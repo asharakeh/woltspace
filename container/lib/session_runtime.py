@@ -146,12 +146,14 @@ def _session_env_value(key: str, value: str) -> str:
 def tty_is_raw(path: str) -> bool | None:
     """Whether the terminal at `path` is in raw mode, or None if unreadable.
 
-    A pane's terminal is cooked (ICANON set) until the program in it mounts
-    its input handler. Ink (Claude Code), codex, opencode, hermes and pi all
-    clear ICANON, with ECHO and ISIG, at that moment and keep it cleared for
-    the app's life, turns included — so raw means the agent is taking input.
+    A pane's terminal is cooked (ICANON set) until the program in it takes it
+    raw. Ink (Claude Code), codex, opencode, hermes and pi all clear ICANON,
+    with ECHO and ISIG, early in boot and keep it cleared for the app's life,
+    turns included. Raw is necessary for input, not sufficient: Claude Code
+    goes raw about 0.05 s after exec and still drops pasted input for the
+    better part of a second after that (see sessions.AGENT_INPUT_READY_AGE).
     A shell at a readline prompt is raw too: this says nothing about *what*
-    is listening, only that something is.
+    is in the pane.
 
     Opened read-only, non-blocking and without becoming our controlling
     terminal; reading the attributes changes nothing for the program using it.
@@ -167,6 +169,23 @@ def tty_is_raw(path: str) -> bool | None:
     finally:
         os.close(fd)
     return not (lflag & termios.ICANON)
+
+
+def _etime_seconds(raw: str) -> int | None:
+    """Seconds since a process started, from one ps `etime` field, or None.
+
+    `etime` is `[[dd-]hh:]mm:ss` on GNU and BSD ps alike; `etimes`, plain
+    seconds, would be simpler but is GNU-only. A bare `ss` is taken too.
+    """
+    days, dash, clock = raw.strip().rpartition("-")
+    parts = clock.split(":")
+    fields = parts + ([days] if dash else [])
+    if len(parts) > 3 or not all(f.isascii() and f.isdigit() for f in fields):
+        return None
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return (int(days) if dash else 0) * 86400 + seconds
 
 
 @dataclass(frozen=True)
@@ -223,6 +242,9 @@ class SessionRuntime(Protocol):
     def paste(self, handle: RuntimeHandle, text: str, settle: float = 0.0) -> None: ...
     def capture(self, handle: RuntimeHandle, start: str | None = "-30") -> str: ...
     def input_ready(self, handle: RuntimeHandle) -> bool | None: ...
+    def agent_age(
+        self, handle: RuntimeHandle, process_names: Iterable[str]
+    ) -> int | None: ...
     def stop(self, handle: RuntimeHandle) -> bool: ...
     def list_session_names(self, include_main: bool = False) -> set[str]: ...
     def has_descendant_process(
@@ -565,13 +587,14 @@ class TmuxSessionRuntime:
         return result.stdout if isinstance(result.stdout, str) else ""
 
     def input_ready(self, handle: RuntimeHandle) -> bool | None:
-        """Whether the program in this handle's exact pane is taking input.
+        """Whether the program in this handle's exact pane has its terminal raw.
 
         Asked of the persisted pane id and never of the session: tmux resolves
         a session name to whichever pane is active, and the probe has to read
         the same pane the paste goes to. A handle without a pane id therefore
-        has no answer. Readiness, not liveness — see `tty_is_raw`; callers
-        ask it only of a pane the agent process was already found in.
+        has no answer. One half of readiness, never liveness — see
+        `tty_is_raw`, and `agent_age` for the other half; callers ask it only
+        of a pane the agent process was already found in.
 
         None when the pane has no tty, the tty can't be opened, or termios
         fails, and the caller pastes as it did before the probe existed.
@@ -590,6 +613,59 @@ class TmuxSessionRuntime:
             return None
         tty = result.stdout.strip() if isinstance(result.stdout, str) else ""
         return tty_is_raw(tty) if tty else None
+
+    def agent_age(
+        self,
+        handle: RuntimeHandle,
+        process_names: Iterable[str],
+    ) -> int | None:
+        """Whole seconds since the youngest wanted process in this exact pane started.
+
+        Raw mode is not enough to call an agent ready (see `input_ready`), so
+        readiness also asks how long the agent has been up. Read off the
+        process, never the record: a revive puts a new pid under an old record.
+        The youngest match answers, so a relaunch beneath an older process is
+        not mistaken for one long up. Matching is the same comm-or-script test
+        agent detection uses, walked from this one pane only.
+
+        None when the pane is not this session's, nothing in it matches, or
+        ps can't be read or parsed.
+        """
+        if not handle.pane_id.startswith("%"):
+            return None
+        pane = next(
+            (p for p in self.panes_for_session(handle.tmux_session_name)
+             if p.pane_id == handle.pane_id),
+            None,
+        )
+        if pane is None or not pane.pane_pid:
+            return None
+        table = self._process_table()
+        if table is None:
+            return None
+        children, commands, scripts = table
+        wanted = set(process_names)
+        matched: set[str] = set()
+        queue = [pane.pane_pid]
+        seen: set[str] = set()
+        while queue:
+            pid = queue.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            if commands.get(pid) in wanted or scripts.get(pid) in wanted:
+                matched.add(pid)
+            queue.extend(children.get(pid, []))
+        if not matched:
+            return None
+        ages = []
+        for line in (self._ps("pid=,etime=") or "").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] in matched:
+                seconds = _etime_seconds(parts[1])
+                if seconds is not None:
+                    ages.append(seconds)
+        return min(ages) if ages else None
 
     def stop(self, handle: RuntimeHandle) -> bool:
         try:

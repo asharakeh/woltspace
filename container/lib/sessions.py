@@ -168,9 +168,14 @@ _AGENT_POLL_INTERVAL = 0.4
 # purpose: running out turns a Telegram message into a fresh session.
 INPUT_READY_TIMEOUT = 15
 _INPUT_READY_POLL = 0.25
-# Raw mode arrives with the TUI's first mount and the composer right after it —
-# the same beat deliver_boot_prompt gives its marker.
-_INPUT_READY_BEAT = 1.0
+# How old the agent process must be before a paste, on top of a raw terminal.
+# Raw is necessary, not sufficient. Measured on Claude Code 2.1.300: the tty
+# goes raw ~0.05 s after exec; input that early is caught and replayed, then
+# pasted input is DROPPED from ~0.25 to ~0.65 s, and from ~0.7 s the composer
+# takes it. 3 s and not 1, because that window is boot time: it stretches with
+# CPU load, and a loaded host or a small container boots Claude in 2 to 3 s.
+# Do not simplify readiness back to raw alone.
+AGENT_INPUT_READY_AGE = 3
 
 
 class SessionRegistry:
@@ -920,7 +925,7 @@ def _await_agent(session: str | dict | RuntimeHandle, harness: str | None,
 
 
 def _input_ready(handle: RuntimeHandle) -> bool | None:
-    """One look at whether the program in this exact pane is taking input.
+    """One look at whether the program in this exact pane has its terminal raw.
 
     A runtime without the probe answers None — unknown — which pastes exactly
     as delivery did before the probe existed.
@@ -929,21 +934,37 @@ def _input_ready(handle: RuntimeHandle) -> bool | None:
     return probe(handle) if probe is not None else None
 
 
+def _agent_age(handle: RuntimeHandle, harness: str | None) -> int | None:
+    """Seconds the youngest agent process in this exact pane has been up, or None.
+
+    A runtime without the probe answers None, read like an unreadable tty.
+    """
+    probe = getattr(_runtime(), "agent_age", None)
+    if probe is None:
+        return None
+    return probe(handle, get_harness(harness)["process_names"])
+
+
 def _await_input_ready(target: str | dict | RuntimeHandle, harness: str | None,
                        timeout: float | None = None) -> RuntimeHandle | None:
     """Wait until the agent in this session takes input: the pane to paste into, or None.
 
-    Finding the agent process is not enough. Claude Code's process exists
-    about a second before its input handler mounts, and a paste in that gap is
-    lost without a trace. The TUIs we run take their terminal raw the moment
-    input goes live, so the pane's tty mode is the signal (`input_ready`). It
-    is asked only of the exact pane the agent process was found in — a shell
-    at a prompt is raw too, so raw alone never means "agent".
+    Finding the agent process is not enough, and neither is a raw terminal.
+    Claude Code takes its tty raw about 0.05 s after exec, then drops pasted
+    input until its composer mounts, around 0.7 s on an idle host and later on
+    a loaded one (AGENT_INPUT_READY_AGE has the measurements). A paste in that
+    gap is lost without a trace. So ready is all three: the agent process
+    found (launching excluded), its pane raw (`input_ready`), and the youngest
+    agent process at least AGENT_INPUT_READY_AGE old (`agent_age`, off the
+    process: a revive puts a new pid under an old record). Raw is still
+    needed: a TUI that never went raw is not taking input at any age. It is
+    asked only of the exact pane the agent process was found in, since a shell
+    at a prompt is raw too.
 
-    Ready is the agent found (launching excluded) in a raw pane. Found ready
-    on the first look, this returns at once; found after waiting, it gives the
-    composer one beat first. A pane whose mode can't be read is pasted into
-    straight away, as before the probe existed.
+    An agent already old and raw at the first look returns at once, which is
+    nearly every message. One that is raw but young sleeps out the rest of
+    the age, inside the same timeout. A pane whose mode or age can't be read
+    is pasted into straight away, as before the probe existed.
 
     None means paste nothing: the agent did not get there within the timeout,
     or nothing is booting to wait for — no agent and no launching shim, which
@@ -959,32 +980,44 @@ def _await_input_ready(target: str | dict | RuntimeHandle, harness: str | None,
     started = time.monotonic()
     waited = False
     while True:
+        pause = _INPUT_READY_POLL
         found = resolve_agent_handle(target, harness, include_launching=False)
         if found is not None:
-            ready = _input_ready(found)
-            if ready is None:
+            raw = _input_ready(found)
+            if raw is None:
                 print(f"[sessions] {name}: can't read the terminal mode of pane "
                       f"{found.pane_id}; pasting without waiting for input",
                       file=sys.stderr)
                 return found
-            if ready:
-                if waited:
-                    print(f"[sessions] {name}: the {harness} agent took input after "
-                          f"{time.monotonic() - started:.2f}s", file=sys.stderr)
-                    time.sleep(_INPUT_READY_BEAT)
-                return found
+            if raw:
+                age = _agent_age(found, harness)
+                if age is None:
+                    print(f"[sessions] {name}: can't read the age of the {harness} "
+                          f"agent in pane {found.pane_id}; pasting without waiting "
+                          f"for input", file=sys.stderr)
+                    return found
+                if age >= AGENT_INPUT_READY_AGE:
+                    if waited:
+                        print(f"[sessions] {name}: the {harness} agent took input "
+                              f"after {time.monotonic() - started:.2f}s",
+                              file=sys.stderr)
+                    return found
+                # Raw but young: inside the window where Claude drops input.
+                # Sleep out the rest of the age rather than poll through it.
+                pause = AGENT_INPUT_READY_AGE - age
         elif resolve_agent_handle(target, harness, include_launching=True) is None:
             if waited:
                 print(f"[sessions] {name}: stopped waiting after "
                       f"{time.monotonic() - started:.2f}s; nothing is booting",
                       file=sys.stderr)
             return None
-        if time.monotonic() - started >= limit:
+        elapsed = time.monotonic() - started
+        if elapsed >= limit:
             print(f"[sessions] {name}: the {harness} agent was not taking input after "
-                  f"{time.monotonic() - started:.2f}s; not pasting", file=sys.stderr)
+                  f"{elapsed:.2f}s; not pasting", file=sys.stderr)
             return None
         waited = True
-        time.sleep(_INPUT_READY_POLL)
+        time.sleep(min(pause, limit - elapsed))
 
 
 def _guard_paste_text(harness: str | None, text: str) -> str:
@@ -1154,6 +1187,7 @@ def deliver_message(session_id: str, text: str, from_wolt: str = "",
                 ),
             }
         target = resolve_agent_handle(data, harness, include_launching=False)
+        # Raw is looked at again, without waiting; age is not, it only grows.
         if target is None or ready is None or _input_ready(target) is False:
             return {
                 "status": "agent-booting",

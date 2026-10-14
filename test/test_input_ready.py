@@ -141,19 +141,109 @@ class TestInputReadyProbe:
 
 
 # ---------------------------------------------------------------------------
+# The agent's age, from ps etime
+# ---------------------------------------------------------------------------
+
+class TestEtime:
+    @pytest.mark.parametrize("raw,seconds", [
+        ("05", 5),
+        ("00:07", 7),
+        ("   00:07", 7),
+        ("1:02:03", 3723),
+        ("2-03:04:05", 2 * 86400 + 3 * 3600 + 4 * 60 + 5),
+    ])
+    def test_every_shape_ps_prints(self, raw, seconds):
+        from session_runtime import _etime_seconds
+        assert _etime_seconds(raw) == seconds
+
+    @pytest.mark.parametrize("raw", ["", "abc", "1:2:3:4", "12:", "-5", "1-2-3", "x-01:00", "0:0a"])
+    def test_garbage_is_unknown(self, raw):
+        from session_runtime import _etime_seconds
+        assert _etime_seconds(raw) is None
+
+
+class _PsRunner:
+    """subprocess.run stand-in for one session's panes and a ps snapshot."""
+
+    def __init__(self, panes, comm, args, etime):
+        self.by_key = {
+            "list-panes": panes,
+            "pid=,ppid=,comm=": comm,
+            "pid=,args=": args,
+            "pid=,etime=": etime,
+        }
+        self.calls = []
+
+    def __call__(self, command, **kwargs):
+        self.calls.append(command)
+        key = command[1] if command[1] == "list-panes" else command[-1]
+        return SimpleNamespace(stdout=self.by_key.get(key, ""), returncode=0)
+
+
+# Two panes. %42 is the agent's: bash → run-session.sh → claude (an hour up)
+# and a second, younger claude under it. %43 holds an even younger claude
+# that must never be counted for %42.
+_PANES = f"{NAME}\t%42\t100\t1\n{NAME}\t%43\t300\t0\n"
+_COMM = (
+    "100 1 bash\n101 100 bash\n102 101 claude\n103 102 claude\n"
+    "300 1 bash\n301 300 claude\n"
+)
+_ARGS = "101 bash /opt/woltspace/container/bin/run-session.sh pal\n"
+_ETIME = "100 01:00:10\n101 01:00:09\n102 01:00:08\n103 00:04\n300 05\n301 00:01\n"
+
+
+class TestAgentAgeProbe:
+    def _runtime(self, runner):
+        return TmuxSessionRuntime(RuntimeContext(tmux_bin="tmux"), runner=runner)
+
+    def test_is_part_of_the_runtime_contract(self):
+        assert "agent_age" in SessionRuntime.__dict__
+
+    def test_the_youngest_matching_process_in_the_pane_sets_the_age(self):
+        runner = _PsRunner(_PANES, _COMM, _ARGS, _ETIME)
+        handle = RuntimeHandle(NAME, NAME, "%42")
+        assert self._runtime(runner).agent_age(handle, {"claude"}) == 4
+
+    def test_another_panes_agent_never_counts(self):
+        runner = _PsRunner(_PANES, _COMM, _ARGS, _ETIME)
+        handle = RuntimeHandle(NAME, NAME, "%43")
+        assert self._runtime(runner).agent_age(handle, {"claude"}) == 1
+
+    def test_script_names_match_like_agent_detection(self):
+        runner = _PsRunner(_PANES, _COMM, _ARGS, _ETIME)
+        handle = RuntimeHandle(NAME, NAME, "%42")
+        assert self._runtime(runner).agent_age(handle, {"run-session.sh"}) == 3609
+
+    def test_no_wanted_process_is_unknown(self):
+        runner = _PsRunner(_PANES, _COMM, _ARGS, _ETIME)
+        handle = RuntimeHandle(NAME, NAME, "%42")
+        assert self._runtime(runner).agent_age(handle, {"codex"}) is None
+
+    def test_an_unreadable_etime_is_unknown(self):
+        runner = _PsRunner(_PANES, _COMM, _ARGS, "102 soon\n103 later\n")
+        handle = RuntimeHandle(NAME, NAME, "%42")
+        assert self._runtime(runner).agent_age(handle, {"claude"}) is None
+
+    @pytest.mark.parametrize("pane", ["", NAME, "%99"])
+    def test_without_the_exact_pane_there_is_no_answer(self, pane):
+        runner = _PsRunner(_PANES, _COMM, _ARGS, _ETIME)
+        handle = RuntimeHandle(NAME, NAME, pane)
+        assert self._runtime(runner).agent_age(handle, {"claude"}) is None
+        assert not [c for c in runner.calls if c[0] == "ps"]
+
+
+# ---------------------------------------------------------------------------
 # A session that boots on a script
 # ---------------------------------------------------------------------------
 
-class Clock:
-    """Stands in for the sessions module's `time`: sleeping advances it.
+POLL = 0.25
 
-    Every sleep moves the booting script one step on, so a test reads as a
-    timeline of what the lodge saw at each look.
-    """
+
+class Clock:
+    """Stands in for the sessions module's `time`: sleeping advances it."""
 
     def __init__(self):
         self.now = 0.0
-        self.sleeps = 0
         self.events = []
 
     def monotonic(self):
@@ -165,25 +255,35 @@ class Clock:
     def sleep(self, seconds):
         self.events.append(("sleep", seconds))
         self.now += seconds
-        self.sleeps += 1
 
 
 class BootingRuntime(FakeSessionRuntime):
-    """One pane whose processes and terminal mode follow a script.
+    """One pane whose processes, terminal mode and agent age follow a script.
 
-    Each step is (process, raw): process is "agent" (the harness is up, under
-    run-session.sh), "shim" (only run-session.sh, still launching) or "none"
-    (a husk); raw is what the pane's terminal reports. The last step holds.
+    Step i holds from clock time i × 0.25 s, one poll each, and the last step
+    holds for good. Each step is (process, raw): process is "agent" (the
+    harness is up, under run-session.sh), "shim" (only run-session.sh, still
+    launching) or "none" (a husk); raw is what the pane's terminal reports.
+    `born` is the clock time the agent process started — by default a minute
+    before the test, an agent long up — or None when its age can't be read.
     """
 
-    def __init__(self, clock, steps, *, alive=True):
+    def __init__(self, clock, steps, *, alive=True, born=-60.0):
         super().__init__(alive=alive, panes=[(PANE, "100", True)])
         self.clock = clock
         self.steps = steps
+        self.born = born
 
     @property
     def step(self):
-        return self.steps[min(self.clock.sleeps, len(self.steps) - 1)]
+        return self.steps[min(int(self.clock.now / POLL), len(self.steps) - 1)]
+
+    def agent_age(self, handle, process_names):
+        age = None
+        if self.step[0] == "agent" and self.born is not None:
+            age = int(self.clock.now - self.born)
+        self.clock.events.append(("age", handle.pane_id, age))
+        return age
 
     def _matching_panes_for_handle(self, handle, process_names):
         panes = self.panes_for_session(handle.tmux_session_name)
@@ -237,8 +337,8 @@ def lodge(tmp_path, monkeypatch):
 
     installed = []
 
-    def boot(*steps, alive=True):
-        runtime = BootingRuntime(clock, list(steps), alive=alive)
+    def boot(*steps, alive=True, born=-60.0):
+        runtime = BootingRuntime(clock, list(steps), alive=alive, born=born)
         set_runtime(runtime)
         installed.append(runtime)
         return runtime
@@ -261,8 +361,13 @@ def _pastes(events):
 # ---------------------------------------------------------------------------
 
 class TestDeliverWaitsForInput:
-    def test_pastes_once_after_the_flip_and_the_beat(self, lodge):
-        runtime = lodge.boot(("agent", False), ("agent", False), ("agent", True))
+    def test_pastes_once_the_raw_agent_is_old_enough(self, lodge):
+        """The agent execs at 0 and goes raw at 0.5 s. Raw is not ready:
+        Claude drops input until its composer mounts, so the paste waits for
+        the agent to be AGENT_INPUT_READY_AGE old."""
+        runtime = lodge.boot(
+            ("agent", False), ("agent", False), ("agent", True), born=0.0,
+        )
 
         res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
 
@@ -270,27 +375,57 @@ class TestDeliverWaitsForInput:
         assert lodge.events == [
             ("probe", PANE, False), ("sleep", 0.25),
             ("probe", PANE, False), ("sleep", 0.25),
-            ("probe", PANE, True), ("sleep", 1.0),
+            ("probe", PANE, True), ("age", PANE, 0), ("sleep", 3),
+            ("probe", PANE, True), ("age", PANE, 3),
             # The lock is taken only once the wait is over; under it, one
-            # look without waiting, then the paste.
+            # raw look without waiting, then the paste.
             ("lock",), ("probe", PANE, True),
             ("paste", PANE),
         ]
         assert [text for _pane, text, _settle in runtime.pastes] == ["hello"]
 
-    def test_a_session_ready_at_once_pays_no_wait(self, lodge):
+    def test_raw_at_the_first_look_but_young_waits_out_the_age(self, lodge):
+        runtime = lodge.boot(("agent", True), born=-1.0)
+
+        res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
+
+        assert res["status"] == "delivered"
+        assert lodge.events == [
+            ("probe", PANE, True), ("age", PANE, 1), ("sleep", 2),
+            ("probe", PANE, True), ("age", PANE, 3),
+            ("lock",), ("probe", PANE, True),
+            ("paste", PANE),
+        ]
+        assert len(runtime.pastes) == 1
+
+    def test_an_agent_raw_and_old_enough_pays_no_wait(self, lodge):
         lodge.boot(("agent", True))
         res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
         assert res["status"] == "delivered"
-        assert not [e for e in lodge.events if e[0] == "sleep"]
-        assert len(_pastes(lodge.events)) == 1
+        assert lodge.events == [
+            ("probe", PANE, True), ("age", PANE, 60),
+            ("lock",), ("probe", PANE, True),
+            ("paste", PANE),
+        ]
 
     def test_an_unreadable_terminal_pastes_at_once_and_says_so(self, lodge, capsys):
         lodge.boot(("agent", None))
         res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
         assert res["status"] == "delivered"
-        assert not [e for e in lodge.events if e[0] == "sleep"]
-        assert len(_pastes(lodge.events)) == 1
+        assert lodge.events == [
+            ("probe", PANE, None), ("lock",), ("probe", PANE, None), ("paste", PANE),
+        ]
+        assert len(capsys.readouterr().err.strip().splitlines()) == 1
+
+    def test_an_unreadable_age_pastes_at_once_and_says_so(self, lodge, capsys):
+        lodge.boot(("agent", True), born=None)
+        res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
+        assert res["status"] == "delivered"
+        assert lodge.events == [
+            ("probe", PANE, True), ("age", PANE, None),
+            ("lock",), ("probe", PANE, True),
+            ("paste", PANE),
+        ]
         assert len(capsys.readouterr().err.strip().splitlines()) == 1
 
     def test_an_agent_that_never_takes_input_gets_nothing(self, lodge):
@@ -310,6 +445,8 @@ class TestDeliverWaitsForInput:
         # ...and not one moment of it under the session lock.
         last_sleep = max(i for i, e in enumerate(lodge.events) if e[0] == "sleep")
         assert all(i > last_sleep for i, e in enumerate(lodge.events) if e == ("lock",))
+        # A pane that is not raw is never asked its age.
+        assert not [e for e in lodge.events if e[0] == "age"]
 
     def test_a_session_still_launching_for_the_whole_wait_gets_nothing(self, lodge):
         runtime = lodge.boot(("shim", None))
@@ -321,6 +458,7 @@ class TestDeliverWaitsForInput:
     def test_launching_then_the_agent_then_raw_is_one_paste(self, lodge):
         runtime = lodge.boot(
             ("shim", None), ("shim", None), ("agent", False), ("agent", True),
+            born=0.5,
         )
 
         res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
@@ -329,17 +467,18 @@ class TestDeliverWaitsForInput:
         assert lodge.events == [
             ("sleep", 0.25), ("sleep", 0.25),
             ("probe", PANE, False), ("sleep", 0.25),
-            ("probe", PANE, True), ("sleep", 1.0),
+            ("probe", PANE, True), ("age", PANE, 0), ("sleep", 3),
+            ("probe", PANE, True), ("age", PANE, 3),
             ("lock",), ("probe", PANE, True),
             ("paste", PANE),
         ]
         assert [text for _pane, text, _settle in runtime.pastes] == ["hello"]
 
-    def test_the_lock_waits_for_the_probe(self, lodge):
-        lodge.boot(("agent", False), ("agent", False), ("agent", True))
+    def test_the_lock_waits_for_readiness(self, lodge):
+        lodge.boot(("agent", False), ("agent", False), ("agent", True), born=0.0)
         sessions.deliver_message(NAME, "hello", registry=lodge.reg)
         first_lock = lodge.events.index(("lock",))
-        ready = lodge.events.index(("probe", PANE, True))
+        ready = lodge.events.index(("age", PANE, 3))
         assert ready < first_lock
 
     def test_a_husk_is_answered_without_waiting(self, lodge):
@@ -362,8 +501,10 @@ class TestDeliverWaitsForInput:
 # ---------------------------------------------------------------------------
 
 class TestResumeWaitsForInput:
-    def test_pastes_once_after_the_flip_and_the_beat(self, lodge):
-        runtime = lodge.boot(("agent", False), ("agent", False), ("agent", True))
+    def test_pastes_once_the_raw_agent_is_old_enough(self, lodge):
+        runtime = lodge.boot(
+            ("agent", False), ("agent", False), ("agent", True), born=0.0,
+        )
 
         res = sessions.resume_session(NAME, "fix the bug")
 
@@ -371,24 +512,62 @@ class TestResumeWaitsForInput:
         assert lodge.events == [
             ("probe", PANE, False), ("sleep", 0.25),
             ("probe", PANE, False), ("sleep", 0.25),
-            ("probe", PANE, True), ("sleep", 1.0),
+            ("probe", PANE, True), ("age", PANE, 0), ("sleep", 3),
+            ("probe", PANE, True), ("age", PANE, 3),
             ("paste", PANE),
             ("lock",),  # the record update, after the paste
         ]
         assert [text for _pane, text, _settle in runtime.pastes] == ["fix the bug"]
 
-    def test_a_session_ready_at_once_pays_no_wait(self, lodge):
+    def test_raw_at_the_first_look_but_young_waits_out_the_age(self, lodge):
+        lodge.boot(("agent", True), born=-1.0)
+
+        res = sessions.resume_session(NAME, "fix the bug")
+
+        assert res["status"] == "delivered"
+        assert lodge.events == [
+            ("probe", PANE, True), ("age", PANE, 1), ("sleep", 2),
+            ("probe", PANE, True), ("age", PANE, 3),
+            ("paste", PANE),
+            ("lock",),
+        ]
+
+    def test_a_revived_agent_under_an_old_record_waits_on_its_own_age(self, lodge):
+        """A revive puts a new pid under a record that is a day old. The
+        record's timestamps say nothing about the agent; its process does."""
+        record = lodge.reg.get(NAME, wolt="pal", check_alive=False)
+        record["created_at"] = record["last_activity"] = int(time.time()) - 86400
+        lodge.reg._write("pal", NAME, record)
+        lodge.boot(("agent", True), born=-0.5)
+
+        res = sessions.resume_session(NAME, "fix the bug")
+
+        assert res["status"] == "delivered"
+        assert lodge.events[:3] == [("probe", PANE, True), ("age", PANE, 0), ("sleep", 3)]
+        assert len(_pastes(lodge.events)) == 1
+
+    def test_an_agent_raw_and_old_enough_pays_no_wait(self, lodge):
         lodge.boot(("agent", True))
         res = sessions.resume_session(NAME, "fix the bug")
         assert res["status"] == "delivered"
-        assert not [e for e in lodge.events if e[0] == "sleep"]
-        assert len(_pastes(lodge.events)) == 1
+        assert lodge.events == [
+            ("probe", PANE, True), ("age", PANE, 60), ("paste", PANE), ("lock",),
+        ]
 
     def test_an_unreadable_terminal_pastes_at_once_and_says_so(self, lodge, capsys):
         lodge.boot(("agent", None))
         res = sessions.resume_session(NAME, "fix the bug")
         assert res["status"] == "delivered"
         assert lodge.events[:2] == [("probe", PANE, None), ("paste", PANE)]
+        assert len(capsys.readouterr().err.strip().splitlines()) == 1
+
+    def test_an_unreadable_age_pastes_at_once_and_says_so(self, lodge, capsys):
+        lodge.boot(("agent", True), born=None)
+        res = sessions.resume_session(NAME, "fix the bug")
+        assert res["status"] == "delivered"
+        assert lodge.events[:3] == [
+            ("probe", PANE, True), ("age", PANE, None), ("paste", PANE),
+        ]
         assert len(capsys.readouterr().err.strip().splitlines()) == 1
 
     def test_an_agent_that_never_takes_input_gets_nothing(self, lodge):
@@ -401,12 +580,15 @@ class TestResumeWaitsForInput:
         assert runtime.pastes == []
         assert lodge.record_text() == before
         assert ("lock",) not in lodge.events
+        assert lodge.clock.now == 15.0
 
     def test_a_booting_session_is_waited_for_not_relaunched(self, lodge):
         """Only run-session.sh is up and the conversation id is already
         stamped. Relaunching here pasted `run-session.sh --resume` into the
         pane the agent was still booting in."""
-        runtime = lodge.boot(("shim", None), ("agent", False), ("agent", True))
+        runtime = lodge.boot(
+            ("shim", None), ("agent", False), ("agent", True), born=0.25,
+        )
 
         res = sessions.resume_session(NAME, "fix the bug")
 
@@ -446,6 +628,7 @@ class TestTelegramToABootingSession:
         monkeypatch.setattr(core, "BOT_LOG_DIR", tmp_path)
         runtime = lodge.boot(
             ("shim", None), ("shim", None), ("agent", False), ("agent", True),
+            born=0.5,
         )
 
         first = core.message_session(NAME, "are you there?")
@@ -456,6 +639,10 @@ class TestTelegramToABootingSession:
             "are you there?", "and one more thing",
         ]
         assert runtime.spawns == [] and runtime.in_session_spawns == []
+        # The second message found the agent raw and already old: no wait.
+        second_paste = [i for i, e in enumerate(lodge.events) if e[0] == "paste"][1]
+        first_paste = [i for i, e in enumerate(lodge.events) if e[0] == "paste"][0]
+        assert not [e for e in lodge.events[first_paste:second_paste] if e[0] == "sleep"]
 
 
 # ---------------------------------------------------------------------------

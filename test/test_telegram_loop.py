@@ -526,7 +526,7 @@ class TestOptionalDog:
         # The message rides in the spawn's opening prompt, never pasted after (#555).
         spawn.assert_called_once()
         assert spawn.call_args.args[:2] == ("nunu", 123)
-        assert "chat_id=123]: hello\n" in spawn.call_args.args[2]
+        assert spawn.call_args.args[2].endswith("chat_id=123]: hello")
         route.assert_not_awaited()
         assert state["active_wolt"] == "nunu"
         assert state["active_session"] == "nunu-swift-marsh-abc123"

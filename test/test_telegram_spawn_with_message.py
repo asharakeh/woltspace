@@ -28,9 +28,9 @@ FOOTER = (
 )
 
 
-def _same_delimiter(text: str) -> str:
-    """Every reply instruction draws a fresh heredoc delimiter; compare the rest."""
-    return re.sub(r"WOLTSPACE_NOTIFY_[A-F0-9]{16}", "WOLTSPACE_NOTIFY_X", text)
+def _reply_instructions(text: str) -> int:
+    """How many notify reply instructions a prompt carries (each has its own delimiter)."""
+    return len(re.findall(r"<<'WOLTSPACE_NOTIFY_[A-F0-9]{16}'", text))
 
 
 # id, handler, dog available, chat state before, replying to OLD's notification,
@@ -163,10 +163,10 @@ async def test_spawning_message_is_in_the_opening_prompt(lodge, kind, dog, state
     ]
     text = entries[-2][1]
     assert fragment in text
-    assert _same_delimiter(start.call_args.kwargs["prompt"]) == _same_delimiter(
+    # No reply instruction here: the spawn's Telegram context carries the one.
+    assert start.call_args.kwargs["prompt"] == (
         f"{adapter._start_chat_prompt(WOLT)}\n\n"
-        f"[telegram message from human, chat_id={CHAT}]: {text}\n"
-        f"{adapter.notify_reply_instruction('--telegram', CHAT)}"
+        f"[telegram message from human, chat_id={CHAT}]: {text}"
     )
     # Nothing is pasted into the new session; only the dead one was tried.
     expired = bool(state.get("active_session")) or replying
@@ -183,8 +183,9 @@ async def test_spawning_message_is_in_the_opening_prompt(lodge, kind, dog, state
 
 
 @pytest.mark.asyncio
-async def test_opening_prompt_gets_no_second_start_chat(lodge):
-    """Start-chat leads, so the spawn's own prompt assembly doesn't add one."""
+async def test_assembled_opening_prompt_has_one_start_chat_and_one_reply_instruction(lodge):
+    """Start-chat leads, so the spawn's own prompt assembly doesn't add one, and
+    the reply instruction comes once, from the spawn's Telegram context."""
     import sessions
 
     adapter, start, deliver, events, history, setup = lodge
@@ -197,6 +198,7 @@ async def test_opening_prompt_gets_no_second_start_chat(lodge):
         prompt, sessions.wolt_harness(WOLT),
     )
     assert assembled.count("start-chat") == 1
+    assert _reply_instructions(assembled) == 1
     assert "[telegram message from human" in assembled
 
 
@@ -231,5 +233,8 @@ async def test_message_to_a_running_session_is_still_pasted(lodge, kind, dog):
 
     start.assert_not_called()
     assert [c.args[0] for c in deliver.call_args_list] == [OLD]
+    pasted = deliver.call_args.args[1]
+    assert pasted.startswith(f"[telegram message from human, chat_id={CHAT}]: ")
+    assert _reply_instructions(pasted) == 1
     assert f"🪵 sent to {OLD}\n{OLD}" in _replies(update)
     assert history()[-1] == ("assistant", f"[delivered to session {OLD}]")

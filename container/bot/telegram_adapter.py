@@ -371,10 +371,7 @@ def _spawn_session(wolt: str, chat_id: int, prompt: str = "") -> dict:
 
 def _session_message(text: str, chat_id: int) -> str:
     """A Telegram message as its session reads it, pasted or in the opening prompt."""
-    return (
-        f"[telegram message from human, chat_id={chat_id}]: {text}\n"
-        f"{notify_reply_instruction('--telegram', chat_id)}"
-    )
+    return f"[telegram message from human, chat_id={chat_id}]: {text}"
 
 
 def _spawn_session_with_message(wolt: str, chat_id: int, text: str) -> dict:
@@ -382,7 +379,8 @@ def _spawn_session_with_message(wolt: str, chat_id: int, text: str) -> dict:
 
     Pasted into the new pane after the spawn, the message was lost: the agent
     isn't reading input a second in (#555). Start-chat leads, so the spawn
-    doesn't add a second one. Records what _route_to_session would have.
+    doesn't add a second one, and the spawn's Telegram context carries the
+    reply instruction. Records what _route_to_session would have.
     """
     session = _spawn_session(
         wolt, chat_id, f"{_start_chat_prompt(wolt)}\n\n{_session_message(text, chat_id)}")
@@ -418,7 +416,10 @@ async def _route_to_session(update: Update, session_name: str, wolt: str, text: 
         except (json.JSONDecodeError, OSError):
             pass
 
-    session_msg = _session_message(text, chat_id)
+    session_msg = (
+        f"{_session_message(text, chat_id)}\n"
+        f"{notify_reply_instruction('--telegram', chat_id)}"
+    )
     # message_session → resume_session blocks for as long as the agent takes
     # to come up (up to 12s). On the bot's event loop that stalls every other
     # chat, so the wait happens in a thread.

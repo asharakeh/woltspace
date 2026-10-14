@@ -149,11 +149,11 @@ def tty_is_raw(path: str) -> bool | None:
     A pane's terminal is cooked (ICANON set) until the program in it takes it
     raw. Ink (Claude Code), codex, opencode, hermes and pi all clear ICANON,
     with ECHO and ISIG, early in boot and keep it cleared for the app's life,
-    turns included. Raw is necessary for input, not sufficient: Claude Code
-    goes raw about 0.05 s after exec and still drops pasted input for the
-    better part of a second after that (see sessions.AGENT_INPUT_READY_AGE).
-    A shell at a readline prompt is raw too: this says nothing about *what*
-    is in the pane.
+    turns included. Raw is not readiness: Claude Code goes raw about 0.05 s
+    after exec and still drops pasted input for the better part of a second
+    after that, so readiness is the agent's age (sessions.AGENT_INPUT_READY_AGE)
+    and the mode is only reported. A shell at a readline prompt is raw too:
+    this says nothing about *what* is in the pane.
 
     Opened read-only, non-blocking and without becoming our controlling
     terminal; reading the attributes changes nothing for the program using it.
@@ -592,9 +592,9 @@ class TmuxSessionRuntime:
         Asked of the persisted pane id and never of the session: tmux resolves
         a session name to whichever pane is active, and the probe has to read
         the same pane the paste goes to. A handle without a pane id therefore
-        has no answer. One half of readiness, never liveness — see
-        `tty_is_raw`, and `agent_age` for the other half; callers ask it only
-        of a pane the agent process was already found in.
+        has no answer. Neither readiness nor liveness — see `tty_is_raw`;
+        readiness is `agent_age`. Callers ask it only of a pane the agent
+        process was already found in, and only report what it says.
 
         None when the pane has no tty, the tty can't be opened, or termios
         fails, and the caller pastes as it did before the probe existed.
@@ -621,9 +621,9 @@ class TmuxSessionRuntime:
     ) -> int | None:
         """Whole seconds since the youngest wanted process in this exact pane started.
 
-        Raw mode is not enough to call an agent ready (see `input_ready`), so
-        readiness also asks how long the agent has been up. Read off the
-        process, never the record: a revive puts a new pid under an old record.
+        Readiness is how long the agent has been up: raw mode comes too early
+        to tell (see `tty_is_raw`). Read off the process, never the record: a
+        revive puts a new pid under an old record.
         The youngest match answers, so a relaunch beneath an older process is
         not mistaken for one long up. Matching is the same comm-or-script test
         agent detection uses, walked from this one pane only.

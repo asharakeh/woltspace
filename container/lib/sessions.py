@@ -168,13 +168,16 @@ _AGENT_POLL_INTERVAL = 0.4
 # purpose: running out turns a Telegram message into a fresh session.
 INPUT_READY_TIMEOUT = 15
 _INPUT_READY_POLL = 0.25
-# How old the agent process must be before a paste, on top of a raw terminal.
-# Raw is necessary, not sufficient. Measured on Claude Code 2.1.300: the tty
+# How old the agent process must be before a paste. This is the readiness
+# test; the terminal mode is not. Measured on Claude Code 2.1.300: the tty
 # goes raw ~0.05 s after exec; input that early is caught and replayed, then
 # pasted input is DROPPED from ~0.25 to ~0.65 s, and from ~0.7 s the composer
-# takes it. 3 s and not 1, because that window is boot time: it stretches with
-# CPU load, and a loaded host or a small container boots Claude in 2 to 3 s.
-# Do not simplify readiness back to raw alone.
+# takes it. The drop is inside Claude, long after raw, so raw tells nothing:
+# do not simplify readiness back to raw mode. 3 s and not 1, because that
+# window is boot time: it stretches with CPU load, and a loaded host or a
+# small container boots Claude in 2 to 3 s. The age counts from the wrapper's
+# process start, not the exec: natively wclaude execs at once, but in a
+# container trust-dir runs first (~0.1-0.3 s), which eats that much margin.
 AGENT_INPUT_READY_AGE = 3
 
 
@@ -953,22 +956,25 @@ def _await_input_ready(target: str | dict | RuntimeHandle, harness: str | None,
     Claude Code takes its tty raw about 0.05 s after exec, then drops pasted
     input until its composer mounts, around 0.7 s on an idle host and later on
     a loaded one (AGENT_INPUT_READY_AGE has the measurements). A paste in that
-    gap is lost without a trace. So ready is all three: the agent process
-    found (launching excluded), its pane raw (`input_ready`), and the youngest
-    agent process at least AGENT_INPUT_READY_AGE old (`agent_age`, off the
-    process: a revive puts a new pid under an old record). Raw is still
-    needed: a TUI that never went raw is not taking input at any age. It is
-    asked only of the exact pane the agent process was found in, since a shell
-    at a prompt is raw too.
+    gap is lost without a trace. So ready is: the agent process found
+    (launching excluded) and the youngest agent process in its pane at least
+    AGENT_INPUT_READY_AGE old (`agent_age`, read off the process: a revive puts
+    a new pid under an old record).
 
-    An agent already old and raw at the first look returns at once, which is
-    nearly every message. One that is raw but young sleeps out the rest of
-    the age, inside the same timeout. A pane whose mode or age can't be read
-    is pasted into straight away, as before the probe existed.
+    The terminal mode is read once the agent is old enough, and only reported.
+    Raw is pasted into as usual. A cooked or unreadable pane is pasted into
+    too, with one log line: a cooked reader buffers a paste and its Enter
+    fine, and a harness that never goes raw (hermes and pi are unmeasured)
+    must not have every message refused.
 
-    None means paste nothing: the agent did not get there within the timeout,
-    or nothing is booting to wait for — no agent and no launching shim, which
-    the caller's own checks then name (agent-gone, session-dead).
+    An agent already old at the first look returns at once, which is nearly
+    every message. A young one sleeps out the rest of its age, inside the
+    same timeout. An age that can't be read is pasted into straight away, as
+    before the probe existed.
+
+    None means paste nothing: no agent was found within the timeout (still
+    launching), or nothing is booting to wait for — no agent and no launching
+    shim, which the caller's own checks then name (agent-gone, session-dead).
 
     Never call this under a session lock. It can run for the whole timeout,
     and every writer of the record queues on that lock.
@@ -983,28 +989,28 @@ def _await_input_ready(target: str | dict | RuntimeHandle, harness: str | None,
         pause = _INPUT_READY_POLL
         found = resolve_agent_handle(target, harness, include_launching=False)
         if found is not None:
-            raw = _input_ready(found)
-            if raw is None:
-                print(f"[sessions] {name}: can't read the terminal mode of pane "
-                      f"{found.pane_id}; pasting without waiting for input",
-                      file=sys.stderr)
+            age = _agent_age(found, harness)
+            if age is None:
+                print(f"[sessions] {name}: can't read the age of the {harness} "
+                      f"agent in pane {found.pane_id}; pasting without waiting "
+                      f"for input", file=sys.stderr)
                 return found
-            if raw:
-                age = _agent_age(found, harness)
-                if age is None:
-                    print(f"[sessions] {name}: can't read the age of the {harness} "
-                          f"agent in pane {found.pane_id}; pasting without waiting "
-                          f"for input", file=sys.stderr)
-                    return found
-                if age >= AGENT_INPUT_READY_AGE:
-                    if waited:
-                        print(f"[sessions] {name}: the {harness} agent took input "
-                              f"after {time.monotonic() - started:.2f}s",
-                              file=sys.stderr)
-                    return found
-                # Raw but young: inside the window where Claude drops input.
-                # Sleep out the rest of the age rather than poll through it.
-                pause = AGENT_INPUT_READY_AGE - age
+            if age >= AGENT_INPUT_READY_AGE:
+                raw = _input_ready(found)
+                if raw is None:
+                    print(f"[sessions] {name}: the {harness} agent is old enough but "
+                          f"the terminal mode of pane {found.pane_id} can't be read; "
+                          f"pasting", file=sys.stderr)
+                elif not raw:
+                    print(f"[sessions] {name}: the {harness} agent is old enough but "
+                          f"its terminal is not raw; pasting", file=sys.stderr)
+                elif waited:
+                    print(f"[sessions] {name}: the {harness} agent took input after "
+                          f"{time.monotonic() - started:.2f}s", file=sys.stderr)
+                return found
+            # Young: inside the window where Claude drops input. Sleep out
+            # the rest of the age rather than poll through it.
+            pause = AGENT_INPUT_READY_AGE - age
         elif resolve_agent_handle(target, harness, include_launching=True) is None:
             if waited:
                 print(f"[sessions] {name}: stopped waiting after "
@@ -1150,10 +1156,10 @@ def deliver_message(session_id: str, text: str, from_wolt: str = "",
         else, so a booting session is not reported orphaned, but a TUI that
         has not mounted its input yet loses a paste. Delivery first waits for
         the agent to take input (_await_input_ready), before and never under
-        the session lock, then looks once more under the lock without
-        waiting. Detection uses include_launching=False and hands back the
-        exact pane, so a session found in one window can never be pasted into
-        another.
+        the session lock, then finds the agent again under the lock without
+        waiting; its age only grows, so that is not asked again. Detection
+        uses include_launching=False and hands back the exact pane, so a
+        session found in one window can never be pasted into another.
 
     agent-gone is deliberately distinct from session-dead: the tmux session is
     still there, so a caller can resume-then-retry rather than concluding the
@@ -1187,8 +1193,7 @@ def deliver_message(session_id: str, text: str, from_wolt: str = "",
                 ),
             }
         target = resolve_agent_handle(data, harness, include_launching=False)
-        # Raw is looked at again, without waiting; age is not, it only grows.
-        if target is None or ready is None or _input_ready(target) is False:
+        if target is None or ready is None:
             return {
                 "status": "agent-booting",
                 "session": session_id,

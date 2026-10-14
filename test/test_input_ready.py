@@ -361,10 +361,10 @@ def _pastes(events):
 # ---------------------------------------------------------------------------
 
 class TestDeliverWaitsForInput:
-    def test_pastes_once_the_raw_agent_is_old_enough(self, lodge):
-        """The agent execs at 0 and goes raw at 0.5 s. Raw is not ready:
-        Claude drops input until its composer mounts, so the paste waits for
-        the agent to be AGENT_INPUT_READY_AGE old."""
+    def test_a_young_agent_waits_out_its_age_cooked_or_raw(self, lodge):
+        """The agent execs at 0 and goes raw at 0.5 s. Neither tells: Claude
+        drops input until its composer mounts, so the paste waits for the
+        agent to be AGENT_INPUT_READY_AGE old."""
         runtime = lodge.boot(
             ("agent", False), ("agent", False), ("agent", True), born=0.0,
         )
@@ -373,13 +373,10 @@ class TestDeliverWaitsForInput:
 
         assert res["status"] == "delivered"
         assert lodge.events == [
-            ("probe", PANE, False), ("sleep", 0.25),
-            ("probe", PANE, False), ("sleep", 0.25),
-            ("probe", PANE, True), ("age", PANE, 0), ("sleep", 3),
-            ("probe", PANE, True), ("age", PANE, 3),
-            # The lock is taken only once the wait is over; under it, one
-            # raw look without waiting, then the paste.
-            ("lock",), ("probe", PANE, True),
+            ("age", PANE, 0), ("sleep", 3),
+            ("age", PANE, 3), ("probe", PANE, True),
+            # The lock is taken only once the wait is over.
+            ("lock",),
             ("paste", PANE),
         ]
         assert [text for _pane, text, _settle in runtime.pastes] == ["hello"]
@@ -391,29 +388,43 @@ class TestDeliverWaitsForInput:
 
         assert res["status"] == "delivered"
         assert lodge.events == [
-            ("probe", PANE, True), ("age", PANE, 1), ("sleep", 2),
-            ("probe", PANE, True), ("age", PANE, 3),
-            ("lock",), ("probe", PANE, True),
-            ("paste", PANE),
+            ("age", PANE, 1), ("sleep", 2),
+            ("age", PANE, 3), ("probe", PANE, True),
+            ("lock",), ("paste", PANE),
         ]
         assert len(runtime.pastes) == 1
 
-    def test_an_agent_raw_and_old_enough_pays_no_wait(self, lodge):
+    def test_an_agent_raw_and_old_enough_pays_no_wait(self, lodge, capsys):
         lodge.boot(("agent", True))
         res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
         assert res["status"] == "delivered"
         assert lodge.events == [
-            ("probe", PANE, True), ("age", PANE, 60),
-            ("lock",), ("probe", PANE, True),
-            ("paste", PANE),
+            ("age", PANE, 60), ("probe", PANE, True), ("lock",), ("paste", PANE),
         ]
+        assert capsys.readouterr().err == ""
 
-    def test_an_unreadable_terminal_pastes_at_once_and_says_so(self, lodge, capsys):
+    def test_an_old_cooked_agent_is_pasted_into_and_says_so(self, lodge, capsys):
+        """Raw adds nothing once the agent is old, a cooked reader buffers a
+        paste and its Enter fine, and a harness that never goes raw must not
+        have every message refused."""
+        runtime = lodge.boot(("agent", False))
+
+        res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
+
+        assert res["status"] == "delivered"
+        assert lodge.events == [
+            ("age", PANE, 60), ("probe", PANE, False), ("lock",), ("paste", PANE),
+        ]
+        assert [text for _pane, text, _settle in runtime.pastes] == ["hello"]
+        log = capsys.readouterr().err.strip().splitlines()
+        assert len(log) == 1 and "old enough but its terminal is not raw" in log[0]
+
+    def test_an_unreadable_terminal_on_an_old_agent_pastes_and_says_so(self, lodge, capsys):
         lodge.boot(("agent", None))
         res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
         assert res["status"] == "delivered"
         assert lodge.events == [
-            ("probe", PANE, None), ("lock",), ("probe", PANE, None), ("paste", PANE),
+            ("age", PANE, 60), ("probe", PANE, None), ("lock",), ("paste", PANE),
         ]
         assert len(capsys.readouterr().err.strip().splitlines()) == 1
 
@@ -421,15 +432,11 @@ class TestDeliverWaitsForInput:
         lodge.boot(("agent", True), born=None)
         res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
         assert res["status"] == "delivered"
-        assert lodge.events == [
-            ("probe", PANE, True), ("age", PANE, None),
-            ("lock",), ("probe", PANE, True),
-            ("paste", PANE),
-        ]
+        assert lodge.events == [("age", PANE, None), ("lock",), ("paste", PANE)]
         assert len(capsys.readouterr().err.strip().splitlines()) == 1
 
-    def test_an_agent_that_never_takes_input_gets_nothing(self, lodge):
-        runtime = lodge.boot(("agent", False))
+    def test_a_session_still_launching_for_the_whole_wait_gets_nothing(self, lodge):
+        runtime = lodge.boot(("shim", None))
 
         res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
 
@@ -445,17 +452,8 @@ class TestDeliverWaitsForInput:
         # ...and not one moment of it under the session lock.
         last_sleep = max(i for i, e in enumerate(lodge.events) if e[0] == "sleep")
         assert all(i > last_sleep for i, e in enumerate(lodge.events) if e == ("lock",))
-        # A pane that is not raw is never asked its age.
-        assert not [e for e in lodge.events if e[0] == "age"]
 
-    def test_a_session_still_launching_for_the_whole_wait_gets_nothing(self, lodge):
-        runtime = lodge.boot(("shim", None))
-        res = sessions.deliver_message(NAME, "hello", registry=lodge.reg)
-        assert res["status"] == "agent-booting"
-        assert runtime.pastes == []
-        assert lodge.clock.now == 15.0
-
-    def test_launching_then_the_agent_then_raw_is_one_paste(self, lodge):
+    def test_launching_then_the_agent_is_one_paste_once_it_is_old(self, lodge):
         runtime = lodge.boot(
             ("shim", None), ("shim", None), ("agent", False), ("agent", True),
             born=0.5,
@@ -466,11 +464,9 @@ class TestDeliverWaitsForInput:
         assert res["status"] == "delivered"
         assert lodge.events == [
             ("sleep", 0.25), ("sleep", 0.25),
-            ("probe", PANE, False), ("sleep", 0.25),
-            ("probe", PANE, True), ("age", PANE, 0), ("sleep", 3),
-            ("probe", PANE, True), ("age", PANE, 3),
-            ("lock",), ("probe", PANE, True),
-            ("paste", PANE),
+            ("age", PANE, 0), ("sleep", 3),
+            ("age", PANE, 3), ("probe", PANE, True),
+            ("lock",), ("paste", PANE),
         ]
         assert [text for _pane, text, _settle in runtime.pastes] == ["hello"]
 
@@ -501,7 +497,7 @@ class TestDeliverWaitsForInput:
 # ---------------------------------------------------------------------------
 
 class TestResumeWaitsForInput:
-    def test_pastes_once_the_raw_agent_is_old_enough(self, lodge):
+    def test_a_young_agent_waits_out_its_age_cooked_or_raw(self, lodge):
         runtime = lodge.boot(
             ("agent", False), ("agent", False), ("agent", True), born=0.0,
         )
@@ -510,10 +506,8 @@ class TestResumeWaitsForInput:
 
         assert res["status"] == "delivered"
         assert lodge.events == [
-            ("probe", PANE, False), ("sleep", 0.25),
-            ("probe", PANE, False), ("sleep", 0.25),
-            ("probe", PANE, True), ("age", PANE, 0), ("sleep", 3),
-            ("probe", PANE, True), ("age", PANE, 3),
+            ("age", PANE, 0), ("sleep", 3),
+            ("age", PANE, 3), ("probe", PANE, True),
             ("paste", PANE),
             ("lock",),  # the record update, after the paste
         ]
@@ -526,8 +520,8 @@ class TestResumeWaitsForInput:
 
         assert res["status"] == "delivered"
         assert lodge.events == [
-            ("probe", PANE, True), ("age", PANE, 1), ("sleep", 2),
-            ("probe", PANE, True), ("age", PANE, 3),
+            ("age", PANE, 1), ("sleep", 2),
+            ("age", PANE, 3), ("probe", PANE, True),
             ("paste", PANE),
             ("lock",),
         ]
@@ -543,7 +537,7 @@ class TestResumeWaitsForInput:
         res = sessions.resume_session(NAME, "fix the bug")
 
         assert res["status"] == "delivered"
-        assert lodge.events[:3] == [("probe", PANE, True), ("age", PANE, 0), ("sleep", 3)]
+        assert lodge.events[:3] == [("age", PANE, 0), ("sleep", 3), ("age", PANE, 3)]
         assert len(_pastes(lodge.events)) == 1
 
     def test_an_agent_raw_and_old_enough_pays_no_wait(self, lodge):
@@ -551,36 +545,35 @@ class TestResumeWaitsForInput:
         res = sessions.resume_session(NAME, "fix the bug")
         assert res["status"] == "delivered"
         assert lodge.events == [
-            ("probe", PANE, True), ("age", PANE, 60), ("paste", PANE), ("lock",),
+            ("age", PANE, 60), ("probe", PANE, True), ("paste", PANE), ("lock",),
         ]
 
-    def test_an_unreadable_terminal_pastes_at_once_and_says_so(self, lodge, capsys):
+    def test_an_old_cooked_agent_is_pasted_into_and_says_so(self, lodge, capsys):
+        runtime = lodge.boot(("agent", False))
+
+        res = sessions.resume_session(NAME, "fix the bug")
+
+        assert res["status"] == "delivered"
+        assert lodge.events == [
+            ("age", PANE, 60), ("probe", PANE, False), ("paste", PANE), ("lock",),
+        ]
+        assert [text for _pane, text, _settle in runtime.pastes] == ["fix the bug"]
+        log = capsys.readouterr().err.strip().splitlines()
+        assert len(log) == 1 and "old enough but its terminal is not raw" in log[0]
+
+    def test_an_unreadable_terminal_on_an_old_agent_pastes_and_says_so(self, lodge, capsys):
         lodge.boot(("agent", None))
         res = sessions.resume_session(NAME, "fix the bug")
         assert res["status"] == "delivered"
-        assert lodge.events[:2] == [("probe", PANE, None), ("paste", PANE)]
+        assert lodge.events[:3] == [("age", PANE, 60), ("probe", PANE, None), ("paste", PANE)]
         assert len(capsys.readouterr().err.strip().splitlines()) == 1
 
     def test_an_unreadable_age_pastes_at_once_and_says_so(self, lodge, capsys):
         lodge.boot(("agent", True), born=None)
         res = sessions.resume_session(NAME, "fix the bug")
         assert res["status"] == "delivered"
-        assert lodge.events[:3] == [
-            ("probe", PANE, True), ("age", PANE, None), ("paste", PANE),
-        ]
+        assert lodge.events[:2] == [("age", PANE, None), ("paste", PANE)]
         assert len(capsys.readouterr().err.strip().splitlines()) == 1
-
-    def test_an_agent_that_never_takes_input_gets_nothing(self, lodge):
-        runtime = lodge.boot(("agent", False))
-        before = lodge.record_text()
-
-        with pytest.raises(sessions.ResumeFailed, match="still booting"):
-            sessions.resume_session(NAME, "fix the bug")
-
-        assert runtime.pastes == []
-        assert lodge.record_text() == before
-        assert ("lock",) not in lodge.events
-        assert lodge.clock.now == 15.0
 
     def test_a_booting_session_is_waited_for_not_relaunched(self, lodge):
         """Only run-session.sh is up and the conversation id is already
@@ -617,6 +610,8 @@ class TestResumeWaitsForInput:
         assert runtime.pastes == []
         assert runtime.spawns == [] and runtime.in_session_spawns == []
         assert lodge.record_text() == before
+        assert ("lock",) not in lodge.events
+        assert lodge.clock.now == 15.0
 
 
 class TestTelegramToABootingSession:

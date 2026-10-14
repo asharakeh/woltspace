@@ -374,13 +374,15 @@ class FakeSessionRuntime:
     (pane_id, pane_pid, active) tuples. agents: the pane_ids whose process
     tree should count as carrying an agent. agent_sessions: tmux session names
     the batch check reports as agent-bearing (None = undetermined, which makes
-    list() fall back to tmux presence).
+    list() fall back to tmux presence). raw: what input_ready reports for any
+    pane — True (taking input), False (still booting) or None (unreadable).
     """
 
     def __init__(self, *, alive: bool = True, capture_text: str = "",
                  next_pane: str = "%1", panes=None, agents=(),
-                 agent_sessions=None):
+                 agent_sessions=None, raw: bool | None = True):
         self._alive = alive
+        self._raw = raw
         # Batch liveness answer, by tmux session name. None = undetermined.
         self._agent_sessions = agent_sessions
         self._capture_text = capture_text
@@ -469,6 +471,9 @@ class FakeSessionRuntime:
                 return self._capture_text.pop(0)
             return self._capture_text[0] if self._capture_text else ""
         return self._capture_text
+
+    def input_ready(self, handle) -> bool | None:
+        return self._raw
 
     def stop(self, handle) -> bool:
         self.stops.append(handle.tmux_session_name)

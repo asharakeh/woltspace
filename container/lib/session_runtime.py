@@ -24,6 +24,7 @@ import os
 import re
 import shlex
 import subprocess
+import termios
 import time
 from dataclasses import asdict, dataclass
 from typing import Callable, Iterable, Protocol, runtime_checkable
@@ -142,6 +143,32 @@ def _session_env_value(key: str, value: str) -> str:
     return f"{bin_dir}{os.pathsep}{value}"
 
 
+def tty_is_raw(path: str) -> bool | None:
+    """Whether the terminal at `path` is in raw mode, or None if unreadable.
+
+    A pane's terminal is cooked (ICANON set) until the program in it mounts
+    its input handler. Ink (Claude Code), codex, opencode, hermes and pi all
+    clear ICANON, with ECHO and ISIG, at that moment and keep it cleared for
+    the app's life, turns included — so raw means the agent is taking input.
+    A shell at a readline prompt is raw too: this says nothing about *what*
+    is listening, only that something is.
+
+    Opened read-only, non-blocking and without becoming our controlling
+    terminal; reading the attributes changes nothing for the program using it.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    except OSError:
+        return None
+    try:
+        lflag = termios.tcgetattr(fd)[3]
+    except termios.error:
+        return None
+    finally:
+        os.close(fd)
+    return not (lflag & termios.ICANON)
+
+
 @dataclass(frozen=True)
 class RuntimeHandle:
     """Exact process-runtime address stored beneath a Woltspace session ID."""
@@ -195,6 +222,7 @@ class SessionRuntime(Protocol):
     def handle_is_alive(self, handle: RuntimeHandle) -> bool: ...
     def paste(self, handle: RuntimeHandle, text: str, settle: float = 0.0) -> None: ...
     def capture(self, handle: RuntimeHandle, start: str | None = "-30") -> str: ...
+    def input_ready(self, handle: RuntimeHandle) -> bool | None: ...
     def stop(self, handle: RuntimeHandle) -> bool: ...
     def list_session_names(self, include_main: bool = False) -> set[str]: ...
     def has_descendant_process(
@@ -535,6 +563,33 @@ class TmuxSessionRuntime:
             timeout=_TMUX_TIMEOUT,
         )
         return result.stdout if isinstance(result.stdout, str) else ""
+
+    def input_ready(self, handle: RuntimeHandle) -> bool | None:
+        """Whether the program in this handle's exact pane is taking input.
+
+        Asked of the persisted pane id and never of the session: tmux resolves
+        a session name to whichever pane is active, and the probe has to read
+        the same pane the paste goes to. A handle without a pane id therefore
+        has no answer. Readiness, not liveness — see `tty_is_raw`; callers
+        ask it only of a pane the agent process was already found in.
+
+        None when the pane has no tty, the tty can't be opened, or termios
+        fails, and the caller pastes as it did before the probe existed.
+        """
+        if not handle.pane_id.startswith("%"):
+            return None
+        try:
+            result = self._run(
+                [self.tmux, "display-message", "-p", "-t", handle.pane_id, "#{pane_tty}"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=_TMUX_TIMEOUT,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        tty = result.stdout.strip() if isinstance(result.stdout, str) else ""
+        return tty_is_raw(tty) if tty else None
 
     def stop(self, handle: RuntimeHandle) -> bool:
         try:

@@ -1893,7 +1893,9 @@ def resume_session(name: str, prompt: str = "") -> dict:
             status="running",
             runtime=target.to_record(),
         )
-        return {"name": name, "url": session_url, "status": "delivered", "detail": "agent running, message sent"}
+        detail = ("agent booting, nothing to send" if booting and not prompt
+                  else "agent running, message sent")
+        return {"name": name, "url": session_url, "status": "delivered", "detail": detail}
 
     # A record whose workdir does not exist on this host was written by a
     # different runtime (container vs native share a migrated data root).

@@ -414,6 +414,17 @@ class TestResumeWaitsForInput:
         assert [text for _pane, text, _settle in runtime.pastes] == ["fix the bug"]
         assert runtime.spawns == [] and runtime.in_session_spawns == []
 
+    def test_a_booting_session_with_nothing_to_send_says_so(self, lodge):
+        runtime = lodge.boot(("shim", None))
+
+        res = sessions.resume_session(NAME, "")
+
+        assert res["status"] == "delivered"
+        assert res["detail"] == "agent booting, nothing to send"
+        assert runtime.pastes == []
+        assert runtime.spawns == [] and runtime.in_session_spawns == []
+        assert lodge.clock.now == 0.0
+
     def test_a_session_still_launching_for_the_whole_wait_gets_nothing(self, lodge):
         runtime = lodge.boot(("shim", None))
         before = lodge.record_text()

@@ -2125,7 +2125,9 @@ def _assign_creature(name: str, new_type: object) -> dict:
             raise ValueError("type must be otter, beaver, raccoon, or a custom creature")
         cfg["type"] = new_type
         _write_wolt_settings(wolt_json, cfg)
-    site_emoji = _follow_site_emoji(safe, old_type, new_type)
+        # Under the same locks: two assignments must leave the site with the
+        # emoji of the one that wrote wolt.json last.
+        site_emoji = _follow_site_emoji(safe, old_type, new_type)
     kept = {k: cfg[k] for k in ("harness", "model", "role") if cfg.get(k)}
     result = _wolt_settings_response(safe, cfg)
     result.update({

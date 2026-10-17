@@ -40,6 +40,9 @@ test('an unpinned custom creature shows its own model, else its size default', (
   assert.equal(woltDefaultModel(quick, codex), 'gpt-5.6-luna');
   assert.equal(woltDefaultModel({ ...star, creature_models: { codex: 'gone' } }, codex), 'gpt-5.5');
   assert.equal(woltDefaultModel({ type: 'beaver' }, { ...codex, models: { beaver: 'b' } }), 'b');
+  const opencode = { id: 'opencode', freeform_model: true, models: { raccoon: 'openai/gpt-4o' }, catalog: [] };
+  const own = { ...star, creature_models: { opencode: 'custom-provider/custom-model' } };
+  assert.equal(woltDefaultModel(own, opencode), 'custom-provider/custom-model');
 });
 
 function pageExpression(file, marker, context, expr) {

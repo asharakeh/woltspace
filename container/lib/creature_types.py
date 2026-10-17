@@ -61,9 +61,10 @@ BUILTIN_EMOJI = {
     "panda": "🐼",
 }
 
-# Names a custom creature can never take: every built-in, plus the keys the
-# "creatures" section already uses for itself.
-RESERVED = set(BUILTIN_EMOJI) | {"vulture", "custom", "creature", "wolt"}
+# Names a custom creature can never take: every built-in, every type a
+# surface keeps its own emoji for (the lodge pages still know "eagle"), the
+# creature modules, and the keys the "creatures" section uses for itself.
+RESERVED = set(BUILTIN_EMOJI) | {"eagle", "vulture", "custom", "creature", "wolt"}
 
 CREATURE_ID_MAX = 20
 ROLE_MAX = 200

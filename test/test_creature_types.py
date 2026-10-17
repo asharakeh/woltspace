@@ -402,3 +402,32 @@ def test_assignment_and_a_settings_change_both_land(client, lodge, monkeypatch):
     patch_.join(5)
     cfg = json.loads(path.read_text())
     assert (cfg["type"], cfg["model"]) == ("star", "gpt-5.6-sol")
+
+
+def test_two_assignments_leave_the_site_with_the_last_creatures_emoji(client, lodge, monkeypatch):
+    from server import app as server_app
+
+    add_custom("star", STAR)
+    add_custom("quick", {"emoji": "⚡", "size": "otter"})
+    _wolt(lodge, "nova", type="raccoon")
+    site = lodge / "nova" / "wolt" / "site"
+    site.mkdir()
+    (site / "site.json").write_text(json.dumps({"tokens": {"emoji": "🦝"}}))
+    wrapped, inside, release = _paused(server_app._follow_site_emoji)
+    monkeypatch.setattr(server_app, "_follow_site_emoji", wrapped)
+
+    first, _ = _run(server_app._assign_creature, "nova", "star")
+    assert inside.wait(5)
+    second, _ = _run(server_app._assign_creature, "nova", "quick")
+    second.join(0.3)
+    assert second.is_alive()
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert json.loads((lodge / "nova/wolt/wolt.json").read_text())["type"] == "quick"
+    assert json.loads((site / "site.json").read_text())["tokens"]["emoji"] == "⚡"
+
+
+def test_a_name_a_page_keeps_its_own_emoji_for_is_reserved(lodge):
+    with pytest.raises(ValueError, match="built-in"):
+        add_custom("eagle", STAR)

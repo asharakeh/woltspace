@@ -13,7 +13,7 @@
   const fetchJSON = async (url, fallback) => { try { const r = await fetch(url); return r.ok ? await r.json() : fallback; } catch { return fallback; } };
   const time = ts => new Date(ts * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   const day = ts => { const d = new Date(ts * 1000), now = new Date(), yesterday = new Date(Date.now() - 86400e3); return d.toDateString() === now.toDateString() ? 'Today' : d.toDateString() === yesterday.toDateString() ? 'Yesterday' : d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }); };
-  const effective = () => { const id = config.harness || harnesses.default || 'claude'; const h = (harnesses.harnesses || []).find(x => x.id === id) || {}; const models = h.models || {}; return { id, model: config.model || models[woltBaseType(config)] || models.raccoon || '' }; };
+  const effective = () => { const id = config.harness || harnesses.default || 'claude'; const h = (harnesses.harnesses || []).find(x => x.id === id) || {}; return { id, model: config.model || woltDefaultModel(config, { ...h, id }) }; };
 
   function renderHeader() {
     const eng = effective(), own = sessions.filter(s => s.wolt === name).sort((a,b) => (b.last_activity || b.created_at || 0) - (a.last_activity || a.created_at || 0));

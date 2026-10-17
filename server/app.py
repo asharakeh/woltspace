@@ -61,7 +61,8 @@ from .pty_bridge import (
 # Session spawning — shared with bot
 import sys as _sys
 _sys.path.insert(0, str(WOLTSPACE_DIR / "container" / "lib"))
-from creature_types import base_type, creature_emoji
+from creature_types import base_type, creature_emoji, custom_creature_models
+from settings_files import settings_lock, write_json_atomic, write_text_atomic
 from sessions import (
     resume_session, start_session, stop_session,
     deliver_message, resolve_active_session, format_attributed_message,
@@ -1482,6 +1483,9 @@ def _configured_wolts() -> list[dict]:
                     "emoji": creature_emoji(config.get("type") or "rodent"),
                     # What it behaves like: a custom creature's size, else its type.
                     "base_type": base_type(config.get("type") or "rodent"),
+                    # A custom creature's own model per engine, so pages show
+                    # the model a session would really get (see woltDefaultModel).
+                    "creature_models": custom_creature_models(config.get("type")),
                 })
             except Exception:
                 pass
@@ -1962,9 +1966,8 @@ def _wolt_settings_response(safe: str, cfg: dict) -> dict:
 
 
 def _write_wolt_settings(wolt_json: Path, cfg: dict) -> None:
-    tmp = wolt_json.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
-    tmp.replace(wolt_json)
+    """Callers hold settings_lock(wolt_json) from their read to this write."""
+    write_json_atomic(wolt_json, cfg)
 
 
 def _apply_display_name(cfg: dict, safe: str, value: object) -> None:
@@ -1985,6 +1988,12 @@ def _apply_display_name(cfg: dict, safe: str, value: object) -> None:
 def _update_wolt_settings(name: str, body: dict) -> dict:
     if not body or not set(body).issubset({"harness", "model", "display_name"}):
         raise ValueError("body must contain harness, model and/or display_name only")
+    _safe, path = _wolt_settings_path(name)
+    with settings_lock(path):
+        return _update_wolt_settings_locked(name, body)
+
+
+def _update_wolt_settings_locked(name: str, body: dict) -> dict:
     safe, wolt_json, cfg = _load_wolt_settings(name)
     # Validate everything before the single write below.
     if "display_name" in body:
@@ -2103,16 +2112,19 @@ def _assign_creature(name: str, new_type: object) -> dict:
     from creature_types import SIZES, is_custom
     from wolts import SINGLETON_TYPES
 
-    safe, wolt_json, cfg = _load_wolt_settings(name)
-    old_type = cfg.get("type") or "rodent"
-    if not isinstance(new_type, str) or not new_type:
-        raise ValueError("type is required")
-    if old_type in SINGLETON_TYPES:
-        raise ValueError(f"{safe} is the lodge's {old_type}; its creature does not change here")
-    if new_type not in SIZES and not is_custom(new_type):
-        raise ValueError("type must be otter, beaver, raccoon, or a custom creature")
-    cfg["type"] = new_type
-    _write_wolt_settings(wolt_json, cfg)
+    _safe, path = _wolt_settings_path(name)
+    # Lodge lock first: removing a creature checks no wolt is one under it.
+    with settings_lock(WOLTS_DIR / "woltspace.json"), settings_lock(path):
+        safe, wolt_json, cfg = _load_wolt_settings(name)
+        old_type = cfg.get("type") or "rodent"
+        if not isinstance(new_type, str) or not new_type:
+            raise ValueError("type is required")
+        if old_type in SINGLETON_TYPES:
+            raise ValueError(f"{safe} is the lodge's {old_type}; its creature does not change here")
+        if new_type not in SIZES and not is_custom(new_type):
+            raise ValueError("type must be otter, beaver, raccoon, or a custom creature")
+        cfg["type"] = new_type
+        _write_wolt_settings(wolt_json, cfg)
     site_emoji = _follow_site_emoji(safe, old_type, new_type)
     kept = {k: cfg[k] for k in ("harness", "model", "role") if cfg.get(k)}
     result = _wolt_settings_response(safe, cfg)
@@ -2133,9 +2145,7 @@ def _follow_site_emoji(wolt: str, old_type: str, new_type: str) -> bool:
         if not isinstance(tokens, dict) or tokens.get("emoji") != creature_emoji(old_type):
             return False
         tokens["emoji"] = creature_emoji(new_type)
-        tmp = site_json.with_suffix(".tmp")
-        tmp.write_text(json.dumps(site, ensure_ascii=False) + "\n")
-        tmp.replace(site_json)
+        write_text_atomic(site_json, json.dumps(site, ensure_ascii=False) + "\n")
         return True
     except (OSError, json.JSONDecodeError, AttributeError):
         return False
@@ -3087,7 +3097,7 @@ async def wolves_page(request: Request):
     the /wolf/crons API, the same one `woltspace wolf` drives.
     """
     wolts = [
-        {"name": wolt["dir"], "type": wolt.get("type", "rodent")}
+        {"name": wolt["dir"], "type": wolt.get("type", "rodent"), "emoji": wolt["emoji"]}
         for wolt in _configured_wolts()
     ]
     return templates.TemplateResponse(request, "wolves.html", context={

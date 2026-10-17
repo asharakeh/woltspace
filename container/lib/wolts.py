@@ -21,6 +21,7 @@ from pathlib import Path
 from env_compat import get_env
 from skills_sync import seed_wolt_skills
 from creature_types import base_type, creature_emoji, get_custom
+from settings_files import settings_lock, write_json_atomic
 
 WOLTS_DIR = Path(get_env("WOLTSPACE_WOLTS_DIR", "/workspace/wolts"))
 WOLTSPACE_DIR = Path(os.environ.get("WOLTSPACE_DIR", "/workspace/woltspace"))
@@ -107,13 +108,14 @@ def set_active_creature(creature_type: str, wolt_name: str) -> None:
     """Set the active wolt for a singleton creature type."""
     if creature_type not in SINGLETON_TYPES:
         return
-    try:
-        config = json.loads(CONFIG_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        config = {}
-    config.setdefault("creatures", {})
-    config["creatures"][f"active_{creature_type}"] = wolt_name
-    CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n")
+    with settings_lock(CONFIG_FILE):
+        try:
+            config = json.loads(CONFIG_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            config = {}
+        config.setdefault("creatures", {})
+        config["creatures"][f"active_{creature_type}"] = wolt_name
+        write_json_atomic(CONFIG_FILE, config)
 
 
 WOLT_SLUG_MAX = 20
@@ -165,7 +167,19 @@ def create_creature_wolt(name: str, creature_type: str, role: str = "",
         - "dir": Path to the new wolt directory
         - "demoted": name of the old wolt that was demoted to rodent, or None
     Raises ValueError if the type is invalid or the name already exists.
+
+    Holds the lodge settings lock throughout: removing a custom creature
+    checks that no wolt is one under the same lock, so a wolt can never be
+    created as a creature that is being removed.
     """
+    with settings_lock(CONFIG_FILE):
+        return _create_creature_wolt(name, creature_type, role, description,
+                                     harness, model, display_name)
+
+
+def _create_creature_wolt(name: str, creature_type: str, role: str,
+                          description: str, harness: str,
+                          model: str, display_name: str) -> dict:
     if not is_valid_type(creature_type):
         raise ValueError(f"Invalid creature type: {creature_type}. Must be one of: {', '.join(sorted(VALID_TYPES))}, or a custom creature")
     custom = get_custom(creature_type)
@@ -189,9 +203,10 @@ def create_creature_wolt(name: str, creature_type: str, role: str = "",
             old_wolt_json = WOLTS_DIR / active / "wolt" / "wolt.json"
             if old_wolt_json.exists():
                 try:
-                    old_data = json.loads(old_wolt_json.read_text())
-                    old_data["type"] = "rodent"
-                    old_wolt_json.write_text(json.dumps(old_data, indent=2) + "\n")
+                    with settings_lock(old_wolt_json):
+                        old_data = json.loads(old_wolt_json.read_text())
+                        old_data["type"] = "rodent"
+                        write_json_atomic(old_wolt_json, old_data)
                     demoted = active
                 except (json.JSONDecodeError, OSError):
                     pass

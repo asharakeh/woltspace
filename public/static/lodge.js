@@ -49,8 +49,7 @@ function woltHarness(w) {
   const pinned = !!w.harness;
   const id = w.harness || harnessDefault;
   const info = harnessInfo(id);
-  const models = info.models || {};
-  const tierDefault = models[w.type] || models.raccoon || '';  // rodent (legacy) → raccoon tier
+  const tierDefault = woltDefaultModel(w, { ...info, id });  // rodent (legacy) → raccoon tier
   // per-wolt model pin wins IF valid for this engine (mirrors backend resolve_model:
   // a pin is harness-scoped, so an invalid one falls back to the tier default)
   const catalog = info.catalog || [];
@@ -389,7 +388,7 @@ function openEnginePicker(anchorEl, name) {
     button.type = 'button';
     button.appendChild(lodgeElement('span', 'engine-radio', selected ? '●' : '○'));
     button.appendChild(lodgeElement('span', 'engine-opt-label', h.label));
-    const model = modelFor(h.id, w.type);
+    const model = woltDefaultModel(w, harnessInfo(h.id));
     const sub = model + (h.id === harnessDefault ? ' · default' : '');
     if (sub) button.appendChild(lodgeElement('span', 'engine-opt-sub', sub));
     button.addEventListener('click', event => {

@@ -38,6 +38,7 @@ from env_compat import get_env
 from session_expiry import hold_active, public_hold
 from wolts import get_active_creature, find_by_type, list_wolts as _list_wolts_full
 from creature_types import emoji_from
+from settings_files import settings_lock, write_json_atomic
 from paths import (
     wolt_sessions_log,
     platform_version_file,
@@ -121,10 +122,11 @@ def switch_wolt(name: str) -> str | None:
     config_path = WOLTS_DIR / "woltspace.json"
     if config_path.exists():
         try:
-            config = json.loads(config_path.read_text())
-            adapter = os.environ.get("BOT_ADAPTER", "telegram")
-            config.setdefault(adapter, {})["active_wolt"] = name
-            config_path.write_text(json.dumps(config, indent=2) + "\n")
+            with settings_lock(config_path):
+                config = json.loads(config_path.read_text())
+                adapter = os.environ.get("BOT_ADAPTER", "telegram")
+                config.setdefault(adapter, {})["active_wolt"] = name
+                write_json_atomic(config_path, config)
         except Exception:
             pass
     return name

@@ -39,10 +39,10 @@ from __future__ import annotations
 
 import json
 import re
-import threading
 from pathlib import Path
 
 from env_compat import get_env
+from settings_files import settings_lock
 
 # The sizes a custom creature can take.
 SIZES = ("otter", "beaver", "raccoon")
@@ -70,11 +70,6 @@ ROLE_MAX = 200
 EMOJI_MAX = 16  # code points: a flag or a skin-toned emoji is several
 _ID = re.compile(r"^[a-z][a-z0-9-]*$")
 _FIELDS = {"emoji", "size", "models", "role"}
-
-# Writes come only through the lodge's control plane (one process); this keeps
-# two of its requests from interleaving a read-modify-write of the file.
-_write_lock = threading.Lock()
-
 
 def _config_path() -> Path:
     return Path(get_env("WOLTSPACE_WOLTS_DIR", "/workspace/wolts")) / "woltspace.json"
@@ -158,6 +153,12 @@ def custom_model(harness: str | None, creature_type: str | None) -> str | None:
     return custom.get("models", {}).get(harness) or None
 
 
+def custom_creature_models(creature_type: str | None) -> dict:
+    """A custom creature's own model per harness ({} for any other type)."""
+    custom = get_custom(creature_type)
+    return dict(custom.get("models", {})) if custom else {}
+
+
 # --- validation and writes (control plane only) ---------------------------
 
 def _clean(cid: object, entry: object, *, check_models: bool = True) -> dict:
@@ -212,7 +213,7 @@ def add_custom(cid: str, entry: dict) -> dict:
     from harnesses import _load_lodge_settings_for_write, _write_lodge_settings
 
     clean = _clean(cid, entry)
-    with _write_lock:
+    with settings_lock(_config_path()):
         path, cfg = _load_lodge_settings_for_write()
         section = _custom_section(cfg)
         if cid in section:
@@ -235,13 +236,18 @@ def wolts_using(cid: str, wolts_dir: Path | None = None) -> list[str]:
 
 
 def remove_custom(cid: str) -> None:
-    """Remove a custom creature. Refuses while a wolt still is one."""
+    """Remove a custom creature. Refuses while a wolt still is one.
+
+    The in-use check runs under the lodge settings lock, which creating a wolt
+    and assigning a creature also hold: neither can give a wolt this creature
+    between the check and the removal.
+    """
     from harnesses import _load_lodge_settings_for_write, _write_lodge_settings
 
-    users = wolts_using(cid)
-    if users:
-        raise ValueError(f"{cid} is still the creature of: {', '.join(users)}; assign them another first")
-    with _write_lock:
+    with settings_lock(_config_path()):
+        users = wolts_using(cid)
+        if users:
+            raise ValueError(f"{cid} is still the creature of: {', '.join(users)}; assign them another first")
         path, cfg = _load_lodge_settings_for_write()
         section = _custom_section(cfg)
         if cid not in section:

@@ -27,7 +27,9 @@ change a wolt's creature, its own included, and it always asks you first.
 - **`--size`:** `otter`, `beaver` or `raccoon`: what it behaves like.
 - **`--model HARNESS=MODEL`:** optional, repeatable. The model must be one
   the engine offers (`GET /harnesses`).
-- **`--role`:** optional, the default role of a new wolt of this creature.
+- **`--role`:** optional, the role a new wolt of this creature starts with.
+  It is only that default: assigning the creature to an existing wolt never
+  changes the wolt's own role.
 - `add` never overwrites, and `rm` refuses while a wolt is that creature.
 
 New wolts can be created as a custom creature too (`POST /sessions/new/create`

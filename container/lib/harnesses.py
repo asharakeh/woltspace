@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 from env_compat import get_env
+from settings_files import settings_lock, write_json_atomic
 from session_runtime import RuntimeHandle, get_runtime
 from execution_policy import policy_mode
 from skills_sync import COPY_DELIVERY, PLUGIN_DELIVERY
@@ -1212,9 +1213,8 @@ def _settings_section(parent: dict, key: str) -> dict:
 
 
 def _write_lodge_settings(path: Path, cfg: dict) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
-    tmp.rename(path)
+    """Callers hold settings_lock(path) from their read to this write."""
+    write_json_atomic(path, cfg)
 
 
 def set_default_harness(name: str) -> str:
@@ -1225,9 +1225,10 @@ def set_default_harness(name: str) -> str:
     """
     if name not in HARNESSES:
         raise ValueError(f"unknown harness: {name}")
-    path, cfg = _load_lodge_settings_for_write()
-    _settings_section(cfg, "harness")["default"] = name
-    _write_lodge_settings(path, cfg)
+    with settings_lock(_woltspace_json_path()):
+        path, cfg = _load_lodge_settings_for_write()
+        _settings_section(cfg, "harness")["default"] = name
+        _write_lodge_settings(path, cfg)
     return name
 
 
@@ -1264,17 +1265,18 @@ def set_tier_defaults(harness: str, tiers: dict) -> dict:
             continue
         if not isinstance(model, str) or not is_valid_model(harness, model):
             raise ValueError(f"unknown model for {harness}: {model}")
-    path, cfg = _load_lodge_settings_for_write()
-    section = _settings_section(cfg, "harness")
-    entry = _settings_section(_settings_section(section, "models"), harness)
-    saved = _settings_section(entry, "tiers")
-    for tier, model in tiers.items():
-        # (5) what the owner picks is what is kept; only an empty value clears.
-        if model in (None, ""):
-            saved.pop(tier, None)
-        else:
-            saved[tier] = model
-    _write_lodge_settings(path, cfg)
+    with settings_lock(_woltspace_json_path()):
+        path, cfg = _load_lodge_settings_for_write()
+        section = _settings_section(cfg, "harness")
+        entry = _settings_section(_settings_section(section, "models"), harness)
+        saved = _settings_section(entry, "tiers")
+        for tier, model in tiers.items():
+            # (5) what the owner picks is what is kept; only an empty value clears.
+            if model in (None, ""):
+                saved.pop(tier, None)
+            else:
+                saved[tier] = model
+        _write_lodge_settings(path, cfg)
     return {tier: tier_default_model(harness, tier) for tier, _ in PICKER_TIERS}
 
 

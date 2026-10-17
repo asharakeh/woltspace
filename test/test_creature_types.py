@@ -179,7 +179,9 @@ def test_create_a_custom_creature_wolt_gets_a_site_its_role_and_base_lore(lodge)
     assert cfg["type"] == "star" and cfg["role"] == "Reviewer"
     index = (lodge / "nova" / "wolt" / "site" / "index.html").read_text()
     assert "⭐" in index
-    assert "raccoon-sized" in (lodge / "nova" / "CLAUDE.md").read_text()
+    claude_md = (lodge / "nova" / "CLAUDE.md").read_text()
+    assert "raccoon-sized: it works like a raccoon" in claude_md
+    assert "## Native wolts" in claude_md  # the platform lore every wolt boots with
 
 
 # --- the lodge API --------------------------------------------------------
@@ -288,7 +290,7 @@ def test_a_running_session_keeps_its_model_and_the_next_one_gets_the_change(
     monkeypatch.setattr(paths, "WOLTS_DIR", lodge)
     monkeypatch.setenv("WOLTSPACE_ISOLATION", "host")
     add_custom("quick", {"emoji": "⚡", "size": "otter"})
-    path = _wolt(lodge, "nova", type="raccoon", harness="claude")
+    path = _wolt(lodge, "nova", type="raccoon", harness="claude", role="Planner")
     (lodge / "nova" / "wolt" / "site").mkdir()
 
     running = sessions.start_session(wolt="nova")
@@ -302,6 +304,101 @@ def test_a_running_session_keeps_its_model_and_the_next_one_gets_the_change(
 
     resumed = sessions.prepare_session_command(running["name"], "resume")
     assert f"--model {raccoon_model}" in resumed
+    record = sessions.SessionRegistry(lodge).get(running["name"], check_alive=False)
+    assert (record["creature"], record["model"]) == ("raccoon", raccoon_model)
+    assert json.loads(path.read_text())["role"] == "Planner"  # the wolt's role is its own
     following = sessions.start_session(wolt="nova")
     assert following["model"] == tier_default_model("claude", "otter") != raccoon_model
     assert following["creature"] == "quick"
+
+
+# --- concurrent writers ---------------------------------------------------
+# Each test pauses one writer inside its read-modify-write and starts another
+# writer of the same file. The second must wait, and both changes must land.
+
+import threading  # noqa: E402
+
+
+def _paused(target, *, first_only=True):
+    """Wrap target so its first call stops until released."""
+    inside, release = threading.Event(), threading.Event()
+    calls = {"n": 0}
+
+    def wrapper(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1 or not first_only:
+            inside.set()
+            assert release.wait(5)
+        return target(*args, **kwargs)
+    return wrapper, inside, release
+
+
+def _run(fn, *args):
+    box = {}
+
+    def go():
+        try:
+            box["result"] = fn(*args)
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+    t = threading.Thread(target=go)
+    t.start()
+    return t, box
+
+
+def test_removing_a_creature_waits_for_an_assignment_in_flight(client, lodge, monkeypatch):
+    from server import app as server_app
+
+    add_custom("star", STAR)
+    _wolt(lodge, "nova", type="raccoon")
+    wrapped, inside, release = _paused(server_app._write_wolt_settings)
+    monkeypatch.setattr(server_app, "_write_wolt_settings", wrapped)
+
+    assign, _ = _run(server_app._assign_creature, "nova", "star")
+    assert inside.wait(5)
+    remove, removed = _run(remove_custom, "star")
+    remove.join(0.3)
+    assert remove.is_alive()  # waits for the assignment
+    release.set()
+    assign.join(5)
+    remove.join(5)
+    assert "still the creature of: nova" in str(removed["error"])
+    assert "star" in custom_creatures()
+
+
+def test_adding_a_creature_keeps_a_concurrent_default_harness_change(lodge, monkeypatch):
+    wrapped, inside, release = _paused(creature_types._custom_section)
+    monkeypatch.setattr(creature_types, "_custom_section", wrapped)
+
+    add, _ = _run(add_custom, "star", STAR)
+    assert inside.wait(5)
+    other, _ = _run(harnesses.set_default_harness, "codex")
+    other.join(0.3)
+    assert other.is_alive()
+    release.set()
+    add.join(5)
+    other.join(5)
+    settings = _settings(lodge)
+    assert settings["harness"]["default"] == "codex"
+    assert "star" in settings["creatures"]["custom"]
+    assert not list(lodge.glob("*.tmp"))
+
+
+def test_assignment_and_a_settings_change_both_land(client, lodge, monkeypatch):
+    from server import app as server_app
+
+    add_custom("star", STAR)
+    path = _wolt(lodge, "nova", type="raccoon", harness="codex")
+    wrapped, inside, release = _paused(server_app._write_wolt_settings)
+    monkeypatch.setattr(server_app, "_write_wolt_settings", wrapped)
+
+    assign, _ = _run(server_app._assign_creature, "nova", "star")
+    assert inside.wait(5)
+    patch_, _ = _run(server_app._update_wolt_settings, "nova", {"model": "gpt-5.6-sol"})
+    patch_.join(0.3)
+    assert patch_.is_alive()
+    release.set()
+    assign.join(5)
+    patch_.join(5)
+    cfg = json.loads(path.read_text())
+    assert (cfg["type"], cfg["model"]) == ("star", "gpt-5.6-sol")

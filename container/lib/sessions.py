@@ -1319,36 +1319,47 @@ def _adapter_context(data: dict) -> str:
 BOOT_PROMPT_MAX_BYTES = 96 * 1024
 
 
-def _cut_boot_file(path: Path, text: str, room: int) -> str:
-    """`text` cut to at most `room` UTF-8 bytes, a line saying so included."""
+def _cut_boot_file(path: Path, text: str, above: int, room: int) -> str:
+    """`text` cut to at most `room` UTF-8 bytes, a line saying so included.
+
+    `above` is how many lines strip() took off the top of the file. The note
+    numbers lines as the file on disk does, so the wolt reads on from the first
+    line it was not shown instead of reading the shown ones again.
+    """
     raw = text.encode()
+    head = (f"[Cut by the lodge: {path.name} is {len(raw)} bytes and the boot "
+            f"limit is {BOOT_PROMPT_MAX_BYTES}.")
 
     def note(shown: int) -> str:
-        return (f"[Cut by the lodge: {path.name} is {len(raw)} bytes and the boot "
-                f"limit is {BOOT_PROMPT_MAX_BYTES}. Only the first {shown} bytes are "
-                f"shown. Read {path} in full, and trim your boot memory.]")
+        if not shown:
+            return (f"{head} Nothing of it is shown. Read {path} in full, and trim "
+                    "your boot memory.]")
+        return (f"{head} Lines 1-{shown} of it are shown above. Read {path} from line "
+                f"{shown + 1} on, and trim your boot memory.]")
 
-    # Sized with `room` as the count, which never has fewer digits than the count shown.
-    keep = room - len(note(room).encode())
+    # Sized with the file's last line number, which no number in the note exceeds.
+    keep = room - len(note(above + raw.count(b"\n") + 1).encode())
     # A line break is one byte that never occurs inside a UTF-8 character, so
     # cutting just after one keeps the last line and every character whole.
-    shown = raw.rfind(b"\n", 0, max(keep, 0)) + 1
-    return raw[:shown].decode() + note(shown)
+    end = raw.rfind(b"\n", 0, max(keep, 0)) + 1
+    shown = above + raw.count(b"\n", 0, end) if end else 0
+    return raw[:end].decode() + note(shown)
 
 
-def _fit_boot_files(files: list[tuple[Path, str]], budget: int) -> list[str]:
+def _fit_boot_files(files: list[tuple[Path, str, int]], budget: int) -> list[str]:
     """The files' texts, in order, sharing `budget` UTF-8 bytes fairly.
 
     Smallest first, each takes at most an equal part of what is left; a file
     that fits stays whole and leaves the rest to the others. So in practice
     identity.md stays whole and the largest file is cut.
     """
-    texts = [text for _, text in files]
+    texts = [text for _, text, _ in files]
     by_size = sorted(range(len(texts)), key=lambda i: len(texts[i].encode()))
     for done, i in enumerate(by_size):
         share = budget // (len(texts) - done)
         if len(texts[i].encode()) > share:
-            texts[i] = _cut_boot_file(files[i][0], texts[i], share)
+            path, _, above = files[i]
+            texts[i] = _cut_boot_file(path, texts[i], above, share)
         budget -= len(texts[i].encode())
     return texts
 
@@ -1372,21 +1383,23 @@ def _wolt_boot_context(data: dict, over: int = 0) -> str:
     for filename in ("identity.md", "context.md", "learnings.md"):
         path = memory_dir / filename
         try:
-            content = path.read_text().strip()
+            text = path.read_text()
         except OSError:
             continue
+        content = text.strip()
         if content:
-            files.append((path, content))
+            above = text[:len(text) - len(text.lstrip())].count("\n")
+            files.append((path, content, above))
     if not files:
         return ""
-    texts = [content for _, content in files]
+    texts = [content for _, content, _ in files]
     if over > 0:
         total = sum(len(text.encode()) for text in texts)
         texts = _fit_boot_files(files, total - over)
         print(f"[sessions] boot memory of {wolt} cut from {total} to "
               f"{sum(len(text.encode()) for text in texts)} bytes "
               f"(limit {BOOT_PROMPT_MAX_BYTES}); trim wolt/memory/", file=sys.stderr)
-    sections = [f"## {path.name}\n{text}" for (path, _), text in zip(files, texts)]
+    sections = [f"## {path.name}\n{text}" for (path, *_), text in zip(files, texts)]
     target = SessionTarget.from_record(data, wolts_dir=WOLTS_DIR, fallback_wolt=wolt)
     return (
         "[Woltspace boot context]\n"

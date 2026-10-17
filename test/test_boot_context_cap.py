@@ -112,7 +112,9 @@ def test_oversized_memory_fits_under_the_limit(wolts_dir):
     assert prompt.count("[Cut by the lodge") == 1
     assert (f"[Cut by the lodge: context.md is 200000 bytes and the boot limit is "
             f"{limit}.") in prompt
-    assert f"Read {memory / 'context.md'} in full, and trim your boot memory.]" in prompt
+    assert re.search(r"Lines 1-\d+ of it are shown above\. Read "
+                     + re.escape(str(memory / "context.md"))
+                     + r" from line \d+ on, and trim your boot memory\.\]", prompt)
     assert prompt.count(HELLO) == 1
     assert prompt.count(START_CHAT) == 1
 
@@ -127,9 +129,39 @@ def test_cut_ends_at_a_line_and_keeps_characters_whole(wolts_dir):
     kept = prompt.split("## context.md\n", 1)[1].split("[Cut by the lodge", 1)[0]
     assert kept and kept.endswith("\n")
     assert context.startswith(kept)
-    shown = int(re.search(r"Only the first (\d+) bytes are shown", prompt).group(1))
-    assert shown == len(kept.encode())
-    assert "�" not in prompt
+    shown = int(re.search(r"Lines 1-(\d+) of it are shown above", prompt).group(1))
+    assert shown == kept.count("\n")
+    assert "\ufffd" not in prompt
+
+
+def test_cut_line_names_the_first_line_not_shown(wolts_dir):
+    """Numbered as on disk: strip() takes the two blank lines off the top, and
+    the wolt reads on from the line the note names, not from the start again."""
+    context = "\n\n" + "".join(f"line {n:06d} of the context\n" for n in range(3, 8_000))
+    memory, *_ = _oversized(wolts_dir, context=context)
+
+    prompt = _opening_prompt(wolts_dir)
+
+    on_disk = (memory / "context.md").read_text().splitlines()
+    shown, next_line = map(int, re.search(
+        r"Lines 1-(\d+) of it are shown above\. Read \S+ from line (\d+) on", prompt).groups())
+    assert next_line == shown + 1
+    assert f"{on_disk[shown - 1]}\n[Cut by the lodge" in prompt
+    assert on_disk[shown] not in prompt
+
+
+def test_cut_with_no_whole_line_says_read_in_full(wolts_dir):
+    context = "x" * 150_000 + "\n" + _text(50_000)
+    memory, *_ = _oversized(wolts_dir, context=context)
+
+    prompt = _opening_prompt(wolts_dir)
+
+    limit = sessions.BOOT_PROMPT_MAX_BYTES
+    assert len(prompt.encode()) <= limit
+    assert (f"## context.md\n[Cut by the lodge: context.md is {len(context.encode())} bytes "
+            f"and the boot limit is {limit}. Nothing of it is shown. Read "
+            f"{memory / 'context.md'} in full, and trim your boot memory.]") in prompt
+    assert "Lines 1-" not in prompt
 
 
 def test_long_telegram_message_still_fits(wolts_dir):

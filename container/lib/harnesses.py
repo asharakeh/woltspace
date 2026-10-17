@@ -1090,8 +1090,18 @@ def tier_default_model(harness: str | None, tier: str | None) -> str | None:
 
 
 def creature_model(harness: str | None, creature: str | None) -> str | None:
-    """Map a creature tier to this harness's default model flag value."""
-    return tier_default_model(harness, creature)
+    """Map a creature to this harness's default model flag value.
+
+    A custom creature (creature_types) uses its own model for this harness
+    when it names a valid one, else the default of its size. Every other
+    creature is its own tier.
+    """
+    from creature_types import base_type, custom_model
+
+    own = custom_model(resolve_harness(harness), creature)
+    if own and is_valid_model(harness, own):
+        return own
+    return tier_default_model(harness, base_type(creature))
 
 
 def resolve_model(harness: str | None, creature: str | None,

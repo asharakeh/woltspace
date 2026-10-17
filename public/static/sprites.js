@@ -7,6 +7,11 @@ const WOLT_EMOJI = {
 };
 const RODENT_TYPES = new Set(['raccoon', 'beaver', 'otter', 'rodent']);
 const WOLT_TYPES = new Set(['raccoon', 'beaver', 'otter', 'rodent', 'dog']);
+// A custom creature behaves like its size: /wolts sends that as base_type.
+const woltBaseType = (w) => (w && (w.base_type || w.type)) || '';
+// How a wolt is shown when it has no pixel sprite: its built-in emoji, else
+// the custom creature's own (from /wolts).
+const woltEmoji = (w, fallback = '🦫') => WOLT_EMOJI[w && w.type] || (w && w.emoji) || fallback;
 
 const WOLT_SPRITES = {
   beaver: {

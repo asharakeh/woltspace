@@ -46,6 +46,50 @@ _MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
         " ON sessions(wolt, status, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS sessions_status ON sessions(status)",
     )),
+    (3, (
+        # Which wolt and session a chat talks to. Telegram keys by chat id;
+        # Slack by thread ("channel:root_ts") or, for a wolt choice, by the
+        # owner's user id. The two never collide: a user id has no colon.
+        """CREATE TABLE IF NOT EXISTS chat_state (
+            adapter        TEXT NOT NULL,
+            chat_id        TEXT NOT NULL,
+            active_wolt    TEXT,
+            active_session TEXT,
+            record         TEXT,
+            updated_at     INTEGER NOT NULL,
+            PRIMARY KEY (adapter, chat_id)
+        )""",
+        # Slack messages waiting for the owner to pick a wolt. `text` is
+        # cleared once claimed, so a message is delivered at most once.
+        """CREATE TABLE IF NOT EXISTS pending_messages (
+            id         TEXT PRIMARY KEY,
+            adapter    TEXT NOT NULL,
+            user       TEXT NOT NULL,
+            channel    TEXT NOT NULL,
+            root_ts    TEXT NOT NULL,
+            picker_ts  TEXT NOT NULL DEFAULT '',
+            event_id   TEXT,
+            text       TEXT,
+            state      TEXT NOT NULL,
+            wolt       TEXT,
+            session    TEXT,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        )""",
+        "CREATE INDEX IF NOT EXISTS pending_user"
+        " ON pending_messages(adapter, user, state, expires_at)",
+        # Apps the owner wants running; `record` is the whole state dict.
+        """CREATE TABLE IF NOT EXISTS apps_running (
+            name       TEXT PRIMARY KEY,
+            pid        INTEGER,
+            port       INTEGER,
+            tunnel_pid INTEGER,
+            tunnel_url TEXT,
+            keeper     TEXT,
+            started_at INTEGER NOT NULL,
+            record     TEXT NOT NULL
+        )""",
+    )),
 ]
 
 

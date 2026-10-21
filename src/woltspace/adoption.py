@@ -20,9 +20,11 @@ def import_lodge_state(layout: RuntimeLayout) -> dict:
     untouched, so the next boot tries again, and /health shows the error.
     """
     import lodge_db
+    from apps import import_apps
+    from chat_state import import_chat
     from sessions import import_sessions
 
-    importers = {"sessions": import_sessions}
+    importers = {"sessions": import_sessions, "chat": import_chat, "apps": import_apps}
     errors = {}
     for store, importer in importers.items():
         try:

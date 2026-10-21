@@ -203,13 +203,32 @@ class TestRunningState:
         assert result["dead"]["alive"] is False
         assert result["alive"]["alive"] is True
 
-
     def test_a_record_without_a_name_still_restores(self, wolts_dir):
         import lodge_db
         with lodge_db.write(wolts_dir) as conn:
             conn.execute("INSERT INTO apps_running (name, started_at, record)"
                          " VALUES ('ghost', 0, '{\"pid\": 999999}')")
         assert apps.apps_restore() == [{"name": "ghost", "action": "orphan-cleaned"}]
+
+    def test_old_state_files_are_imported_and_retired_logs_stay(self, wolts_dir):
+        import lodge_db
+        state_dir = apps._RUNNING_STATE_DIR
+        state_dir.mkdir(parents=True)
+        (state_dir / "pal-app.json").write_text(json.dumps(
+            {"name": "pal-app", "port": 4001, "pid": 7, "keeper": "pal"}))
+        (state_dir / "nunu-app.json").write_text(json.dumps({"name": "nunu-app", "pid": 8}))
+        (state_dir / "pal-app.log").write_text("log\n")
+        apps._write_state("nunu-app", {"name": "nunu-app", "pid": 9})
+
+        ran = lodge_db.run_imports(wolts_dir, {"apps": apps.import_apps})
+
+        assert ran == {"apps": {"imported": 1, "skipped": 1}}
+        assert apps._read_state("pal-app") == {"name": "pal-app", "port": 4001, "pid": 7,
+                                               "keeper": "pal"}
+        assert apps._read_state("nunu-app")["pid"] == 9
+        assert sorted(p.name for p in state_dir.iterdir()) == [
+            "nunu-app.json.imported", "pal-app.json.imported", "pal-app.log"]
+        assert lodge_db.run_imports(wolts_dir, {"apps": apps.import_apps}) == {}
 
 
 # ---------------------------------------------------------------------------

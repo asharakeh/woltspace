@@ -162,18 +162,43 @@ def _read_state(name: str) -> dict | None:
     return json.loads(row["record"]) if row else None
 
 
+_INSERT_STATE = ("INSERT{} INTO apps_running (name, pid, port, tunnel_pid, tunnel_url, keeper,"
+                 " started_at, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+
+
+def _state_row(name: str, state: dict) -> tuple:
+    return (name, state.get("pid"), state.get("port"), state.get("tunnel_pid"),
+            state.get("tunnel_url"), state.get("keeper"), int(time.time()), json.dumps(state))
+
+
 def _write_state(name: str, state: dict) -> None:
     with lodge_db.write(WOLTS_DIR) as conn:
         conn.execute(
-            "INSERT INTO apps_running (name, pid, port, tunnel_pid, tunnel_url, keeper,"
-            " started_at, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            _INSERT_STATE.format("") +
             " ON CONFLICT(name) DO UPDATE SET pid=excluded.pid, port=excluded.port,"
             " tunnel_pid=excluded.tunnel_pid, tunnel_url=excluded.tunnel_url,"
             " keeper=excluded.keeper, record=excluded.record",
-            (name, state.get("pid"), state.get("port"), state.get("tunnel_pid"),
-             state.get("tunnel_url"), state.get("keeper"), int(time.time()),
-             json.dumps(state)),
+            _state_row(name, state),
         )
+
+
+def import_apps(conn, wolts_dir) -> tuple[dict, list[Path]]:
+    """Import .space/apps/<name>.json from older releases; a row already here wins.
+
+    lodge_db.run_imports retires the files it returns; the .log files stay.
+    """
+    counts = {"imported": 0, "skipped": 0}
+    files = sorted(space_apps_dir(Path(wolts_dir)).glob("*.json"))
+    for path in files:
+        try:
+            state = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            print(f"[apps] import: skipping unreadable {path}: {exc}")
+            counts["skipped"] += 1
+            continue
+        cursor = conn.execute(_INSERT_STATE.format(" OR IGNORE"), _state_row(path.stem, state))
+        counts["imported" if cursor.rowcount else "skipped"] += 1
+    return counts, files
 
 
 def _clear_state(name: str) -> None:

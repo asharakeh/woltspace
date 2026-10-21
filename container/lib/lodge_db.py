@@ -50,6 +50,35 @@ _MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
         " ON sessions(wolt, status, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS sessions_status ON sessions(status)",
     )),
+    (2, (
+        # The owner's consents. scope: the approved directory for kind 'auto',
+        # the dig's name for kind 'dig' (whose `record` holds the rest).
+        """CREATE TABLE IF NOT EXISTS grants (
+            kind           TEXT NOT NULL,
+            wolt_id        TEXT NOT NULL,
+            scope          TEXT NOT NULL DEFAULT '',
+            policy_version INTEGER NOT NULL DEFAULT 0,
+            approved_at    INTEGER NOT NULL,
+            record         TEXT,
+            PRIMARY KEY (kind, wolt_id, scope)
+        )""",
+        # A dig's name is one dig for the whole lodge, whichever wolt holds it.
+        "CREATE UNIQUE INDEX IF NOT EXISTS grants_dig_name ON grants(scope) WHERE kind='dig'",
+        # The wolf's journal, one row per event. A row with action 'fired'
+        # claims `slot` (a minute) for its cron: the newest one is "last run".
+        """CREATE TABLE IF NOT EXISTS wolf_runs (
+            id      INTEGER PRIMARY KEY,
+            wolt    TEXT NOT NULL,
+            cron    TEXT NOT NULL,
+            slot    TEXT,
+            action  TEXT NOT NULL,
+            session TEXT,
+            ts      REAL NOT NULL,
+            extra   TEXT
+        )""",
+        # Unique so a re-import of a line or stamp already taken is skipped.
+        "CREATE UNIQUE INDEX IF NOT EXISTS wolf_runs_key ON wolf_runs(wolt, cron, action, ts)",
+    )),
 ]
 _BREAKING: set[int] = set()
 

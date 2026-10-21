@@ -378,6 +378,22 @@ def tunnel_url():
 # Session runtime test double
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _no_subprocess_inside_a_lodge_write(monkeypatch):
+    """A lodge.db write holds the lodge's one lock: SQL only, never tmux or ps."""
+    import subprocess as _subprocess
+    import lodge_db
+
+    def guarded(real):
+        def call(*args, **kwargs):
+            assert not lodge_db.in_write(), f"subprocess inside a lodge.db write: {args[:1]}"
+            return real(*args, **kwargs)
+        return call
+
+    monkeypatch.setattr(_subprocess, "run", guarded(_subprocess.run))
+    monkeypatch.setattr(_subprocess, "Popen", guarded(_subprocess.Popen))
+
+
 class FakeSessionRuntime:
     """Recording stand-in for TmuxSessionRuntime.
 
@@ -394,6 +410,13 @@ class FakeSessionRuntime:
     pane — True (raw), False (still cooked) or None (unreadable). age: what
     agent_age reports, in seconds — an agent long up by default — or None.
     """
+
+    def __getattribute__(self, name):
+        value = object.__getattribute__(self, name)
+        if callable(value) and not name.startswith("_"):
+            import lodge_db
+            assert not lodge_db.in_write(), f"runtime.{name} inside a lodge.db write"
+        return value
 
     def __init__(self, *, alive: bool = True, capture_text: str = "",
                  next_pane: str = "%1", panes=None, agents=(),

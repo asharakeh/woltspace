@@ -24,7 +24,8 @@ from execution_policy import AutoGrantStore
 from paths import space_wolf_dir
 from session_expiry import hold_active
 from session_runtime import RuntimeHandle, get_runtime
-from sessions import SessionRegistry, claim_resume_id, stamp_resume_id, stored_resume_id
+from sessions import (SessionRegistry, claim_resume_id, stamp_resume_id, stop_and_settle, stored_resume_id,
+                      wait_out_stopping)
 
 ARCHIVE_DIRNAME = ".archive"
 
@@ -116,20 +117,27 @@ def _end_session(registry: SessionRegistry, name: str, wolt: str, now: int, *,
     if not sweep and data.get("status") == "running" and not stored_resume_id(data):
         claim_resume_id(registry, data, lambda d: stamp_resume_id(
             registry, wolt, name, d["harness_session_id"]))
-    with registry.edit(name, wolt=wolt) as data:
+    for _ in range(3):  # a claim lost to a message or a hold: judge again
+        data = wait_out_stopping(registry, name)  # a rest in progress ends first
         handle = RuntimeHandle.from_record(data or {})
         if data is None or not get_runtime().is_alive(handle):
             return False
-        # The hold route writes in one transaction too: a hold may have come since the check.
+        # A hold may have come since the check before the move.
         if not sweep and hold_active(data, now):
             raise ArchiveError(409, f"{wolt} has a session that holds", held=[_held(data)])
-        if not get_runtime().stop(handle) and get_runtime().is_alive(handle):
+        resumable = data.get("status") in ("running", "resting") and stored_resume_id(data)
+        stopped = stop_and_settle(
+            registry, name, data,
+            lambda seen: get_runtime().stop(handle) or not get_runtime().is_alive(handle),
+            lambda record: record.update(status="resting", rested_at=now, rest_reason="archived")
+            if resumable else record.update(status="stopped", finished_at=now),
+            wolt=wolt,
+        )
+        if stopped is False:
             raise ArchiveError(500, f"session {name} could not be stopped")
-        if data.get("status") in ("running", "resting") and stored_resume_id(data):
-            data.update(status="resting", rested_at=now, rest_reason="archived")
-        else:
-            data.update(status="stopped", finished_at=now)
-    return True
+        if stopped:
+            return True
+    raise ArchiveError(409, f"session {name} kept changing; archive again")
 
 
 def _end_live(registry: SessionRegistry, name: str, now: int, *, sweep: bool = False) -> list[str]:

@@ -4,7 +4,9 @@ import json
 import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -58,29 +60,105 @@ def test_a_touch_never_writes_running_over_a_rest(tmp_path):
     assert True not in touched[touched.index(False):] if False in touched else True
 
 
-def test_a_paste_after_a_rest_wakes_instead_of_pasting(tmp_path, monkeypatch):
-    """#571 (b): a rest stops tmux inside its write; the paste claims first, then pastes."""
+def test_a_message_during_a_rest_waits_and_never_pastes(tmp_path, monkeypatch):
+    """#571 (b): the record is `stopping` while tmux dies; a message waits, then wakes it."""
     reg = SessionRegistry(tmp_path)
     make_session(reg, name="s", wolt="pal", harness_session_id="conv-1")
-    pastes = []
+    pastes, claimed, threads = [], [], []
     monkeypatch.setattr(sessions, "_tmux_paste", lambda *a, **k: pastes.append(a))
     monkeypatch.setattr(sessions, "resolve_agent_handle",
-                        lambda *a, **k: RuntimeHandle(tmux_session_name="s", pane_id="%1"))
-    resting, claimed = threading.Event(), []
+                        lambda *a, **k: RuntimeHandle("s", "s", pane_id="%1"))
 
-    def rest():
-        with reg.edit("s") as data:
-            resting.set()
-            threading.Event().wait(0.2)  # tmux stopping while the paste waits
-            data["status"] = "resting"
+    def stop(seen):
+        paste = threading.Thread(target=lambda: claimed.append(
+            sessions._paste_into_live_agent(reg, "pal", "s", "running", "claude", "hi")))
+        paste.start()
+        threads.append(paste)
+        time.sleep(0.3)  # the message has found `stopping` and waits
+        return not claimed
 
-    def paste():
-        resting.wait()
-        claimed.append(sessions._paste_into_live_agent(reg, "pal", "s", "running", "claude", "hi"))
-
-    _race(rest, paste)
-    assert claimed == [False] and pastes == []
+    rested = sessions.stop_and_settle(reg, "s", reg._read("pal", "s"), stop,
+                                      lambda record: record.update(status="resting"))
+    threads[0].join()
+    assert rested and claimed == [False] and pastes == []
     assert reg._read("pal", "s")["status"] == "resting"
+
+
+@pytest.mark.parametrize("rest_first", [False, True])
+def test_a_delivery_and_a_rest_claim_and_the_first_wins(tmp_path, monkeypatch, rest_first):
+    """E6b: the message is pasted and the rest refused, or the message waits and wakes it."""
+    reg = SessionRegistry(tmp_path)
+    make_session(reg, name="s", wolt="pal", harness_session_id="conv-1", last_activity=5)
+    judged, pastes = reg._read("pal", "s"), []
+    monkeypatch.setattr(sessions, "_tmux_paste", lambda *a, **k: pastes.append(a))
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda data: True)
+    monkeypatch.setattr(sessions, "session_has_agent_process", lambda *a: True)
+    monkeypatch.setattr(sessions, "resolve_agent_handle",
+                        lambda *a, **k: RuntimeHandle("s", "s", pane_id="%1"))
+    rest = []
+
+    def ready(*a):
+        if rest_first:  # the rest claims after delivery looked, and settles a moment later
+            assert reg.claim("s", judged, sessions.STOPPING)
+            settle = threading.Timer(0.3, lambda: reg._write(
+                "pal", "s", {**reg._read("pal", "s"), "status": "resting"}))
+            settle.start()
+            rest.append(settle)
+        return True
+
+    monkeypatch.setattr(sessions, "_await_input_ready", ready)
+    result = sessions.deliver_message("s", "hi", registry=reg)
+    if rest_first:
+        rest[0].join()
+        assert result["status"] == "session-dead" and pastes == []
+        assert reg._read("pal", "s")["status"] == "resting"
+    else:
+        assert result["status"] == "delivered" and len(pastes) == 1
+        assert not reg.claim("s", judged, sessions.STOPPING)
+
+
+def test_only_what_decides_a_rest_can_cancel_it(tmp_path):
+    reg = SessionRegistry(tmp_path)
+    make_session(reg, name="s", wolt="pal", last_activity=5)
+    judged = reg._read("pal", "s")
+    with reg.edit("s") as data:
+        data["title"] = "a title, not a use"
+    assert reg.claim("s", judged, sessions.STOPPING)
+    with reg.edit("s") as data:
+        data["status"] = "running"
+    reg.touch("s")  # a use since the judgment
+    assert not reg.claim("s", judged, sessions.STOPPING)
+
+
+def test_a_failed_stop_gives_back_the_status_and_keeps_what_came_meanwhile(tmp_path):
+    reg = SessionRegistry(tmp_path)
+    hold = {"until": None, "reason": "a build", "since": 1}
+    make_session(reg, name="s", wolt="pal", hold=hold)
+
+    def stop(seen):
+        with reg.edit("s") as data:
+            assert data["status"] == sessions.STOPPING
+            data["title"] = "written while stopping"
+        return False
+
+    assert sessions.stop_and_settle(reg, "s", reg._read("pal", "s"), stop, None) is False
+    stored = reg._read("pal", "s")
+    assert (stored["status"], stored["title"], stored["hold"]) == ("running", "written while stopping", hold)
+
+
+@pytest.mark.parametrize("resume_id, tmux_alive, settled", [
+    ("conv-1", False, "resting"), ("", False, "stopped"), ("conv-1", True, "resting")])
+def test_boot_finishes_a_stop_a_dead_control_plane_left(tmp_path, resume_id, tmux_alive, settled):
+    from conftest import FakeSessionRuntime
+    reg = SessionRegistry(tmp_path)
+    (tmp_path / "pal").mkdir()
+    make_session(reg, name="s", wolt="pal", status=sessions.STOPPING, harness_session_id=resume_id)
+    runtime = FakeSessionRuntime(alive=tmux_alive)
+    with mock.patch.object(sessions, "get_runtime", return_value=runtime):
+        report = reg.adopt_runtime_sessions()
+    assert report["settled"] == [{"session": "s", "wolt": "pal", "status": settled}]
+    assert reg._read("pal", "s")["status"] == settled
+    assert runtime.stops == (["s"] if tmux_alive else [])
 
 
 def test_two_claimers_of_one_conversation_get_one_each(tmp_path, monkeypatch):

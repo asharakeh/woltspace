@@ -1048,13 +1048,12 @@ async def session_message(session_id: str, request: Request):
 def _rest_session_locked(safe: str, idle_since: int):
     """Verify and stop one idle session without blocking the server event loop.
 
-    The authority judges the rule itself, inside one registry write that also
-    stops tmux: the session is running, can come back, holds nothing, and
-    nobody has used it since idle_since or for the whole window. A message
-    claims its use in a write of its own first, so it either lands before the
-    judgment (and the rest refuses) or finds the session resting.
+    The authority judges the rule itself: the session is running, can come
+    back, holds nothing, and nobody has used it since idle_since or for the
+    whole window. stop_and_settle then claims it `stopping` only if no use, hold
+    or resume came after the judgment, and stops tmux outside any write.
     """
-    from sessions import SessionRegistry, stamp_resume_id
+    from sessions import SessionRegistry, stamp_resume_id, stop_and_settle
     registry = SessionRegistry(WOLTS_DIR)
     data = registry.get(safe, check_alive=False)
     if data is None:
@@ -1065,35 +1064,40 @@ def _rest_session_locked(safe: str, idle_since: int):
     if data.get("status") == "running" and not stored_resume_id(data):
         claim_resume_id(registry, data, lambda d: stamp_resume_id(
             registry, wolt, safe, d["harness_session_id"]))
-    with registry.edit(safe, wolt=wolt) as data:
-        if data is None:
-            return JSONResponse({"error": "session not found"}, status_code=404)
-        if data.get("status") != "running":
-            return {"ok": True, "status": data.get("status"), "session": safe}
-        if not stored_resume_id(data):
-            return JSONResponse({"error": "session has no conversation to resume; not resting it"}, status_code=409)
-        now = int(time.time())
-        if hold_active(data, now):
-            return JSONResponse({"error": "session is held; not resting it"}, status_code=409)
-        try:
-            used = last_use(data, get_runtime().last_keys())
-        except Exception:
-            used = None
-        if used is None:
-            return JSONResponse({"error": "session activity could not be verified"}, status_code=409)
-        if used > idle_since:
-            return JSONResponse({"error": "session was used since; rest aborted"}, status_code=409)
-        # The authority judges the quiet window itself, never the caller. This
-        # also closes the same-second gap: use in the second the vulture
-        # looked is "now", far inside any window.
-        timeout = get_idle_timeout()
-        if timeout is None or now - used < timeout:
-            return JSONResponse({"error": "session is not idle long enough; rest aborted"}, status_code=409)
-        if not get_runtime().stop(RuntimeHandle.from_record(data)):
-            return JSONResponse({"error": "session could not be stopped; still running"}, status_code=409)
-        data["status"] = "resting"
-        data["rested_at"] = now
-        data["rest_reason"] = "idle"
+    data = registry.get(safe, wolt=wolt, check_alive=False)
+    if data is None:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    if data.get("status") != "running":
+        return {"ok": True, "status": data.get("status"), "session": safe}
+    if not stored_resume_id(data):
+        return JSONResponse({"error": "session has no conversation to resume; not resting it"}, status_code=409)
+    now = int(time.time())
+    if hold_active(data, now):
+        return JSONResponse({"error": "session is held; not resting it"}, status_code=409)
+    try:
+        used = last_use(data, get_runtime().last_keys())
+    except Exception:
+        used = None
+    if used is None:
+        return JSONResponse({"error": "session activity could not be verified"}, status_code=409)
+    if used > idle_since:
+        return JSONResponse({"error": "session was used since; rest aborted"}, status_code=409)
+    # The authority judges the quiet window itself, never the caller. This
+    # also closes the same-second gap: use in the second the vulture
+    # looked is "now", far inside any window.
+    timeout = get_idle_timeout()
+    if timeout is None or now - used < timeout:
+        return JSONResponse({"error": "session is not idle long enough; rest aborted"}, status_code=409)
+    stopped = stop_and_settle(
+        registry, safe, data,
+        lambda seen: get_runtime().stop(RuntimeHandle.from_record(seen)),
+        lambda record: record.update(status="resting", rested_at=now, rest_reason="idle"),
+        wolt=wolt,
+    )
+    if stopped is None:
+        return JSONResponse({"error": "session was used since; rest aborted"}, status_code=409)
+    if not stopped:
+        return JSONResponse({"error": "session could not be stopped; still running"}, status_code=409)
     return {"ok": True, "status": "resting", "session": safe, "rested_at": now}
 
 
@@ -1127,7 +1131,7 @@ async def wolt_message(name: str, request: Request):
     registry = SessionRegistry(WOLTS_DIR)
     session_id = resolve_active_session(safe_wolt, registry=registry)
     if not session_id:
-        resting = [s for s in registry.list(wolt=safe_wolt) if s.get("status") == "resting"]
+        resting = [s for s in registry.list(wolt=safe_wolt) if s.get("status") in ("resting", "stopping")]
         resting.sort(key=lambda s: (s.get("last_activity") or 0, s.get("created_at") or 0), reverse=True)
         session_id = resting[0]["name"] if resting else None
     if not session_id:

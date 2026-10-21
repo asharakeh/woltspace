@@ -18,6 +18,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -176,6 +177,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         raise
 
 
+_STATE = threading.local()
+
+
 @contextmanager
 def write(wolts_dir):
     """One write transaction: BEGIN IMMEDIATE, then COMMIT, or ROLLBACK on error.
@@ -186,15 +190,28 @@ def write(wolts_dir):
     conn = connect(wolts_dir)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        outer = in_write()
+        _STATE.writing = True
         try:
             yield conn
         except BaseException:
             if conn.in_transaction:  # SQLite may have rolled back already (FULL, IOERR)
                 conn.execute("ROLLBACK")
             raise
+        finally:
+            _STATE.writing = outer
         conn.execute("COMMIT")
     finally:
         conn.close()
+
+
+def in_write() -> bool:
+    """True while this thread holds a write transaction.
+
+    A write holds the lodge's one lock, so it runs SQL only: never a
+    subprocess (tmux, ps), never network I/O. The tests enforce it with this.
+    """
+    return getattr(_STATE, "writing", False)
 
 
 def run_imports(wolts_dir, importers: dict) -> dict:

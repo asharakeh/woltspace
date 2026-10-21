@@ -38,7 +38,7 @@ def _client():
 
 
 def _registry_mock():
-    """A Mock registry whose edit() yields get()'s record and _write()s it if changed."""
+    """A Mock registry whose edit() yields get()'s record and _write()s it if changed; claim() always wins."""
     registry = Mock()
 
     @contextmanager
@@ -49,7 +49,13 @@ def _registry_mock():
         if json.dumps(data, sort_keys=True) != before:
             registry._write(data.get("wolt", ""), name, data)
 
+    def claim(name, seen, status, *, wolt=None):
+        with edit(name, wolt=wolt) as data:
+            data["status"] = status
+        return True
+
     registry.edit = edit
+    registry.claim = claim
     return registry
 
 

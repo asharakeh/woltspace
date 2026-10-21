@@ -88,6 +88,13 @@ ORPHAN_AGENT_GONE = "agent-process-missing"
 
 # The fields get(check_alive=True) and list() compute rather than read off disk.
 LIVENESS_FIELDS = frozenset({"alive", "tmux_alive", "agent_alive"})
+# A session whose tmux is being stopped outside any write (stop_and_settle).
+STOPPING = "stopping"
+# What decides whether a session may be stopped: a claim compares these only.
+_CLAIM_FIELDS = ("status", "last_activity", "hold", "harness_session_id")
+# How long a message waits for a stop in progress before it goes on.
+STOPPING_WAIT = 30
+
 # One write transaction per thread per lodge, shared by nested registry calls.
 _TX = threading.local()
 
@@ -339,7 +346,7 @@ class SessionRegistry:
         # Same rule for a hold: it covered a task running in this session, and
         # that task died with it. Every write that leaves running (rest, death,
         # stop, finish, orphaned) drops it, so a woken session never inherits one.
-        if normalized.get("status") != "running":
+        if normalized.get("status") not in ("running", STOPPING):
             normalized.pop("hold", None)
         put_session(conn, normalized)
 
@@ -369,6 +376,19 @@ class SessionRegistry:
             yield data
             if data is not None and json.dumps(data, sort_keys=True, default=str) != before:
                 self._put(conn, data)
+
+    def claim(self, name: str, seen: dict, status: str, *, wolt: str = None) -> bool:
+        """Move a session to `status` only if what decides a stop is still as `seen`.
+
+        Compares status, last_activity, hold and the resume id, never the
+        whole record: a title or viewport written meanwhile must not cancel a
+        rest. False when a use, a hold or a resume came first.
+        """
+        with self.edit(name, wolt=wolt) as current:
+            if not still_as_seen(current, seen):
+                return False
+            current["status"] = status
+        return True
 
     def records(self, *, wolt: str = None) -> list[dict]:
         """Every visible session as stored, with no liveness work."""
@@ -761,6 +781,7 @@ class SessionRegistry:
             "adopted": [],
             "orphaned": [],
             "unchanged": [],
+            "settled": [],
         }
         runtime = _runtime()
         for wolt in self._all_wolts():
@@ -780,6 +801,9 @@ class SessionRegistry:
 
                 name = data.get("name") or row["name"]
                 previous = data.get("status") or ""
+                if previous == STOPPING:
+                    report["settled"].append(self._finish_stop(name, wolt, data, runtime))
+                    continue
                 if previous not in {"running", "orphaned"}:
                     report["unchanged"].append({
                         "session": name,
@@ -825,6 +849,21 @@ class SessionRegistry:
                     "handle_refreshed": adopted_handle != handle,
                 })
         return report
+
+    def _finish_stop(self, name: str, wolt: str, data: dict, runtime) -> dict:
+        """Settle a session a control plane left `stopping` when it died."""
+        handle = RuntimeHandle.from_record(data)
+        if runtime.is_alive(handle):
+            runtime.stop(handle)
+        now = int(time.time())
+        with self.edit(name, wolt=wolt) as current:
+            if current is not None and current.get("status") == STOPPING:
+                if stored_resume_id(current):
+                    current.update(status="resting", rested_at=now,
+                                   rest_reason=current.get("rest_reason") or "interrupted")
+                else:
+                    current.update(status="stopped", finished_at=now)
+        return {"session": name, "wolt": wolt, "status": (current or {}).get("status")}
 
     def delete(self, name: str, *, wolt: str = None) -> bool:
         """Remove a session. Returns True if it existed."""
@@ -1221,7 +1260,7 @@ def deliver_message(session_id: str, text: str, from_wolt: str = "",
     paste_settle (every engine, claude included, pauses before the Enter).
     """
     reg = registry or SessionRegistry()
-    existing = reg.get(session_id, check_alive=False)
+    existing = wait_out_stopping(reg, session_id)
     if existing is None:
         return {"status": "no-session", "session": session_id}
     wolt = existing.get("wolt", "")
@@ -1248,14 +1287,14 @@ def deliver_message(session_id: str, text: str, from_wolt: str = "",
             "session": session_id,
             "detail": "the agent is still booting",
         }
-    # The delivery goes on record as use before the paste. A rest judges
-    # idleness and stops tmux inside one write: either it came first and the
-    # status is no longer the one checked above, or this use is on record and
-    # the rest refuses. Either way no message goes into a pane being stopped.
-    with reg.edit(session_id, wolt=wolt) as current:
-        if current is None or current.get("status") != data.get("status"):
-            return {"status": "session-dead", "session": session_id}
-        current["last_activity"] = int(time.time())
+    # The delivery claims the session before it pastes, as a rest does: one
+    # guarded UPDATE of last_activity WHERE status='running' (touch). A rest
+    # claims by comparing that last_activity, so whichever commits first
+    # wins: this one, and the rest's claim loses; the rest's, and this finds
+    # no running row, waits the stop out, and the caller wakes the session.
+    if not reg.touch(session_id, wolt=wolt):
+        wait_out_stopping(reg, session_id)
+        return {"status": "session-dead", "session": session_id}
     settle = get_harness(harness).get("paste_settle", 0.0)
     body = format_attributed_message(text, from_wolt, from_session)
     _tmux_paste(target, _guard_paste_text(harness, body), settle=settle)
@@ -1567,6 +1606,45 @@ def stamp_resume_id(registry: "SessionRegistry", wolt: str, name: str, resume_id
     with registry.edit(name, wolt=wolt) as current:
         if current is not None and not stored_resume_id(current):
             current["harness_session_id"] = resume_id
+
+
+def still_as_seen(record: dict | None, seen: dict) -> bool:
+    """Nothing that decides a stop or a settle changed since `seen` was read."""
+    return record is not None and all(record.get(k) == seen.get(k) for k in _CLAIM_FIELDS)
+
+
+def stop_and_settle(registry: "SessionRegistry", name: str, seen: dict, stop, settle,
+                    *, wolt: str = None) -> bool | None:
+    """Stop a session's tmux with no write transaction around the stop.
+
+    A write holds the lodge's one lock, and a slow tmux must not hold up every
+    other session. So: claim the record `stopping` if it is still as `seen`
+    (the judgment), run stop(seen) outside any write, then settle(record) in a
+    write. A message that finds `stopping` waits for it to end, then wakes the
+    session (wait_out_stopping), so it never lands in a pane being stopped.
+    A failed stop gives back the judged status and nothing else, so what was
+    written meanwhile stays. None: the claim lost. False: the stop failed.
+    """
+    if not registry.claim(name, seen, STOPPING, wolt=wolt):
+        return None
+    stopped = bool(stop(seen))
+    with registry.edit(name, wolt=wolt) as current:
+        if current is not None and current.get("status") == STOPPING:
+            if stopped:
+                settle(current)
+            else:
+                current["status"] = seen.get("status")
+    return stopped
+
+
+def wait_out_stopping(registry: "SessionRegistry", name: str) -> dict | None:
+    """The session's record once no stop is in progress (or after STOPPING_WAIT)."""
+    deadline = time.monotonic() + STOPPING_WAIT
+    while True:
+        data = registry.get(name, check_alive=False)
+        if data is None or data.get("status") != STOPPING or time.monotonic() > deadline:
+            return data
+        time.sleep(0.2)
 
 
 def recover_resume_id(data: dict, taken: set[str]) -> str:
@@ -1990,23 +2068,30 @@ def _paste_into_live_agent(registry: "SessionRegistry", wolt: str, name: str,
                            seen_status: str, harness: str, prompt: str) -> bool:
     """Deliver a resume prompt to the agent found running.
 
-    The look that found the agent was a plain read. A rest stops the runtime
-    and writes `resting` in one write; a paste after that sends the message
-    into a dead pane and writes `running` over a stopped session. So claim the
-    session first, in one write: only while the record still has the status we
-    saw and the agent is still there (the shape deliver_message has), it goes
-    back to running with this use on record, and a rest after it refuses. Then
-    paste. False when the session changed under us: the caller wakes it instead.
+    A rest claims the session `stopping` before it stops tmux; a paste after
+    that sends the message into a dying pane and writes `running` over a
+    stopped session. So find the pane first, then claim in one write: only
+    while the record still has the status we saw and nobody used, held or
+    rested it since, it goes back to running with this use on record, and a
+    rest after it loses its own claim. Then paste. False when the session
+    changed under us: a stop in progress is waited out, and the caller wakes it.
     """
+    seen = registry.get(name, wolt=wolt, check_alive=False)
+    if seen is None or seen.get("status") != seen_status:
+        wait_out_stopping(registry, name)
+        return False
+    target = resolve_agent_handle(seen, harness, include_launching=False)
+    if target is None:
+        return False
     with registry.edit(name, wolt=wolt) as current:
-        if current is None or current.get("status") != seen_status:
-            return False
-        target = resolve_agent_handle(current, harness, include_launching=False)
-        if target is None:
-            return False
-        current["status"] = "running"
-        current["runtime"] = target.to_record()
-        current["last_activity"] = int(time.time())  # a message is use
+        lost = not still_as_seen(current, seen)
+        if not lost:
+            current["status"] = "running"
+            current["runtime"] = target.to_record()
+            current["last_activity"] = int(time.time())  # a message is use
+    if lost:
+        wait_out_stopping(registry, name)
+        return False
     if prompt:
         _tmux_paste(target, _guard_paste_text(harness, prompt),
                     settle=get_harness(harness).get("paste_settle", 0.0))
@@ -2036,7 +2121,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
     did not come up — or, in step 2, did not take input within the wait.
     """
     registry = SessionRegistry()
-    data = registry.get(name, check_alive=False)
+    data = wait_out_stopping(registry, name)
     if data is None:
         raise ValueError(f"session '{name}' not found in registry")
 

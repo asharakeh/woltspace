@@ -335,6 +335,13 @@ def lodge(tmp_path, monkeypatch):
             yield data
 
     monkeypatch.setattr(sessions.SessionRegistry, "edit", recording_edit)
+    real_touch = sessions.SessionRegistry.touch
+
+    def recording_touch(self, name, **kwargs):  # delivery's claim
+        clock.events.append(("lock",))
+        return real_touch(self, name, **kwargs)
+
+    monkeypatch.setattr(sessions.SessionRegistry, "touch", recording_touch)
 
     installed = []
 

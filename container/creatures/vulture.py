@@ -44,7 +44,7 @@ from pathlib import Path
 from env_compat import get_env
 from sessions import (
     SessionRegistry, claim_resume_id, recover_resume_id, stamp_resume_id,
-    stored_resume_id, taken_resume_ids,
+    still_as_seen, stop_and_settle, stored_resume_id, taken_resume_ids,
 )
 from harnesses import session_has_agent_process
 from paths import space_vulture_dir
@@ -198,18 +198,19 @@ def _settle_dead(data: dict, now: int, reason: str) -> str:
 
 def _settle_if_still_dead(reg: SessionRegistry, wolt: str, name: str, now: int,
                           reason: str, still_dead, stop=None) -> str | None:
-    """Settle one session in one registry write, if it is still running and still dead.
+    """Settle one session, if it is still running and still dead.
 
     The pass works from a snapshot taken at its start; a message can resume a
     session in the meantime (resume_session spawns a new tmux and writes
-    running). Read again inside the write and ask the runtime again, so a
-    woken session is never written resting while it runs. Returns the new
-    status, or None when the session was left alone.
+    running). Read again and ask the runtime again, then settle only if
+    nothing that decides it changed since (registry.claim), so a woken
+    session is never written resting while it runs. Returns the new status,
+    or None when the session was left alone.
 
-    `stop` (pass 2's tmux kill) runs inside the same write, as /rest does: a
-    message that reads resting then finds tmux gone and wakes the session in
-    a fresh one, instead of reviving the agent in a pane about to be killed.
-    A failed stop leaves the session running.
+    `stop` (pass 2's tmux kill) goes through stop_and_settle, as /rest does: the
+    record is `stopping` while tmux dies, so a message waits for it and then
+    wakes the session in a fresh one, instead of reviving the agent in a pane
+    about to be killed. A failed stop leaves the session running.
 
     A session without a stored conversation id first gets one recovered from
     its engine's files, as an idle rest does, so it rests instead of being
@@ -218,13 +219,19 @@ def _settle_if_still_dead(reg: SessionRegistry, wolt: str, name: str, now: int,
     data = reg.get(name, wolt=wolt, check_alive=False)
     if data is not None and data.get("status") == "running" and not stored_resume_id(data):
         claim_resume_id(reg, data, lambda d: stamp_resume_id(reg, wolt, name, d["harness_session_id"]))
-    with reg.edit(name, wolt=wolt) as current:
-        if current is None or current.get("status") != "running" or not still_dead(current):
-            return None
-        if stop is not None and not stop():
-            return None
-        status = _settle_dead(current, now, reason)
-    return status
+    current = reg.get(name, wolt=wolt, check_alive=False)
+    if current is None or current.get("status") != "running" or not still_dead(current):
+        return None
+    settled = []
+    if stop is None:
+        with reg.edit(name, wolt=wolt) as record:
+            if still_as_seen(record, current):
+                settled.append(_settle_dead(record, now, reason))
+    elif not stop_and_settle(reg, name, current, lambda seen: stop(),
+                          lambda record: settled.append(_settle_dead(record, now, reason)),
+                          wolt=wolt):
+        return None
+    return settled[0] if settled else None
 
 
 def _log_held(data: dict, now: int) -> None:
@@ -374,10 +381,14 @@ def reap(dry_run: bool = False) -> dict:
                 log(f"[dry-run] would kill leftover tmux: {session_name}")
             else:
                 wolt_name = reg_data.get("wolt", "")
-                with reg.edit(session_name, wolt=wolt_name) as current:
-                    if not current or current.get("status") not in LEFTOVER_STATUSES:
-                        continue
-                    _kill_tmux_session(session_name)
+                current = reg.get(session_name, wolt=wolt_name, check_alive=False)
+                if not current or current.get("status") not in LEFTOVER_STATUSES:
+                    continue
+                if not stop_and_settle(reg, session_name, current,
+                                    lambda seen: _kill_tmux_session(session_name),
+                                    lambda record: record.update(status=current["status"]),
+                                    wolt=wolt_name):
+                    continue
                 log(f"🦅 killed leftover tmux: {session_name}")
                 stats["cleaned"].append(session_name)
             stats["tmux_killed"].append(session_name)

@@ -77,6 +77,8 @@ _MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             extra   TEXT
         )""",
         # Unique so a re-import of a line or stamp already taken is skipped.
+        # The key holds a REAL ts: importers copy it bit for bit, and nothing
+        # may round or normalize it, or the same event goes in twice.
         "CREATE UNIQUE INDEX IF NOT EXISTS wolf_runs_key ON wolf_runs(wolt, cron, action, ts)",
     )),
 ]

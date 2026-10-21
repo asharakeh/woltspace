@@ -240,9 +240,18 @@ def tmp_registry(tmp_path):
     if LIB_DIR not in sys.path:
         sys.path.insert(0, LIB_DIR)
     from sessions import SessionRegistry
-    # Per-wolt model: registry uses WOLTS_DIR as root, sessions land in
-    # wolts_dir/{wolt}/.state/sessions/{name}.json
     return SessionRegistry(tmp_path)
+
+
+def make_session(reg, **fields) -> dict:
+    """Store one session record as given (name and wolt required), as a test seed.
+
+    A raw write into the registry's lodge.db: no defaults beyond a running
+    status and a creation time, and no last_activity stamp.
+    """
+    record = {"status": "running", "created_at": int(time.time()), **fields}
+    reg._write(record["wolt"], record["name"], record)
+    return record
 
 
 @pytest.fixture
@@ -307,10 +316,8 @@ def _stop_shadow_sessions(wolts_dir: Path):
     """Stop every session the shadow wolt spawned — through the server if it is up."""
     import urllib.request
 
-    sessions_dir = wolts_dir / SHADOW_WOLT / ".state" / "sessions"
-    names = []
-    if sessions_dir.is_dir():
-        names = [path.stem for path in sessions_dir.glob("*.json")]
+    from sessions import SessionRegistry
+    names = [r["name"] for r in SessionRegistry(wolts_dir).records(wolt=SHADOW_WOLT)]
     for name in names:
         body = json.dumps({}).encode()
         request = urllib.request.Request(

@@ -198,35 +198,32 @@ def _settle_dead(data: dict, now: int, reason: str) -> str:
 
 def _settle_if_still_dead(reg: SessionRegistry, wolt: str, name: str, now: int,
                           reason: str, still_dead, stop=None) -> str | None:
-    """Settle one session under its lock, if it is still running and still dead.
+    """Settle one session in one registry write, if it is still running and still dead.
 
     The pass works from a snapshot taken at its start; a message can resume a
     session in the meantime (resume_session spawns a new tmux and writes
-    running). Read again under the lock and ask the runtime again, so a woken
-    session is never written resting while it runs. Returns the new status,
-    or None when the session was left alone.
+    running). Read again inside the write and ask the runtime again, so a
+    woken session is never written resting while it runs. Returns the new
+    status, or None when the session was left alone.
 
-    `stop` (pass 2's tmux kill) runs in the same critical section, before the
-    write, as /rest does: a message that reads resting then finds tmux gone
-    and wakes the session in a fresh one, instead of reviving the agent in a
-    pane about to be killed. A failed stop leaves the session running.
+    `stop` (pass 2's tmux kill) runs inside the same write, as /rest does: a
+    message that reads resting then finds tmux gone and wakes the session in
+    a fresh one, instead of reviving the agent in a pane about to be killed.
+    A failed stop leaves the session running.
 
     A session without a stored conversation id first gets one recovered from
     its engine's files, as an idle rest does, so it rests instead of being
-    reaped. Before the session lock, never inside it: claim_resume_id holds the
-    lodge-wide recovery lock, which resume_session takes first too.
+    reaped; outside the write, since recovery reads the engine's files.
     """
     data = reg.get(name, wolt=wolt, check_alive=False)
     if data is not None and data.get("status") == "running" and not stored_resume_id(data):
         claim_resume_id(reg, data, lambda d: stamp_resume_id(reg, wolt, name, d["harness_session_id"]))
-    with reg._lock(wolt, name):
-        current = reg._read(wolt, name)
+    with reg.edit(name, wolt=wolt) as current:
         if current is None or current.get("status") != "running" or not still_dead(current):
             return None
         if stop is not None and not stop():
             return None
         status = _settle_dead(current, now, reason)
-        reg._write(wolt, name, current)
     return status
 
 
@@ -305,25 +302,11 @@ def reap(dry_run: bool = False) -> dict:
 
     # --- Pass 1: Registry reconciliation ---
     # Find "running" registry entries whose tmux session is dead.
-    # Iterate all wolts' .state/sessions/ dirs (per-wolt model).
-    for wolt_entry in sorted(WOLTS_DIR.iterdir()) if WOLTS_DIR.exists() else []:
-        if not wolt_entry.is_dir() or wolt_entry.name.startswith("."):
-            continue
-        sessions_dir = wolt_entry / ".state" / "sessions"
-        if not sessions_dir.exists():
-            continue
-        for path in sessions_dir.glob("*.json"):
-            if path.name.endswith(".tmp"):
-                continue
-            try:
-                data = json.loads(path.read_text())
-            except (json.JSONDecodeError, OSError):
-                continue
-
-            name = data.get("name", path.stem)
+    for wolt_name in reg._all_wolts():
+        for data in reg.records(wolt=wolt_name):
+            name = data.get("name", "")
             status = data.get("status", "")
             created_at = data.get("created_at", 0)
-            wolt_name = data.get("wolt", wolt_entry.name)
 
             # Only reap sessions marked as running
             if status != "running":
@@ -391,8 +374,7 @@ def reap(dry_run: bool = False) -> dict:
                 log(f"[dry-run] would kill leftover tmux: {session_name}")
             else:
                 wolt_name = reg_data.get("wolt", "")
-                with reg._lock(wolt_name, session_name):
-                    current = reg._read(wolt_name, session_name)
+                with reg.edit(session_name, wolt=wolt_name) as current:
                     if not current or current.get("status") not in LEFTOVER_STATUSES:
                         continue
                     _kill_tmux_session(session_name)

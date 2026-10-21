@@ -112,17 +112,15 @@ def _end_session(registry: SessionRegistry, name: str, wolt: str, now: int, *,
     data = registry.get(name, wolt=wolt, check_alive=False)
     if data is None:
         return False
-    # Recover a missing id before the session lock, never inside it: the
-    # recovery lock is always taken first (see _rest_session_locked).
+    # Recover a missing id before the write below, as _rest_session_locked does.
     if not sweep and data.get("status") == "running" and not stored_resume_id(data):
         claim_resume_id(registry, data, lambda d: stamp_resume_id(
             registry, wolt, name, d["harness_session_id"]))
-    with registry._lock(wolt, name):
-        data = registry.get(name, wolt=wolt, check_alive=False)
+    with registry.edit(name, wolt=wolt) as data:
         handle = RuntimeHandle.from_record(data or {})
         if data is None or not get_runtime().is_alive(handle):
             return False
-        # The hold route takes this lock too: a hold may have come since the check.
+        # The hold route writes in one transaction too: a hold may have come since the check.
         if not sweep and hold_active(data, now):
             raise ArchiveError(409, f"{wolt} has a session that holds", held=[_held(data)])
         if not get_runtime().stop(handle) and get_runtime().is_alive(handle):
@@ -131,7 +129,6 @@ def _end_session(registry: SessionRegistry, name: str, wolt: str, now: int, *,
             data.update(status="resting", rested_at=now, rest_reason="archived")
         else:
             data.update(status="stopped", finished_at=now)
-        registry._write(wolt, name, data)
     return True
 
 
@@ -165,9 +162,10 @@ def archive_wolt(name: str, *, wolts_dir: Path, now: int | None = None) -> dict:
         except OSError as exc:
             raise ArchiveError(500, f"could not move {name} into {ARCHIVE_DIRNAME}: {exc}")
         # A message can wake a session, or a new one start, between the stop
-        # pass and the move. The registry can't see .archive, so read there.
+        # pass and the move. The registry shows only wolts in wolts/, so look
+        # through .archive, in the lodge's own database.
         try:
-            swept = _end_live(SessionRegistry(target.parent), name, now, sweep=True)
+            swept = _end_live(SessionRegistry(target.parent, db_dir=wolts_dir), name, now, sweep=True)
         except ArchiveError as exc:
             raise ArchiveError(500, f"archived {name}, but {exc.message}")
     return {"archived": name, "stopped": sorted(set(stopped + swept))}
@@ -283,10 +281,11 @@ def delete_archived_wolt(name: str, *, wolts_dir: Path) -> dict:
         # needed, so a delete that failed halfway can run again.
         if not in_archive(name, wolts_dir=wolts_dir):
             raise ArchiveError(404, f"no archived wolt named {name}")
-        # Grants and cron stamps are keyed by name: a later wolt with this
+        # Grants, cron stamps and sessions are keyed by name: a later wolt with this
         # name must not inherit them. They go first, so a delete that fails
         # halfway never leaves a grant behind.
         revoked = AutoGrantStore(wolts_dir).revoke_wolt(name)
+        SessionRegistry(wolts_dir).forget_wolt(name)
         stamps = space_wolf_dir(wolts_dir) / name
         if _unlinked(stamps, wolts_dir):  # a link on .space/wolf/<name> skips them, never followed
             shutil.rmtree(stamps, ignore_errors=True)

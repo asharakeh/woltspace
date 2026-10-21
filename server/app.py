@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import threading
 import time
@@ -265,6 +266,7 @@ async def health():
     from woltspace.layout import RuntimeLayout
 
     layout = RuntimeLayout.from_env()
+    adoption = read_adoption_report(layout)
     return {
         "ok": True,
         # The lodge's own version. The tui reads it to check the minimum
@@ -274,9 +276,28 @@ async def health():
         "pid": os.getpid(),
         "wolts_dir": str(WOLTS_DIR),
         "isolation": os.environ.get("WOLTSPACE_ISOLATION", "external"),
-        "adoption": read_adoption_report(layout),
+        "adoption": adoption,
         "connectors": read_connector_report(layout).get("connectors", []),
+        "db": _db_health(adoption),
     }
+
+
+def _db_health(adoption: dict) -> dict:
+    """Where lodge.db is, which migrations it has, what was imported into it."""
+    import lodge_db
+    db = {"path": str(lodge_db.path(WOLTS_DIR)), "schema": [], "imported": {}}
+    try:
+        conn = lodge_db.connect(WOLTS_DIR, readonly=True)
+        try:
+            db["schema"] = lodge_db.applied_migrations(conn)
+            db["imported"] = lodge_db.imports(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        db["error"] = f"{type(exc).__name__}: {exc}"
+    if adoption.get("import_errors"):
+        db["import_error"] = adoption["import_errors"]
+    return db
 
 # --- Templates & Static ---
 
@@ -953,13 +974,7 @@ def _hold_reason(value) -> str:
 
 def _hold_locked(safe: str, seconds: int | None, reason: str):
     from sessions import SessionRegistry
-    registry = SessionRegistry(WOLTS_DIR)
-    data = registry.get(safe, check_alive=False)
-    if data is None:
-        return JSONResponse({"error": "session not found"}, status_code=404)
-    wolt = data.get("wolt", "")
-    with registry._lock(wolt, safe):
-        data = registry.get(safe, wolt=wolt, check_alive=False)
+    with SessionRegistry(WOLTS_DIR).edit(safe) as data:
         if data is None:
             return JSONResponse({"error": "session not found"}, status_code=404)
         if data.get("status") != "running":
@@ -968,25 +983,16 @@ def _hold_locked(safe: str, seconds: int | None, reason: str):
         now = int(time.time())
         data["hold"] = {"until": None if seconds is None else now + seconds, "reason": reason, "since": now}
         data["last_activity"] = now  # taking a hold is use
-        registry._write(wolt, safe, data)
     return {"ok": True, "session": safe, "hold": data["hold"]}
 
 
 def _release_hold_locked(safe: str):
     from sessions import SessionRegistry
-    registry = SessionRegistry(WOLTS_DIR)
-    data = registry.get(safe, check_alive=False)
-    if data is None:
-        return JSONResponse({"error": "session not found"}, status_code=404)
-    wolt = data.get("wolt", "")
-    with registry._lock(wolt, safe):
-        data = registry.get(safe, wolt=wolt, check_alive=False)
+    with SessionRegistry(WOLTS_DIR).edit(safe) as data:
         if data is None:
             return JSONResponse({"error": "session not found"}, status_code=404)
-        if "hold" in data:
-            # A raw write: releasing is not use, so an idle session rests on the next sweep.
-            data.pop("hold")
-            registry._write(wolt, safe, data)
+        # A raw write: releasing is not use, so an idle session rests on the next sweep.
+        data.pop("hold", None)
     return {"ok": True, "session": safe, "hold": None}
 
 
@@ -1042,9 +1048,11 @@ async def session_message(session_id: str, request: Request):
 def _rest_session_locked(safe: str, idle_since: int):
     """Verify and stop one idle session without blocking the server event loop.
 
-    The authority judges the rule itself, under the session lock: the session
-    is running, can come back, holds nothing, and nobody has used it since
-    idle_since or for the whole window.
+    The authority judges the rule itself, inside one registry write that also
+    stops tmux: the session is running, can come back, holds nothing, and
+    nobody has used it since idle_since or for the whole window. A message
+    claims its use in a write of its own first, so it either lands before the
+    judgment (and the rest refuses) or finds the session resting.
     """
     from sessions import SessionRegistry, stamp_resume_id
     registry = SessionRegistry(WOLTS_DIR)
@@ -1052,14 +1060,12 @@ def _rest_session_locked(safe: str, idle_since: int):
     if data is None:
         return JSONResponse({"error": "session not found"}, status_code=404)
     wolt = data.get("wolt", "")
-    # Resting must be reversible: recover a missing id first. Before the session
-    # lock, never inside it: claim_resume_id holds the lodge-wide recovery lock,
-    # which resume_session and the id poller take before the session lock.
+    # Resting must be reversible: recover a missing id first, outside the write
+    # below (recovery reads the engine's files).
     if data.get("status") == "running" and not stored_resume_id(data):
         claim_resume_id(registry, data, lambda d: stamp_resume_id(
             registry, wolt, safe, d["harness_session_id"]))
-    with registry._lock(wolt, safe):
-        data = registry.get(safe, wolt=wolt, check_alive=False)
+    with registry.edit(safe, wolt=wolt) as data:
         if data is None:
             return JSONResponse({"error": "session not found"}, status_code=404)
         if data.get("status") != "running":
@@ -1088,8 +1094,7 @@ def _rest_session_locked(safe: str, idle_since: int):
         data["status"] = "resting"
         data["rested_at"] = now
         data["rest_reason"] = "idle"
-        registry._write(wolt, safe, data)
-        return {"ok": True, "status": "resting", "session": safe, "rested_at": now}
+    return {"ok": True, "status": "resting", "session": safe, "rested_at": now}
 
 
 @app.post("/sessions/{session_id}/rest")

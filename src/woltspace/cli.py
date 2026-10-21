@@ -580,6 +580,14 @@ def _auto(args) -> int:
     return 1
 
 
+def _graft_runtime_lib() -> RuntimeLayout:
+    layout = RuntimeLayout.from_env()
+    lib_dir = str(layout.runtime_lib)
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    return layout
+
+
 def _auto_runtime():
     """Borrow the runtime's own grant store and target resolver.
 
@@ -588,10 +596,7 @@ def _auto_runtime():
     implementation here would be a second answer to "is this directory
     approved?". Same sys.path graft `adoption.py` uses to reach the registry.
     """
-    layout = RuntimeLayout.from_env()
-    lib_dir = str(layout.runtime_lib)
-    if lib_dir not in sys.path:
-        sys.path.insert(0, lib_dir)
+    layout = _graft_runtime_lib()
     from execution_policy import AutoGrantStore
     from session_targets import SessionTarget
 
@@ -680,12 +685,15 @@ def _dig(args) -> int:
 
 
 def _dig_store():
+    """The dig grants, kept in the lodge DB that `container/lib` opens."""
+    layout = _graft_runtime_lib()
     from .dig import DigStore
 
-    return DigStore(RuntimeLayout.from_env().state_root)
+    return DigStore(layout.state_root)
 
 
 def _dig_grant(args) -> int:
+    _graft_runtime_lib()
     from .dig import DigError, resolve_ssh
 
     layout = RuntimeLayout.from_env()
@@ -730,6 +738,7 @@ def _dig_list(args) -> int:
 
 
 def _dig_revoke(args) -> int:
+    _graft_runtime_lib()
     from .dig import DigError
 
     try:
@@ -746,6 +755,7 @@ def _dig_revoke(args) -> int:
 
 
 def _dig_connect(args) -> int:
+    _graft_runtime_lib()
     from .dig import DigError, connect
 
     try:

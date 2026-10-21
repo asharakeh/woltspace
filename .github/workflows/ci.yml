@@ -101,6 +101,7 @@ jobs:
           test/test_wolt_archive.py
           test/test_wolt_archive_api.py
           test/test_wolt_archive_bots.py
+          test/test_chat_state.py
           test/test_native_session_cli.py
           test/test_seed.py
           test/test_container_entrypoint.py::test_boot_never_picks_a_name_only_the_archive_holds

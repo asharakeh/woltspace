@@ -32,7 +32,7 @@ def telegram(monkeypatch, tmp_path):
     start = MagicMock(return_value={"name": "pal-new-reed-654321", "url": ""})
     deliver = MagicMock(side_effect=lambda name, msg: {"ok": name == LIVE, "url": ""})
     for name, value in [
-            ("_WOLTS_DIR", wolts), ("CHATS_DIR", tmp_path / "chats"), ("HISTORY_DIR", tmp_path / "history"),
+            ("_WOLTS_DIR", wolts), ("HISTORY_DIR", tmp_path / "history"),
             ("list_wolts", lambda: [{"name": n, "type": "beaver", "dir": str(wolts / n)} for n in ("bob", "kit")]),
             ("is_allowed", lambda update: True), ("get_tunnel_url", lambda: ""), ("dog_available", lambda: False),
             ("transcribe_audio", lambda path: "hi"), ("_download_bytes", AsyncMock(return_value=b"ogg")),

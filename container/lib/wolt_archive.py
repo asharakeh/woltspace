@@ -22,6 +22,7 @@ from pathlib import Path
 
 from execution_policy import AutoGrantStore
 from paths import space_wolf_dir
+from wolfcore import forget_last_run
 from session_expiry import hold_active
 from session_runtime import RuntimeHandle, get_runtime
 from sessions import (SessionRegistry, claim_resume_id, stamp_resume_id, stop_and_settle, stored_resume_id,
@@ -294,9 +295,10 @@ def delete_archived_wolt(name: str, *, wolts_dir: Path) -> dict:
         # halfway never leaves a grant behind.
         revoked = AutoGrantStore(wolts_dir).revoke_wolt(name)
         SessionRegistry(wolts_dir).forget_wolt(name)
-        stamps = space_wolf_dir(wolts_dir) / name
-        if _unlinked(stamps, wolts_dir):  # a link on .space/wolf/<name> skips them, never followed
-            shutil.rmtree(stamps, ignore_errors=True)
+        forget_last_run(wolts_dir, name)
+        lock_dir = space_wolf_dir(wolts_dir) / name  # its wolf.json lock
+        if _unlinked(lock_dir, wolts_dir):  # a link on .space/wolf/<name> skips it, never followed
+            shutil.rmtree(lock_dir, ignore_errors=True)
         _open_up(target)
         try:
             shutil.rmtree(target, **{_ON_ERROR: _retry_removal})

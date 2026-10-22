@@ -27,8 +27,9 @@ import socket
 import sqlite3
 import stat
 import subprocess
+import sys
 import tarfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -549,12 +550,21 @@ def _add_entry(tar: tarfile.TarFile, entry: Entry) -> None:
 def snapshot_lodge_db(db: Path) -> tuple[bytes, dict]:
     """A consistent, scrubbed copy of the lodge database, in memory, and its row counts.
 
-    Read-only: the backup never writes to the live database, and SQLite's
-    backup API takes a consistent cut even mid-transaction, WAL rows included.
-    The copy never touches the disk. The ephemeral tables are emptied in it
-    with secure_delete and a VACUUM after, so their bytes are not left in free
-    pages either.
+    The backup changes no rows: it first folds the WAL into the file (a
+    TRUNCATE checkpoint, skipped with one line on stderr when busy or failed),
+    then SQLite's backup API takes a consistent cut even mid-transaction, WAL
+    rows included. The copy never touches the disk. The ephemeral tables are
+    emptied in it with secure_delete and a VACUUM after, so their bytes are
+    not left in free pages either.
     """
+    try:
+        with closing(sqlite3.connect(f"{Path(db).as_uri()}?mode=rw", uri=True, timeout=1)) as conn:
+            busy = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        problem = "busy" if busy else None
+    except sqlite3.Error as exc:
+        problem = str(exc)
+    if problem:
+        print(f"woltspace backup: lodge.db WAL checkpoint skipped ({problem})", file=sys.stderr)
     source = sqlite3.connect(f"{Path(db).as_uri()}?mode=ro", uri=True)
     copy = sqlite3.connect(":memory:", isolation_level=None)
     try:

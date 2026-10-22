@@ -13,6 +13,7 @@ in files; only rows that change live here.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import sqlite3
@@ -24,7 +25,10 @@ from pathlib import Path
 
 # Each entry runs once per file, and meta records it as migration:<id>.
 # Every missing id runs, in id order, so PRs that each add one can land in
-# any order. Add an entry; never edit a shipped one.
+# any order. Add an entry; never edit a shipped one. An entry is additive by
+# default: older code that does not know it still reads and writes the file.
+# One that is not (a dropped or renamed column, a changed meaning) also goes
+# in _BREAKING, and the file then refuses every build that does not know it.
 _MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
     (1, (
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -73,6 +77,8 @@ _MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             extra   TEXT
         )""",
         # Unique so a re-import of a line or stamp already taken is skipped.
+        # The key holds a REAL ts: importers copy it bit for bit, and nothing
+        # may round or normalize it, or the same event goes in twice.
         "CREATE UNIQUE INDEX IF NOT EXISTS wolf_runs_key ON wolf_runs(wolt, cron, action, ts)",
     )),
     (3, (
@@ -120,6 +126,11 @@ _MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
         )""",
     )),
 ]
+_BREAKING: set[int] = set()
+
+
+class SchemaTooNew(sqlite3.DatabaseError):
+    """lodge.db holds a breaking migration this build does not know."""
 
 
 def path(wolts_dir) -> Path:
@@ -151,6 +162,7 @@ def connect(wolts_dir, *, readonly: bool = False) -> sqlite3.Connection:
             # mode=ro opens lazily: touch the file now so a missing one
             # fails here, not at the caller's first query.
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            _refuse_newer(conn)
         else:
             ensure_schema(conn)
     except BaseException:
@@ -187,13 +199,38 @@ def applied_migrations(conn: sqlite3.Connection) -> list[int]:
     return sorted(_applied(conn))
 
 
+def _build() -> str:
+    try:
+        return importlib.metadata.version("woltspace")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _refuse_newer(conn: sqlite3.Connection) -> int:
+    """The file's floor (meta.min_schema), or SchemaTooNew when this build is below it."""
+    try:
+        meta = dict(conn.execute(
+            "SELECT key, value FROM meta WHERE key IN ('min_schema', 'written_by')"))
+    except sqlite3.OperationalError:  # no meta table: a new file
+        return 0
+    floor, known = int(meta.get("min_schema", 0)), max(v for v, _ in _MIGRATIONS)
+    if floor > known:
+        raise SchemaTooNew(
+            f"lodge.db needs schema >= {floor} (written by {meta.get('written_by', 'unknown')}); "
+            f"this build knows up to {known}. Install that build or newer.")
+    return floor
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Apply every migration meta has no record of, in one transaction."""
+    """Apply every migration meta has no record of, in one transaction, and
+    record the floor and this build. Writes nothing to a file above this build."""
+    _refuse_newer(conn)
     if {version for version, _ in _MIGRATIONS} <= _applied(conn):
         return
     conn.execute("BEGIN IMMEDIATE")
     try:
         done = _applied(conn)  # another process may have won
+        floor = _refuse_newer(conn)
         for version, statements in sorted(_MIGRATIONS):
             if version in done:
                 continue
@@ -203,6 +240,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
                 "INSERT INTO meta(key, value) VALUES (?, strftime('%s','now'))",
                 (f"migration:{version}",),
             )
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('min_schema', ?), ('written_by', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(max([floor, *_BREAKING])), _build()),
+        )
         conn.execute("COMMIT")
     except BaseException:
         if conn.in_transaction:  # SQLite may have rolled back already (FULL, IOERR)

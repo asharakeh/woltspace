@@ -3,7 +3,7 @@
 import os
 import sqlite3
 import stat
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import sys
 import threading
 from pathlib import Path
@@ -56,6 +56,59 @@ def test_a_migration_that_lands_late_still_runs(tmp_path, monkeypatch):
     assert {"two", "three"} <= tables
     assert lodge_db.applied_migrations(conn) == [1, 2, 3]
     conn.close()
+
+
+def _newer_build(monkeypatch, tmp_path, extra, breaking):
+    """Migrate the file as a newer build would, then come back as this one."""
+    known, known_breaking = lodge_db._MIGRATIONS, lodge_db._BREAKING
+    monkeypatch.setattr(lodge_db, "_MIGRATIONS", known + extra)
+    monkeypatch.setattr(lodge_db, "_BREAKING", known_breaking | breaking)
+    lodge_db.connect(tmp_path).close()
+    monkeypatch.setattr(lodge_db, "_MIGRATIONS", known)
+    monkeypatch.setattr(lodge_db, "_BREAKING", known_breaking)
+
+
+@pytest.mark.parametrize("readonly", [False, True])
+def test_an_additive_newer_migration_still_opens_with_older_code(tmp_path, monkeypatch, readonly):
+    newest = max(v for v, _ in lodge_db._MIGRATIONS)
+    _newer_build(monkeypatch, tmp_path, [(newest + 1, ("CREATE TABLE later (x)",))], set())
+    with closing(lodge_db.connect(tmp_path, readonly=readonly)) as conn:
+        assert lodge_db.applied_migrations(conn)[-1] == newest + 1
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+    assert meta["min_schema"] == "0"
+    assert meta["written_by"] == lodge_db._build()
+
+
+@pytest.mark.parametrize("readonly", [False, True])
+def test_a_breaking_newer_migration_makes_older_code_refuse(tmp_path, monkeypatch, readonly):
+    newest = max(v for v, _ in lodge_db._MIGRATIONS)
+    # The newer build skipped a migration this one would add: refusing must
+    # also mean not migrating.
+    monkeypatch.setattr(lodge_db, "_build", lambda: "9.9.9")
+    _newer_build(monkeypatch, tmp_path, [(newest + 2, ("CREATE TABLE later (x)",))], {newest + 2})
+    monkeypatch.setattr(lodge_db, "_MIGRATIONS",
+                        lodge_db._MIGRATIONS + [(newest + 1, ("CREATE TABLE mine (x)",))])
+    db = lodge_db.path(tmp_path)
+    before = db.read_bytes()
+    with pytest.raises(lodge_db.SchemaTooNew) as refused:
+        lodge_db.connect(tmp_path, readonly=readonly)
+    assert str(refused.value) == (
+        f"lodge.db needs schema >= {newest + 2} (written by 9.9.9); "
+        f"this build knows up to {newest + 1}. Install that build or newer.")
+    assert isinstance(refused.value, sqlite3.DatabaseError)
+    assert db.read_bytes() == before
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("SELECT count(*) FROM sqlite_master WHERE name='mine'").fetchone() == (0,)
+
+
+def test_the_floor_never_goes_down(tmp_path, monkeypatch):
+    newest = max(v for v, _ in lodge_db._MIGRATIONS)
+    _newer_build(monkeypatch, tmp_path, [(newest + 1, ("CREATE TABLE later (x)",))], {newest + 1})
+    _newer_build(monkeypatch, tmp_path, [(newest + 1, ("CREATE TABLE later (x)",)),
+                                         (newest + 2, ("CREATE TABLE last (x)",))], set())
+    with closing(sqlite3.connect(lodge_db.path(tmp_path))) as conn:
+        assert conn.execute("SELECT value FROM meta WHERE key='min_schema'").fetchone() == (
+            str(newest + 1),)
 
 
 def test_readonly_refuses_writes_and_a_missing_file(tmp_path):

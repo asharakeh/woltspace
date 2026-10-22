@@ -28,6 +28,23 @@ def _race(*targets):
         t.join()
 
 
+def test_a_read_of_an_empty_lodge_finds_nothing_and_creates_nothing(tmp_path):
+    reg = SessionRegistry(tmp_path)
+    assert reg.list() == [] and reg.records() == []
+    assert reg.get("s", check_alive=False) is None
+    assert reg.taken_resume_ids() == set()
+    assert not (tmp_path / ".space").exists()
+
+
+def test_a_read_opens_the_file_read_only(tmp_path):
+    reg = SessionRegistry(tmp_path)
+    make_session(reg, name="s", wolt="pal")
+    with reg._reader() as conn:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("DELETE FROM sessions")
+    assert reg.get("s", check_alive=False)["name"] == "s"
+
+
 def test_two_writers_of_different_fields_keep_both(tmp_path):
     """799e4b0: the spawner's runtime handle and session-reg's resume id, written together."""
     reg = SessionRegistry(tmp_path)

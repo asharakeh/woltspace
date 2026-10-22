@@ -770,6 +770,38 @@ def test_the_lodge_db_goes_in_as_one_consistent_snapshot(wolts, tmp_path):
         conn.close()
 
 
+def test_the_backup_folds_the_wal_and_still_restores(wolts, tmp_path):
+    import sqlite3
+
+    live = _live_lodge_db(wolts, rows=500)
+    wal = wolts / ".space" / "lodge.db-wal"
+    try:
+        assert wal.stat().st_size > 100_000
+        result = create_backup(wolts, out_dir=tmp_path / "out")
+        assert wal.stat().st_size == 0
+    finally:
+        live.close()
+    db = restore_backup(result.archive, to=tmp_path / "back").wolts_dir / ".space" / "lodge.db"
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT count(*) FROM sessions").fetchone() == (500,)
+    finally:
+        conn.close()
+
+
+def test_a_busy_checkpoint_is_one_line_and_the_backup_goes_on(wolts, tmp_path, capsys):
+    live = _live_lodge_db(wolts)
+    try:
+        live.execute("BEGIN")
+        live.execute("SELECT count(*) FROM sessions").fetchone()  # a reader pins the WAL
+        result = create_backup(wolts, out_dir=tmp_path / "out")
+    finally:
+        live.close()
+    assert result.manifest["lodge_db"]["tables"]["sessions"] == 3
+    lines = [line for line in capsys.readouterr().err.splitlines() if "checkpoint" in line]
+    assert len(lines) == 1, lines
+
+
 def test_no_lodge_db_means_no_lodge_db_in_the_manifest(wolts, tmp_path):
     result = create_backup(wolts, out_dir=tmp_path / "out")
     assert "lodge_db" not in result.manifest

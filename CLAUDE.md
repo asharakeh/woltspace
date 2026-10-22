@@ -229,6 +229,8 @@ API: `SessionRegistry.create()`, `.update()`, `.get()`, `.list()`, `.finish()`, 
 
 Used by core.py, run-session.sh, notify, and server. CLI wrapper: `session-reg`.
 
+Every lodge process must run as the lodge's user: `lodge.db` is 0600, and even a read-only open has to write its `-shm`, so `sudo` or another uid gets "unable to open database file".
+
 ### `container/bin/`
 Utility scripts available in container PATH:
 - `wclaude` — **always use this instead of bare `claude` inside the container.** Trusts `$PWD` via `trust-dir` before launching Claude Code — prevents the workspace trust dialog. All args pass through.

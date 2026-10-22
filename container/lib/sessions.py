@@ -291,7 +291,12 @@ class SessionRegistry:
         if conn is not None:
             yield conn
             return
-        conn = lodge_db.connect(self.db_dir)
+        if lodge_db.path(self.db_dir).exists():
+            conn = lodge_db.connect(self.db_dir, readonly=True)
+        else:  # no lodge here (yet): no sessions, and no new file
+            conn = sqlite3.connect(":memory:", isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            lodge_db.ensure_schema(conn)
         try:
             yield conn
         finally:

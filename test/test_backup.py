@@ -1230,107 +1230,83 @@ def test_real_age_round_trip(wolts, tmp_path, monkeypatch):
     assert restored.manifest["secrets"]["present"] is True
 
 
-def test_ephemeral_tables_are_scrubbed_from_the_snapshot_only(wolts, tmp_path, monkeypatch):
-    """Chat routing, the Slack queue, running apps and per-machine consents
-    stay home; their bytes are not even left in the copy's free pages."""
-    import sqlite3
-
-    # Debian builds SQLite with SECURE_DELETE on; macOS's Python does not.
-    # Start every connection without it, so the test sees what a Mac would.
-    real_connect = sqlite3.connect
-
-    def connect(*args, **kwargs):
-        conn = real_connect(*args, **kwargs)
-        conn.execute("PRAGMA secure_delete=OFF")
-        return conn
-
-    monkeypatch.setattr(sqlite3, "connect", connect)
+def test_every_lodge_db_row_goes_into_the_snapshot(wolts, tmp_path):
+    """Chat routing, the Slack queue, running apps and consents travel too."""
     live = _live_lodge_db(wolts)
     marker = "pal-said-0xMARKER"
     live.execute("CREATE TABLE pending_messages (id TEXT PRIMARY KEY, text TEXT)")
     live.execute("CREATE TABLE chat_state (chat_id TEXT PRIMARY KEY, record TEXT)")
     live.execute("CREATE TABLE grants (scope TEXT PRIMARY KEY, record TEXT)")
-    live.execute("CREATE TABLE wolf_runs (id INTEGER PRIMARY KEY, cron TEXT)")
-    for table, row in (("pending_messages", ("m1", marker * 50)),
-                       ("chat_state", ("c1", marker * 50)),
-                       ("grants", ("/home/pal/" + marker, "{}")),
-                       ("wolf_runs", (1, "digest"))):
-        live.execute(f"INSERT INTO {table} VALUES (?, ?)", row)
+    live.execute("CREATE TABLE apps_running (name TEXT PRIMARY KEY, pid INTEGER,"
+                 " tunnel_pid INTEGER, tunnel_url TEXT, record TEXT)")
+    for table, row in (("pending_messages", ("m1", marker)),
+                       ("chat_state", ("c1", "{}")),
+                       ("grants", ("/home/pal/nunu", "{}")),
+                       ("apps_running", ("shop", 1, None, None, "{}"))):
+        live.execute(f"INSERT INTO {table} VALUES ({', '.join('?' * len(row))})", row)
     try:
         result = create_backup(wolts, out_dir=tmp_path / "out")
     finally:
         live.close()
 
-    assert result.manifest["lodge_db"]["tables"] == {
-        "chat_state": 0, "grants": 0, "meta": 0, "pending_messages": 0,
-        "sessions": 3, "wolf_runs": 1,
-    }
-    assert result.manifest["lodge_db"]["scrubbed"] == [
-        "apps_running", "chat_state", "grants", "pending_messages",
-    ]
+    assert result.manifest["lodge_db"] == {"tables": {
+        "apps_running": 1, "chat_state": 1, "grants": 1, "meta": 0,
+        "pending_messages": 1, "sessions": 3,
+    }}
     with tarfile.open(result.archive, "r:gz") as tar:
         snapshot = tar.extractfile(f"{ARCHIVE_ROOT}/.space/lodge.db").read()
-    assert marker.encode() not in snapshot
-
-    conn = sqlite3.connect(wolts / ".space" / "lodge.db")
-    try:
-        assert conn.execute("SELECT count(*) FROM pending_messages").fetchone() == (1,)
-    finally:
-        conn.close()
+    assert marker.encode() in snapshot
 
     restored = restore_backup(result.archive, to=tmp_path / "back")
-    assert "woltspace auto grant" in "\n".join(backup_mod.restore_lines(restored))
+    assert ("consents came back with the lodge: review them with woltspace auto list"
+            in "\n".join(backup_mod.restore_lines(restored)))
 
 
-EPHEMERAL_FILES = (
-    ".space/logs/control-plane.log",
-    ".space/outbox/abc123",
-    ".space/vulture/last-run",
-    ".space/models/claude.json",
-    ".space/telegram/history/42.jsonl",
-    "pal/.state/chat/slack/D42.jsonl",
-    ".space/telegram/chats/42.json",
-    ".space/platform/chat/42.jsonl",
-    ".space/platform/views-history.jsonl",
-    ".space/auto-grants.json",
-    ".space/auto-grants.lock",
-    ".space/digs/grants.json",
-    ".space/digs/grants.lock",
-    ".space/apps/shop.json",
-    "pal/.state/chat/slack/_pending_messages.json",
-    "pal/.state/chat/slack/_pending_messages.lock",
-    "pal/.state/chat/slack/_thread_sessions.json",
-    "pal/.state/chat/slack/_owner_selections.json",
-    "pal/.state/chat/slack/_active_threads.json",
-    "wolts/.state/chat/slack/_pending_messages.json",  # the phantom wolt
-)
+def test_a_restored_app_row_forgets_its_process_ids(wolts, tmp_path):
+    """On another machine an old pid may be any live process: the app must be
+    started again, never taken as running, never signalled through it."""
+    import sqlite3
+
+    live = _live_lodge_db(wolts)
+    live.execute("CREATE TABLE apps_running (name TEXT PRIMARY KEY, pid INTEGER, port INTEGER,"
+                 " tunnel_pid INTEGER, tunnel_url TEXT, record TEXT)")
+    state = {"pid": os.getpid(), "port": 8100, "keeper": "pal", "tunnel_pid": os.getpid(),
+             "tunnel_url": "https://x.example"}
+    live.execute("INSERT INTO apps_running VALUES ('shop', ?, 8100, ?, 'https://x.example', ?)",
+                 (os.getpid(), os.getpid(), json.dumps(state)))
+    try:
+        result = create_backup(wolts, out_dir=tmp_path / "out")
+    finally:
+        live.close()
+
+    restored = restore_backup(result.archive, to=tmp_path / "back")
+    conn = sqlite3.connect(restored.wolts_dir / ".space" / "lodge.db")
+    try:
+        row = conn.execute("SELECT pid, port, tunnel_pid, tunnel_url, record FROM apps_running").fetchone()
+    finally:
+        conn.close()
+    # The lodge reads its app state from the record, so the pids go there too.
+    assert row[:4] == (None, 8100, None, None)
+    assert json.loads(row[4]) == {"port": 8100, "keeper": "pal"}
 
 
-def test_ephemeral_state_never_leaves_the_machine(wolts, tmp_path):
-    """Live files, and the *.imported copies lodge.db's importers leave behind."""
-    kept = (
-        "pal/.state/sessions.imported/pal-1.json",  # resume ids
-        ".space/telegram/uploads/photo.jpg",
-        ".space/platform/adoption.json",
-    )
-    paths = list(EPHEMERAL_FILES)
-    for rel in EPHEMERAL_FILES:
-        head, _, tail = rel.rpartition("/")
-        paths.append(f"{head}/{tail}.imported")
-        paths.append(f"{head}/{tail}.imported.2")
-    paths += [
+def test_runtime_state_goes_into_the_archive(wolts, tmp_path):
+    """Logs, chat history and routing, spools, consents, and the *.imported
+    copies lodge.db's importers leave behind: all of it is data now."""
+    paths = (
+        ".space/logs/control-plane.log",
+        ".space/outbox/abc123",
+        ".space/telegram/history/42.jsonl",
         ".space/telegram/chats.imported/42.json",
-        ".space/telegram/chats.imported.2/43.json",
-        ".space/apps.imported/shop.json",
-    ]
-    for rel in (*paths, *kept):
+        ".space/auto-grants.json.imported",
+        ".space/apps/shop.json",
+        "pal/.state/chat/slack/_pending_messages.json",
+    )
+    for rel in paths:
         (wolts / rel).parent.mkdir(parents=True, exist_ok=True)
-        (wolts / rel).write_text(SECRET)
+        (wolts / rel).write_text("x")
 
     result = create_backup(wolts, out_dir=tmp_path / "out")
     names = set(_members(result.archive))
-    leaked = [rel for rel in paths if f"{ARCHIVE_ROOT}/{rel}" in names]
-    assert leaked == []
-    for rel in kept:
-        assert f"{ARCHIVE_ROOT}/{rel}" in names
-    assert ".space/logs" in result.manifest["excludes"]["ephemeral"]["paths"]
+    assert [rel for rel in paths if f"{ARCHIVE_ROOT}/{rel}" not in names] == []
+    assert "ephemeral" not in result.manifest["excludes"]

@@ -18,7 +18,6 @@ one only gives a tidier registry.
 
 from __future__ import annotations
 
-import fnmatch
 import io
 import json
 import os
@@ -86,45 +85,6 @@ EXCLUDED_PATH_SUFFIXES = (
 #: (above). Only the lodge's: another SQLite file's `-wal` holds committed rows,
 #: so an app's database is archived as it lies, sidecars and all.
 LODGE_DB = ".space/lodge.db"
-
-#: Tables of the snapshot emptied before it is archived: chat routing, the
-#: Slack queue (the owner's message text), running apps, and the Auto and dig
-#: consents, which name this machine's paths and hosts. Sessions (resume ids)
-#: and wolf_runs (no duplicate cron fire) stay.
-SCRUBBED_TABLES = ("apps_running", "chat_state", "grants", "pending_messages")
-
-#: Ephemeral state never leaves the machine: logs, spools, caches, chat routing,
-#: queued messages, consents, running apps. Patterns over the path from the
-#: data root (`*` crosses folders); each also drops its `.imported` and
-#: `.imported.N` forms, the copies lodge.db's importers leave behind.
-EPHEMERAL_PATHS = (
-    ".space/logs",
-    ".space/outbox",
-    ".space/vulture",
-    ".space/models",
-    ".space/telegram/history",
-    "*/.state/chat/slack/*.jsonl",
-    ".space/telegram/chats",
-    ".space/platform/chat",
-    ".space/platform/views-history.jsonl",
-    ".space/auto-grants.json",
-    ".space/auto-grants.lock",
-    ".space/digs/grants.json",
-    ".space/digs/grants.lock",
-    ".space/apps",
-    "*/.state/chat/slack/_pending_messages.json",
-    "*/.state/chat/slack/_pending_messages.lock",
-    "*/.state/chat/slack/_thread_sessions.json",
-    "*/.state/chat/slack/_owner_selections.json",
-    "*/.state/chat/slack/_active_threads.json",
-)
-
-
-def _ephemeral(rel: str) -> bool:
-    return any(
-        fnmatch.fnmatchcase(rel, pattern) or fnmatch.fnmatchcase(rel, pattern + ".imported*")
-        for pattern in EPHEMERAL_PATHS
-    )
 
 #: `.codex/shell_snapshots` earns its place twice over. Codex snapshots the
 #: shell environment into runnable `.sh` files, so every exported secret — the
@@ -253,7 +213,7 @@ def _rel(root: Path, path: Path) -> str:
 
 
 def _path_excluded(rel: str) -> bool:
-    return _ephemeral(rel) or any(
+    return any(
         rel == suffix or rel.endswith("/" + suffix) for suffix in EXCLUDED_PATH_SUFFIXES
     )
 
@@ -474,10 +434,6 @@ def build_manifest(wolts_dir: Path, tag: str, scan: Scan) -> dict:
                 "suffixes": list(EXCLUDED_PATH_SUFFIXES),
                 "rule": "matched on the whole path tail, never on the bare name",
             },
-            "ephemeral": {
-                "paths": list(EPHEMERAL_PATHS),
-                "rule": "from the data root, with their .imported forms; never leaves the machine",
-            },
             "by_file_name": sorted(EXCLUDED_FILE_NAMES),
             "by_file_suffix": list(EXCLUDED_FILE_SUFFIXES),
             "never_excluded": {
@@ -548,14 +504,12 @@ def _add_entry(tar: tarfile.TarFile, entry: Entry) -> None:
 
 
 def snapshot_lodge_db(db: Path) -> tuple[bytes, dict]:
-    """A consistent, scrubbed copy of the lodge database, in memory, and its row counts.
+    """A consistent copy of the lodge database, in memory, and its row counts.
 
     The backup changes no rows: it first folds the WAL into the file (a
     TRUNCATE checkpoint, skipped with one line on stderr when busy or failed),
     then SQLite's backup API takes a consistent cut even mid-transaction, WAL
-    rows included. The copy never touches the disk. The ephemeral tables are
-    emptied in it with secure_delete and a VACUUM after, so their bytes are
-    not left in free pages either.
+    rows included, every row kept. The copy never touches the disk.
     """
     try:
         with closing(sqlite3.connect(f"{Path(db).as_uri()}?mode=rw", uri=True, timeout=1)) as conn:
@@ -573,15 +527,11 @@ def snapshot_lodge_db(db: Path) -> tuple[bytes, dict]:
             "SELECT name FROM sqlite_master WHERE type = 'table' "
             "AND name NOT LIKE 'sqlite_%' ORDER BY name"
         )]
-        copy.execute("PRAGMA secure_delete=ON")
-        for name in set(names) & set(SCRUBBED_TABLES):
-            copy.execute(f'DELETE FROM "{name}"')
-        copy.execute("VACUUM")
         tables = {
             name: copy.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
             for name in names
         }
-        return copy.serialize(), {"tables": tables, "scrubbed": list(SCRUBBED_TABLES)}
+        return copy.serialize(), {"tables": tables}
     finally:
         copy.close()
         source.close()
@@ -855,12 +805,26 @@ def restore_backup(
             audit_members(members, target)
             tar.extractall(target, members=members, filter=_restore_filter)
     manifest = json.loads((target / MANIFEST_NAME).read_text())
+    wolts_dir = target / manifest.get("archive_root", ARCHIVE_ROOT)
+    _forget_app_pids(wolts_dir / LODGE_DB)
     return RestoreResult(
         target=target,
-        wolts_dir=target / manifest.get("archive_root", ARCHIVE_ROOT),
+        wolts_dir=wolts_dir,
         manifest=manifest,
         entries=len([m for m in members if m.name != MANIFEST_NAME]),
     )
+
+
+def _forget_app_pids(db: Path) -> None:
+    """On the machine a backup lands on, an old pid may be any live process:
+    the lodge would take the app as running, and stopping it would signal
+    that process. Blank them in the restored copy, so the lodge starts it."""
+    if db.is_symlink() or not db.is_file():
+        return
+    with closing(sqlite3.connect(db, isolation_level=None)) as conn:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='apps_running'").fetchone():
+            conn.execute("UPDATE apps_running SET pid=NULL, tunnel_pid=NULL, tunnel_url=NULL,"
+                         " record=json_remove(record, '$.pid', '$.tunnel_pid', '$.tunnel_url')")
 
 
 @contextmanager
@@ -1009,8 +973,8 @@ def restore_lines(result: RestoreResult) -> list[str]:
     if "lodge_db" in manifest:
         lines.extend([
             "",
-            "consents are per machine and were not backed up: re-grant here what you want,",
-            "  woltspace auto grant <wolt> [--workdir DIR]  ·  woltspace dig grant ...",
+            "consents came back with the lodge: review them with woltspace auto list /",
+            "  woltspace dig list and revoke what this machine should not have",
         ])
     lines.extend([
         "",

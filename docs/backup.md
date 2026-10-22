@@ -32,11 +32,13 @@ Everything under `WOLTSPACE_WOLTS_DIR` that is data:
   lodge writes to it. Its live `lodge.db-wal`
   and `lodge.db-shm` stay out. Any other SQLite file (an app's own) is archived
   as it lies, `-wal` included, because that is where its newest rows are.
-  In the copy, never the live file, the ephemeral tables are emptied:
-  `chat_state`, `pending_messages` (the owner's queued Slack text),
-  `apps_running` and `grants`. The copy is then vacuumed, so their bytes are
-  not left in free pages. `sessions` (the resume ids) and `wolf_runs` (no
-  duplicate cron fire after a restore) stay
+  Every row goes in, chat routing, the Slack queue and the Auto and dig
+  consents included. On restore, the apps' pids (and tunnel pids) are blanked
+  in the restored copy: on another machine an old pid can be any live
+  process, so the lodge starts the app again instead of trusting it
+  (pre-lodge.db app files, `.space/apps/<name>.json`, come back as they were)
+- logs, chat history, spools and the `.imported` copies lodge.db's importers
+  leave behind: everything except junk (below) and the two OAuth login files
 - `.git` directories — a wolt's history is data, so it is archived in full
 
 Symlinks are archived **as symlinks** and never followed. The skill-delivery
@@ -74,25 +76,11 @@ own directory called `claude` is data, the rest of `.local` is data, and
 `.local/share/opencode` (session state, easily 150MB) is kept. Conversation
 transcripts live in `.claude/projects`, which is also kept.
 
-**Ephemeral state** — never leaves the machine, matched from the top of the
-data root, with the `.imported` / `.imported.N` copies lodge.db's importers
-leave behind:
-
-| Excluded | What it is |
-| --- | --- |
-| `.space/logs`, `.space/vulture` | logs, regenerated |
-| `.space/outbox` | `notify --file` spool, one-hour lifetime |
-| `.space/models` | engine model-list cache |
-| `.space/telegram/history`, `*/.state/chat/slack/*.jsonl`, `.space/platform/chat`, `.space/platform/views-history.jsonl` | chat and view history |
-| `.space/telegram/chats`, `*/.state/chat/slack/_thread_sessions.json`, `_owner_selections.json`, `_active_threads.json` | which wolt a chat talks to |
-| `*/.state/chat/slack/_pending_messages.json` (and `.lock`) | queued Slack messages, the owner's own text |
-| `.space/auto-grants.json`, `.space/digs/grants.json` (and their `.lock`) | Auto and dig consents: this machine's paths and hosts |
-| `.space/apps` | which apps run, on which port and pid |
-
-A restored lodge starts with chat routing and the Slack queue empty, no app
-running, and no consent: `restore` says to re-grant (`woltspace auto grant`,
-`woltspace dig grant`) on the machine that will run it. `.space/telegram/uploads`
-(files the owner sent) is kept.
+A restored lodge comes back with its consents. An Auto grant names a wolt
+and an absolute working folder, so it applies again only where that path
+exists the same way; a dig re-checks its host, user and port with `ssh -G`
+before every connection. `restore` says to review them (`woltspace auto
+list`, `woltspace dig list`) and revoke what the new machine should not have.
 
 **By file** — `.DS_Store`, `*.pyc`, `*.sock`, and anything that is not a
 regular file, a directory, or a symlink (sockets, fifos, devices): noise, or
@@ -216,8 +204,7 @@ left behind. Paths only: no credential is in the archive, and nothing reads a
 secret's **value** into the manifest or the printed summary.
 
 Two more sections: `lodge_db` (when there is a `lodge.db`) counts the rows of
-each table in the snapshot after the scrub, `{"tables": {"sessions": 159, ...},
-"scrubbed": [...]}`; `secrets`
+each table in the snapshot, `{"tables": {"sessions": 159, ...}}`; `secrets`
 says whether the `.env` files and bot tokens are inside, `{"present": true,
 "recipient"}` for an encrypted backup, and if not, the `reason`.
 

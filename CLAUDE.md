@@ -139,11 +139,10 @@ The data-plane snapshot, in the python CLI, identical native and in-container:
   the backup fails) the whole archive is one `<archive>.tar.gz.age`, streamed
   through `age`, the `.env` files and `config.json` inside (never the OAuth
   files); no plaintext touches the disk.
-- `.space/lodge.db` goes in as an in-memory snapshot (SQLite backup API), its ephemeral tables
-  (chat_state, pending_messages, apps_running, grants) emptied in the copy;
-  its `-wal`/`-shm` stay out. Ephemeral files (logs, chat history and routing,
-  queued messages, consents, running apps, and their `.imported` forms) never
-  go in: `EPHEMERAL_PATHS` in backup.py.
+- `.space/lodge.db` goes in as an in-memory snapshot (SQLite backup API), every
+  row kept; its `-wal`/`-shm` stay out. Everything else goes in too (logs, chat
+  history and routing, queued messages, consents, running apps) except junk and
+  the two OAuth login files. `restore` blanks the apps' pids in the restored copy.
 - `woltspace restore <archive> [--to DIR] [--identity KEYFILE|-]` — extracts
   into a new directory and refuses a populated one (an `.age` archive is
   decrypted twice, never to disk: audit pass, then extraction); prints what to re-authenticate and the `WOLTSPACE_WOLTS_DIR=…`

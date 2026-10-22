@@ -54,6 +54,7 @@ jobs:
           test/test_push_view.py
           test/test_lodge_db.py
           test/test_session_store.py
+          test/test_db_show_cli.py
           test/test_vulture.py
           test/test_vulture_connector.py
           test/test_session_expiry.py

@@ -251,6 +251,14 @@ _start_container() {
       *) publish="$WOLTSPACE_PUBLISH_HOST:$publish" ;;
     esac
   fi
+  local network_args=""
+  if [ -n "${WOLTSPACE_DOCKER_NETWORK:-}" ]; then
+    case "$WOLTSPACE_DOCKER_NETWORK" in
+      host|none) echo "error: WOLTSPACE_DOCKER_NETWORK=$WOLTSPACE_DOCKER_NETWORK is not allowed (host shares the host's network, none drops the port)" >&2; exit 1 ;;
+      -*|*[!A-Za-z0-9_.-]*) echo "error: WOLTSPACE_DOCKER_NETWORK must be a network name" >&2; exit 1 ;;
+    esac
+    network_args="--network $WOLTSPACE_DOCKER_NETWORK"
+  fi
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
   local extra_args=""
@@ -275,6 +283,7 @@ _start_container() {
     -v "$WOLTS_DIR:/workspace/wolts:rw" \
     -v "$WOLTS_DIR/.claude:/home/node/.claude:rw" \
     -p "$publish":7777 \
+    $network_args \
     $extra_args \
     woltspace > /dev/null
 

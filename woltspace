@@ -37,6 +37,11 @@ WOLTSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # See docs/environment.md for the full table and the sunset plan.
 WOLTS_DIR="${WOLTSPACE_WOLTS_DIR:-${WOLTS_DIR:-$HOME/.woltspace/wolts}}"
 WOLTS_DIR="${WOLTS_DIR/#\~/$HOME}"
+# The file docker hands the container as its environment. Read from the
+# launching shell only; a path outside the data root keeps it out of reach of
+# the container, whose first process runs as root with that environment.
+ENV_FILE="${WOLTSPACE_ENV_FILE:-$WOLTS_DIR/.env}"
+ENV_FILE="${ENV_FILE/#\~/$HOME}"
 
 # Default name for default path, hash-suffixed for custom paths (avoids collisions)
 if [ -n "${WOLTSPACE_CONTAINER:-}" ]; then
@@ -277,7 +282,7 @@ _start_container() {
   mkdir -p "$WOLTS_DIR/.claude"
   docker run -d \
     --name "$CONTAINER_NAME" \
-    --env-file "$WOLTS_DIR/.env" \
+    --env-file "$ENV_FILE" \
     -e HOST_UID=$(id -u) \
     -e HOST_GID=$(id -g) \
     -v "$WOLTS_DIR:/workspace/wolts:rw" \
@@ -335,7 +340,7 @@ _show_url() {
   echo ""
 
   # Check if tunnel is enabled
-  local env_file="$WOLTS_DIR/.env"
+  local env_file="$ENV_FILE"
   local tunnel_enabled
   tunnel_enabled=$(grep '^WOLTSPACE_PUBLIC_TUNNEL=' "$env_file" 2>/dev/null | cut -d= -f2-)
   tunnel_enabled="${tunnel_enabled:-true}"
@@ -423,7 +428,7 @@ if [ "$cmd" = "init" ]; then
   _setup_path
 
   # Detect existing lodge (wolts or just scaffold from prior init)
-  if [ -d "$WOLTS_DIR" ] && { [ "$(_count_wolts)" -gt 0 ] || [ -f "$WOLTS_DIR/.env" ]; }; then
+  if [ -d "$WOLTS_DIR" ] && { [ "$(_count_wolts)" -gt 0 ] || [ -f "$ENV_FILE" ]; }; then
     printf "\n  %b🦫%b  %b\n\n" "${_L}" "${_R}" "${_B}${_G}woltspace${_R}"
     if [ "$(_count_wolts)" -gt 0 ]; then
       echo "  ${_D}🐘 found existing wolts:${_R}"
@@ -487,7 +492,7 @@ if [ "$cmd" = "init" ]; then
 
   # Create wolts dir + .env from template
   mkdir -p "$WOLTS_DIR"
-  [ ! -f "$WOLTS_DIR/.env" ] && cp "$WOLTSPACE_DIR/.env.example" "$WOLTS_DIR/.env"
+  [ ! -f "$ENV_FILE" ] && cp "$WOLTSPACE_DIR/.env.example" "$ENV_FILE"
 
   # Ensure .claude dir exists for auth persistence (entrypoint handles ownership)
   mkdir -p "$WOLTS_DIR/.claude"
@@ -495,13 +500,13 @@ if [ "$cmd" = "init" ]; then
     echo ""
     echo "  ${_G}✓${_R} public access enabled"
     # Set tunnel enabled explicitly
-    sed -i '' 's/^# WOLTSPACE_PUBLIC_TUNNEL=false/WOLTSPACE_PUBLIC_TUNNEL=true/' "$WOLTS_DIR/.env" 2>/dev/null || \
-    sed -i 's/^# WOLTSPACE_PUBLIC_TUNNEL=false/WOLTSPACE_PUBLIC_TUNNEL=true/' "$WOLTS_DIR/.env"
+    sed -i '' 's/^# WOLTSPACE_PUBLIC_TUNNEL=false/WOLTSPACE_PUBLIC_TUNNEL=true/' "$ENV_FILE" 2>/dev/null || \
+    sed -i 's/^# WOLTSPACE_PUBLIC_TUNNEL=false/WOLTSPACE_PUBLIC_TUNNEL=true/' "$ENV_FILE"
   else
     echo ""
     echo "  ${_D}no worries — localhost:7777 only. you can enable it later in .env${_R}"
-    sed -i '' 's/^# WOLTSPACE_PUBLIC_TUNNEL=false/WOLTSPACE_PUBLIC_TUNNEL=false/' "$WOLTS_DIR/.env" 2>/dev/null || \
-    sed -i 's/^# WOLTSPACE_PUBLIC_TUNNEL=false/WOLTSPACE_PUBLIC_TUNNEL=false/' "$WOLTS_DIR/.env"
+    sed -i '' 's/^# WOLTSPACE_PUBLIC_TUNNEL=false/WOLTSPACE_PUBLIC_TUNNEL=false/' "$ENV_FILE" 2>/dev/null || \
+    sed -i 's/^# WOLTSPACE_PUBLIC_TUNNEL=false/WOLTSPACE_PUBLIC_TUNNEL=false/' "$ENV_FILE"
   fi
   echo ""
 

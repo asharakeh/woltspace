@@ -132,6 +132,10 @@ ARG USE_LOCAL=false
 # Changing CACHE_BUST invalidates the install layer (and everything after it)
 # but keeps the heavy layers above (node, claude, apt, uv, cloudflared) cached.
 ARG CACHE_BUST=
+# A path inside the build context. When set, that file becomes Claude Code's
+# managed settings, root-owned 0644: they outrank every user and project
+# settings file, and node cannot edit them. Unset: no managed settings.
+ARG WOLTSPACE_CLAUDE_MANAGED_SETTINGS=
 
 # uv's tool store lives somewhere predictable and node-owned, and the console
 # scripts land straight on PATH.
@@ -151,6 +155,14 @@ ENV PYTHONUNBUFFERED=1
 # Local source (only read when USE_LOCAL=true). Last COPY in the file so the
 # layers above stay cached.
 COPY . /tmp/local-src/
+
+# Claude refuses to start on an unparseable managed settings file, so a bad one
+# fails the build here rather than every session later.
+RUN if [ -n "$WOLTSPACE_CLAUDE_MANAGED_SETTINGS" ]; then \
+      f="/tmp/local-src/$WOLTSPACE_CLAUDE_MANAGED_SETTINGS"; \
+      python3 -m json.tool "$f" > /dev/null \
+      && install -D -o root -g root -m 0644 "$f" /etc/claude-code/managed-settings.json; \
+    fi
 
 # One RUN, on purpose. The wheel's bundle is the install root — `server/`,
 # `container/lib`, `container/bin`, skills and templates all live inside it —

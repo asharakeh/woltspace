@@ -128,6 +128,7 @@ by the platform runtime.
 | `WOLTSPACE_CONTAINER` | Container name to operate on, for running more than one lodge. | the host launcher, `tui/src/attach.js` | `woltspace`, hash-suffixed for a custom data root |
 | `WOLTSPACE_CONTAINER_HOME` | The per-wolt `$HOME` the container image builds. Containers are the only isolation mode that owns a home outright, so harness credentials sit at a fixed path rather than wherever `$HOME` points. | `server/config.py` | `/home/node` |
 | `WOLTSPACE_IMAGE` | Docker image to run. | `desktop/src-tauri/src/docker.rs` | the published image |
+| `WOLTSPACE_PUBLISH_HOST` | Host address the container's port is published on, e.g. `127.0.0.1` to keep the lodge off the local network (unset, docker publishes on every interface, past most host firewalls). Read from the launching shell only. | the host launcher | unset (all interfaces) |
 | `WOLTSPACE_LOCAL` | Sticky equivalent of `--local`: build the image from this checkout. | the host launcher | `false` |
 | `WOLTSPACE_NONINTERACTIVE` | Run `init` without prompting. Pair with `WOLTSPACE_INIT_WOLT_NAME` to name the first wolt. | the host launcher | unset |
 | `WOLTSPACE_INIT_WOLT_NAME` | Which wolt a fresh non-interactive `init` should **create**. A different question from `WOLTSPACE_WOLT_NAME`, which names the wolt a shell already belongs to — see the note below. | the host launcher | unset (the lodge asks) |

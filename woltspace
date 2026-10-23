@@ -238,6 +238,19 @@ _build_image() {
 _start_container() {
   local wolt_name="${1:-}"
   _refuse_over_native_colony
+  # Run settings come from the launching shell only, never from .env (the
+  # container can write that). Each must be one word of a fixed character set,
+  # so none can carry other docker flags. Checked before anything is removed.
+  local publish="${WOLTSPACE_PORT:-7777}"
+  if [ -n "${WOLTSPACE_PUBLISH_HOST:-}" ]; then
+    case "$WOLTSPACE_PUBLISH_HOST" in
+      *[!0-9a-fA-F.:]*) echo "error: WOLTSPACE_PUBLISH_HOST must be an IP address" >&2; exit 1 ;;
+    esac
+    case "$WOLTSPACE_PUBLISH_HOST" in
+      *:*) publish="[$WOLTSPACE_PUBLISH_HOST]:$publish" ;;  # IPv6
+      *) publish="$WOLTSPACE_PUBLISH_HOST:$publish" ;;
+    esac
+  fi
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
   local extra_args=""
@@ -261,7 +274,7 @@ _start_container() {
     -e HOST_GID=$(id -g) \
     -v "$WOLTS_DIR:/workspace/wolts:rw" \
     -v "$WOLTS_DIR/.claude:/home/node/.claude:rw" \
-    -p "${WOLTSPACE_PORT:-7777}":7777 \
+    -p "$publish":7777 \
     $extra_args \
     woltspace > /dev/null
 

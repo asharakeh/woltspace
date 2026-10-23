@@ -68,9 +68,17 @@ RUN apt-get update && apt-get install -y \
     && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Allow node user to install packages at runtime
-RUN echo "node ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/node \
-    && chmod 0440 /etc/sudoers.d/node
+# Allow node user to install packages at runtime. WOLTSPACE_NODE_SUDO=false
+# leaves node no way back to root: no sudoers rule and no sudo binary (sudo
+# refuses its own removal without SUDO_FORCE_REMOVE). Boot is unaffected: the
+# root phase runs before gosu, not through sudo.
+ARG WOLTSPACE_NODE_SUDO=true
+RUN case "$WOLTSPACE_NODE_SUDO" in \
+      ""|true) echo "node ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/node \
+               && chmod 0440 /etc/sudoers.d/node ;; \
+      false) SUDO_FORCE_REMOVE=yes apt-get purge -y sudo && rm -rf /etc/sudoers.d ;; \
+      *) echo "WOLTSPACE_NODE_SUDO must be true or false" >&2; exit 1 ;; \
+    esac
 
 # Install uv (fast Python package manager)
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh

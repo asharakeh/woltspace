@@ -191,6 +191,12 @@ _refuse_over_native_colony() {
 }
 
 _build_image() {
+  # Build args passed through from the launching shell (never from .env):
+  # docker reads each bare `--build-arg NAME` from this environment.
+  case "${WOLTSPACE_NODE_SUDO:-}" in
+    ''|true|false) ;;
+    *) echo "error: WOLTSPACE_NODE_SUDO must be true or false" >&2; exit 1 ;;
+  esac
   local cache_flag=""
   [ "$NO_CACHE" = true ] && cache_flag="--no-cache"
 
@@ -204,6 +210,7 @@ _build_image() {
     docker build -t woltspace $cache_flag \
       --build-arg USE_LOCAL=true \
       --build-arg CACHE_BUST="$(date +%s)" \
+      --build-arg WOLTSPACE_NODE_SUDO \
       -f "$WOLTSPACE_DIR/container/Dockerfile" "$WOLTSPACE_DIR"
   else
     local version_arg=""
@@ -221,6 +228,7 @@ _build_image() {
     echo ""
     docker build -t woltspace $cache_flag $version_arg \
       --build-arg CACHE_BUST="$(date +%s)" \
+      --build-arg WOLTSPACE_NODE_SUDO \
       -f "$WOLTSPACE_DIR/container/Dockerfile" "$WOLTSPACE_DIR/container"
   fi
 }

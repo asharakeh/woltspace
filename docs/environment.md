@@ -134,6 +134,7 @@ by the platform runtime.
 | `WOLTSPACE_BRANCH` | Build arg naming the branch the image installs from. | `container/Dockerfile` | `main` |
 | `WOLTSPACE_PYPI_VERSION` | Build arg: the `woltspace` version the image installs. | `container/Dockerfile` | the release being built |
 | `WOLTSPACE_TUI_VERSION` | Build arg: the `@woltspace/tui` version the image installs. The tui declares the minimum `woltspace` version it needs; woltspace does not check the tui's version, so the two are installed and upgraded on their own. | `container/Dockerfile` | `latest` |
+| `WOLTSPACE_NODE_SUDO` | Build arg: `false` builds an image where `node` cannot become root (no sudoers rule, no `sudo`). A session can then no longer `apt-get install`, nor install into the root-owned global npm/uv dirs; bake such tools into the image. The launcher passes it through from the launching shell on every build, so set it for every `rebuild`. | `container/Dockerfile`, the host launcher | `true` |
 | `HOST_UID` / `HOST_GID` | The host user the container's `node` user is matched to, so files a wolt writes are readable on the host. | `container_entrypoint.run_root_phase` | the invoking user |
 
 ### Creating a wolt vs. being one

@@ -141,6 +141,35 @@ by the platform runtime.
 | `WOLTSPACE_CLAUDE_MANAGED_SETTINGS` | Build arg: a path inside the build context (the checkout for `--local`, `container/` otherwise) installed as `/etc/claude-code/managed-settings.json`, root-owned 0644: the Claude Code settings no user or project file can override. Must be valid JSON. Passed through from the launching shell on every build. | `container/Dockerfile`, the host launcher | unset (none) |
 | `HOST_UID` / `HOST_GID` | The host user the container's `node` user is matched to, so files a wolt writes are readable on the host. | `container_entrypoint.run_root_phase` | the invoking user |
 
+### A second, hardened lodge
+
+The launcher's options only add up to a locked-down lodge when they are set
+together. They are read from the launching shell only, so keep them in a small
+script you run for that lodge, never in its data root's `.env`:
+
+```bash
+export WOLTSPACE_WOLTS_DIR=~/lodge-b
+export WOLTSPACE_CONTAINER=lodge-b
+export WOLTSPACE_IMAGE=lodge-b
+export WOLTSPACE_PORT=7778
+export WOLTSPACE_NODE_SUDO=false
+export WOLTSPACE_CLAUDE_MANAGED_SETTINGS=managed-settings.json
+export WOLTSPACE_ENV_FILE=~/lodge-b.env
+export WOLTSPACE_PUBLISH_HOST=127.0.0.1
+export WOLTSPACE_DOCKER_NETWORK=lodge-b-egress
+woltspace init
+```
+
+- `WOLTSPACE_WOLTS_DIR`: its own data root, so the two lodges share no wolts or state.
+- `WOLTSPACE_CONTAINER`: its own container, so `start` and `stop` never touch the other lodge's.
+- `WOLTSPACE_IMAGE`: its own image, so a build for either lodge never retags the other's.
+- `WOLTSPACE_PORT`: its own host port, since the other lodge holds 7777.
+- `WOLTSPACE_NODE_SUDO=false`: `node` cannot become root, and the launcher adds `no-new-privileges`.
+- `WOLTSPACE_CLAUDE_MANAGED_SETTINGS`: Claude Code settings no session can override (a JSON file in the build context).
+- `WOLTSPACE_ENV_FILE`: outside the data root, so a session cannot write variables the root phase receives at the next create.
+- `WOLTSPACE_PUBLISH_HOST=127.0.0.1`: the port is reachable from this machine only.
+- `WOLTSPACE_DOCKER_NETWORK`: a network you made whose only way out is your egress proxy (`HTTPS_PROXY` in the env file).
+
 ### Creating a wolt vs. being one
 
 `WOLTSPACE_INIT_WOLT_NAME` and `WOLTSPACE_WOLT_NAME` look like the same

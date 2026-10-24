@@ -462,8 +462,10 @@ if [ "$cmd" = "init" ]; then
   _refuse_over_native_colony
   _setup_path
 
-  # Detect existing lodge (wolts or just scaffold from prior init)
-  if [ -d "$WOLTS_DIR" ] && { [ "$(_count_wolts)" -gt 0 ] || [ -f "$ENV_FILE" ]; }; then
+  # Detect existing lodge (wolts or just scaffold from prior init). The
+  # scaffold is the data root's own .env: an external WOLTSPACE_ENV_FILE can be
+  # made before the lodge is, and says nothing about the data root.
+  if [ -d "$WOLTS_DIR" ] && { [ "$(_count_wolts)" -gt 0 ] || [ -f "$WOLTS_DIR/.env" ]; }; then
     printf "\n  %b🦫%b  %b\n\n" "${_L}" "${_R}" "${_B}${_G}woltspace${_R}"
     if [ "$(_count_wolts)" -gt 0 ]; then
       echo "  ${_D}🐘 found existing wolts:${_R}"

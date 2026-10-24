@@ -539,6 +539,23 @@ def test_an_accepted_docker_network_is_joined(tmp_path):
     assert argv[argv.index("--network") + 1] == "lodge-b_egress.1"
 
 
+@pytest.mark.parametrize("external", [True, False])
+def test_init_sees_an_existing_lodge_in_the_data_root_not_in_an_external_env_file(tmp_path, external):
+    wolts_dir = tmp_path / "wolts"
+    wolts_dir.mkdir()  # exists, and holds no lodge yet
+    env_file = tmp_path / "lodge-b.env" if external else wolts_dir / ".env"
+    env_file.write_text("WOLTSPACE_PUBLIC_TUNNEL=false\n")
+    env = {"WOLTSPACE_ENV_FILE": str(env_file)} if external else {}
+    result = _launch(wolts_dir, "init", WOLTSPACE_NONINTERACTIVE="true", WOLTSPACE_INIT_WOLT_NAME="first", **env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = [c.split() for c in (tmp_path / "fake-bin" / "docker.log").read_text().splitlines()]
+    [argv] = [c for c in calls if c[0] == "run"]
+    assert argv[argv.index("--env-file") + 1] == str(env_file)
+    # A pre-made external env file is not a lodge: init is a fresh one and names the first wolt.
+    assert ("lodge exists" in result.stdout) is not external
+    assert ("WOLTSPACE_WOLT_NAME=first" in argv) is external
+
+
 def test_launcher_still_boots_when_the_owner_is_a_container(tmp_path):
     """Container mode unchanged: an "external" owner is this script's own work."""
     wolts_dir = _lodge(tmp_path)

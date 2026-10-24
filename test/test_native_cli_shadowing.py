@@ -502,6 +502,43 @@ def test_a_bad_woltspace_image_stops_before_any_docker_call(tmp_path, verb, imag
     assert calls == []
 
 
+# --------------------------------------------------------------------------
+# The run-setting checks: a bad value stops `start` before the old container goes
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("env, message", [
+    ({"WOLTSPACE_PUBLISH_HOST": "localhost"}, "WOLTSPACE_PUBLISH_HOST must be an IP address"),
+    ({"WOLTSPACE_PUBLISH_HOST": "127.0.0.1 -v /:/host"}, "WOLTSPACE_PUBLISH_HOST must be an IP address"),
+    ({"WOLTSPACE_PUBLISH_HOST": "-p"}, "WOLTSPACE_PUBLISH_HOST must be an IP address"),
+    ({"WOLTSPACE_DOCKER_NETWORK": "host"}, "WOLTSPACE_DOCKER_NETWORK=host is not allowed"),
+    ({"WOLTSPACE_DOCKER_NETWORK": "none"}, "WOLTSPACE_DOCKER_NETWORK=none is not allowed"),
+    ({"WOLTSPACE_DOCKER_NETWORK": "--privileged"}, "WOLTSPACE_DOCKER_NETWORK must be a network name"),
+    ({"WOLTSPACE_DOCKER_NETWORK": "lodge net"}, "WOLTSPACE_DOCKER_NETWORK must be a network name"),
+    ({"WOLTSPACE_DOCKER_NETWORK": "net;id"}, "WOLTSPACE_DOCKER_NETWORK must be a network name"),
+])
+def test_a_rejected_run_setting_stops_start_before_rm_or_run(tmp_path, env, message):
+    result, calls, _ = _docker_calls(tmp_path, **env)
+    assert result.returncode == 1
+    assert message in result.stderr
+    assert not [c for c in calls if c[0] in ("rm", "run", "build")]
+
+
+@pytest.mark.parametrize("host, published", [("127.0.0.1", "127.0.0.1:7777:7777"), ("::1", "[::1]:7777:7777"),
+                                             ("fd00::2", "[fd00::2]:7777:7777")])
+def test_the_port_is_published_on_the_host_address_ipv6_in_brackets(tmp_path, host, published):
+    result, _, runs = _docker_calls(tmp_path, WOLTSPACE_PUBLISH_HOST=host)
+    assert result.returncode == 0, result.stderr
+    [argv] = runs
+    assert argv[argv.index("-p") + 1] == published
+
+
+def test_an_accepted_docker_network_is_joined(tmp_path):
+    result, _, runs = _docker_calls(tmp_path, WOLTSPACE_DOCKER_NETWORK="lodge-b_egress.1")
+    assert result.returncode == 0, result.stderr
+    [argv] = runs
+    assert argv[argv.index("--network") + 1] == "lodge-b_egress.1"
+
+
 def test_launcher_still_boots_when_the_owner_is_a_container(tmp_path):
     """Container mode unchanged: an "external" owner is this script's own work."""
     wolts_dir = _lodge(tmp_path)

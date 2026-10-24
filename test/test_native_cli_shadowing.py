@@ -433,6 +433,16 @@ def test_the_dockerfile_labels_the_build_arg_the_launcher_reads():
     assert f'LABEL {key}="${{WOLTSPACE_NODE_SUDO:-true}}"' in (ROOT / "container" / "Dockerfile").read_text()
 
 
+def test_build_needs_no_wolts_and_only_builds(tmp_path):
+    wolts_dir = tmp_path / "wolts"
+    wolts_dir.mkdir()
+    result = _launch(wolts_dir, "build")
+    assert result.returncode == 0, result.stdout
+    calls = (tmp_path / "fake-bin" / "docker.log").read_text().splitlines()
+    # Reading the running container's version is fine; nothing else but the build.
+    assert [c.split()[0] for c in calls if not c.endswith(" cat /workspace/woltspace/.version")] == ["build"]
+
+
 def test_a_bad_node_sudo_stops_rebuild_before_docker_changes_anything(tmp_path):
     result, calls, _ = _docker_calls(tmp_path, "rebuild", WOLTSPACE_NODE_SUDO="False")
     assert result.returncode == 1

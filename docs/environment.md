@@ -131,10 +131,10 @@ by the platform runtime.
 | `WOLTSPACE_LOCAL` | Sticky equivalent of `--local`: build the image from this checkout. | the host launcher | `false` |
 | `WOLTSPACE_NONINTERACTIVE` | Run `init` without prompting. Pair with `WOLTSPACE_INIT_WOLT_NAME` to name the first wolt. | the host launcher | unset |
 | `WOLTSPACE_INIT_WOLT_NAME` | Which wolt a fresh non-interactive `init` should **create**. A different question from `WOLTSPACE_WOLT_NAME`, which names the wolt a shell already belongs to — see the note below. | the host launcher | unset (the lodge asks) |
+| `WOLTSPACE_PYTHON_VERSION` | Build arg: the CPython version uv installs, root-owned, into `/opt/woltspace/python` for woltspace itself. The image then has two Pythons: that one and Debian's `python3` (3.11), kept for scripts that call it directly. A session's own uv still installs other versions into its home. Not passed through by the launcher. | `container/Dockerfile` | `3.13` |
 | `WOLTSPACE_BRANCH` | Build arg naming the branch the image installs from. | `container/Dockerfile` | `main` |
 | `WOLTSPACE_PYPI_VERSION` | Build arg: the `woltspace` version the image installs. | `container/Dockerfile` | the release being built |
 | `WOLTSPACE_TUI_VERSION` | Build arg: the `@woltspace/tui` version the image installs. The tui declares the minimum `woltspace` version it needs; woltspace does not check the tui's version, so the two are installed and upgraded on their own. | `container/Dockerfile` | `latest` |
-| `WOLTSPACE_PYTHON_VERSION` | Build arg: the CPython version uv installs, root-owned, into `/opt/woltspace/python` for woltspace itself. The image then has two Pythons: that one and Debian's `python3` (3.11), kept for scripts that call it directly. A session's own uv still installs other versions into its home. Not passed through by the launcher. | `container/Dockerfile` | `3.13` |
 | `HOST_UID` / `HOST_GID` | The host user the container's `node` user is matched to, so files a wolt writes are readable on the host. | `container_entrypoint.run_root_phase` | the invoking user |
 
 ### Creating a wolt vs. being one

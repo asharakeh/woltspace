@@ -338,8 +338,9 @@ def _launch(wolts_dir, verb="start", **env):
     fake_bin.mkdir(exist_ok=True)
     # A docker that screams if the guard ever lets it through. It logs its argv,
     # lists the container once it has been run, and answers `image inspect` of
-    # the image `woltspace` with FAKE_IMAGE_LABEL, so a `start` that is let
-    # through goes all the way to `docker run`.
+    # the lodge's image (WOLTSPACE_IMAGE, else `woltspace`) with
+    # FAKE_IMAGE_LABEL, so a `start` that is let through goes all the way to
+    # `docker run`.
     docker = fake_bin / "docker"
     docker.write_text(
         "#!/bin/sh\necho 'DOCKER INVOKED' >&2\n"
@@ -347,7 +348,7 @@ def _launch(wolts_dir, verb="start", **env):
         'case "$1 $*" in\n'
         '  run*) touch "$0.ran" ;;\n'
         '  ps*) [ -f "$0.ran" ] && echo "$WOLTSPACE_CONTAINER" ;;\n'
-        '  "image image inspect"*" woltspace") echo "$FAKE_IMAGE_LABEL" ;;\n'
+        '  "image image inspect"*" ${WOLTSPACE_IMAGE:-woltspace}") echo "$FAKE_IMAGE_LABEL" ;;\n'
         "esac\nexit 0\n"
     )
     docker.chmod(0o755)
@@ -448,6 +449,57 @@ def test_a_bad_node_sudo_stops_rebuild_before_docker_changes_anything(tmp_path):
     assert result.returncode == 1
     assert "WOLTSPACE_NODE_SUDO must be true or false" in result.stderr
     assert not [c for c in calls if c[0] in ("rm", "run", "build")]
+
+
+# --------------------------------------------------------------------------
+# WOLTSPACE_IMAGE: each lodge on a machine builds and runs its own image
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("local", ["false", "true"])
+def test_build_tags_the_image_woltspace_image_names(tmp_path, local):
+    wolts_dir = tmp_path / "wolts"
+    wolts_dir.mkdir()
+    result = _launch(wolts_dir, "build", WOLTSPACE_IMAGE="lodge-b", WOLTSPACE_LOCAL=local)
+    assert result.returncode == 0, result.stderr
+    calls = [c.split() for c in (tmp_path / "fake-bin" / "docker.log").read_text().splitlines()]
+    [build] = [c for c in calls if c[0] == "build"]
+    assert build[build.index("-t") + 1] == "lodge-b"
+
+
+@pytest.mark.parametrize("verb", ["start", "init"])
+def test_start_inspects_and_runs_the_image_woltspace_image_names(tmp_path, verb):
+    result, calls, runs = _docker_calls(tmp_path, verb, WOLTSPACE_IMAGE="lodge-b", FAKE_IMAGE_LABEL="false")
+    assert result.returncode == 0, result.stdout
+    [argv] = runs
+    assert argv[-1] == "lodge-b"
+    assert "no-new-privileges" in argv  # the label was read from lodge-b
+    assert ["image", "inspect", "lodge-b"] in calls  # the "is it built yet" check
+    assert not [c for c in calls if "woltspace" in c]
+
+
+@pytest.mark.parametrize("verb", ["build", "start"])
+def test_without_woltspace_image_the_image_is_still_woltspace(tmp_path, verb):
+    _, calls, runs = _docker_calls(tmp_path, verb)
+    named = [c[c.index("-t") + 1] for c in calls if c[0] == "build"] + [c[-1] for c in runs]
+    assert named == ["woltspace"]
+
+
+@pytest.mark.parametrize("image", ["woltspace/woltspace:latest", "registry.example:5000/lodge-b@sha256:ab12"])
+def test_an_image_reference_such_as_the_desktop_apps_is_accepted(tmp_path, image):
+    result, calls, runs = _docker_calls(tmp_path, WOLTSPACE_IMAGE=image, FAKE_IMAGE_LABEL="false")
+    assert result.returncode == 0, result.stderr
+    [argv] = runs
+    assert argv[-1] == image
+    assert "no-new-privileges" in argv
+
+
+@pytest.mark.parametrize("verb", ["build", "start", "init", "rebuild"])
+@pytest.mark.parametrize("image", ["-lodge", "lodge-b --privileged", "lodge;id", "$(id)", ".lodge", "/lodge"])
+def test_a_bad_woltspace_image_stops_before_any_docker_call(tmp_path, verb, image):
+    result, calls, _ = _docker_calls(tmp_path, verb, WOLTSPACE_IMAGE=image)
+    assert result.returncode == 1
+    assert "WOLTSPACE_IMAGE must be an image name" in result.stderr
+    assert calls == []
 
 
 def test_launcher_still_boots_when_the_owner_is_a_container(tmp_path):

@@ -53,6 +53,16 @@ else
   _hash=$(printf '%s' "$WOLTS_DIR" | md5sum 2>/dev/null | cut -c1-6 || printf '%s' "$WOLTS_DIR" | md5 2>/dev/null | cut -c1-6)
   CONTAINER_NAME="woltspace-${_hash}"
 fi
+# The image this lodge builds and runs. A second lodge on the machine names
+# its own, or a build for one would retag the other's. Read from the launching
+# shell only, and one image reference (the desktop app's value, such as
+# woltspace/woltspace:latest, is one too), checked before any docker call, so
+# it can carry no other docker flags.
+IMAGE="${WOLTSPACE_IMAGE:-woltspace}"
+case "$IMAGE" in
+  [!A-Za-z0-9]*|*[!A-Za-z0-9_.:/@-]*)
+    echo "error: WOLTSPACE_IMAGE must be an image name (a letter or digit, then letters, digits, . _ - : / @)" >&2; exit 1 ;;
+esac
 cmd="${1:-start}"
 
 # Parse flags: --local, --branch <name>
@@ -218,7 +228,7 @@ _build_image() {
     echo "  ${_D}🪵 building image from local source (wheel + local tui)${_R}"
     echo "  ${_L}   felling fresh timber...${_R}"
     echo ""
-    docker build -t woltspace $cache_flag \
+    docker build -t "$IMAGE" $cache_flag \
       --build-arg USE_LOCAL=true \
       --build-arg CACHE_BUST="$(date +%s)" \
       --build-arg WOLTSPACE_NODE_SUDO \
@@ -238,7 +248,7 @@ _build_image() {
     fi
     echo "  ${_L}   felling fresh timber...${_R}"
     echo ""
-    docker build -t woltspace $cache_flag $version_arg \
+    docker build -t "$IMAGE" $cache_flag $version_arg \
       --build-arg CACHE_BUST="$(date +%s)" \
       --build-arg WOLTSPACE_NODE_SUDO \
       --build-arg WOLTSPACE_CLAUDE_MANAGED_SETTINGS \
@@ -286,7 +296,7 @@ _start_container() {
   # An image built without sudo says so in its label. Then no setuid binary
   # may hand a process root either.
   local privilege_args=""
-  [ "$(docker image inspect -f '{{index .Config.Labels "woltspace.node_sudo"}}' woltspace 2>/dev/null)" = false ] \
+  [ "$(docker image inspect -f '{{index .Config.Labels "woltspace.node_sudo"}}' "$IMAGE" 2>/dev/null)" = false ] \
     && privilege_args="--security-opt no-new-privileges"
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
@@ -315,7 +325,7 @@ _start_container() {
     $network_args \
     $privilege_args \
     $extra_args \
-    woltspace > /dev/null
+    "$IMAGE" > /dev/null
 
   sleep 2
   if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
@@ -464,7 +474,7 @@ if [ "$cmd" = "init" ]; then
       echo "  ${_L}   resuming onboarding${_R}"
     fi
     echo ""
-    if ! docker image inspect woltspace &>/dev/null; then
+    if ! docker image inspect "$IMAGE" &>/dev/null; then
       _build_image
     fi
     _start_container
@@ -833,7 +843,7 @@ RESTORE
       docker restart "$CONTAINER_NAME" > /dev/null
       _show_url
     else
-      if ! docker image inspect woltspace &>/dev/null; then
+      if ! docker image inspect "$IMAGE" &>/dev/null; then
         _build_image
       fi
       _start_container

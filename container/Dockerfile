@@ -134,6 +134,22 @@ ENV UV_TOOL_DIR=/opt/woltspace/tools \
     UV_LINK_MODE=copy \
     UV_NO_CACHE=1
 
+# woltspace runs on a uv-managed CPython, not Debian's python3: 3.11.2 lacks
+# tarfile's filter= (3.11.4+), so `woltspace restore` crashed in a container
+# lodge. Debian's python3 stays for whatever calls it directly. The install dir
+# is a stage ARG, so every RUN below sees it but the running container does
+# not: a session's own uv keeps its default dirs. The managed Python is
+# root-owned and only root writes it (uv's lock file comes 0666); the build
+# proves that, and that node can run it.
+ARG WOLTSPACE_PYTHON_VERSION=3.13
+ARG UV_PYTHON_INSTALL_DIR=/opt/woltspace/python
+RUN set -eux; \
+    uv python install --no-bin "$WOLTSPACE_PYTHON_VERSION"; \
+    chmod -R go-w "$UV_PYTHON_INSTALL_DIR"; \
+    test -z "$(find "$UV_PYTHON_INSTALL_DIR" ! -type l \( ! -user root -o -perm /022 \))"; \
+    gosu node "$(uv python find --managed-python --no-python-downloads "$WOLTSPACE_PYTHON_VERSION")" \
+      -c 'import tarfile; tarfile.data_filter'
+
 # Boot is a long-lived python process writing to docker's pipe, which is not a
 # tty: block buffering would hold "scaffolded new wolt", "setup complete" and
 # the tunnel URL until the container exits. Set for every python in the image,
@@ -157,13 +173,13 @@ COPY . /tmp/local-src/
 RUN set -eux; \
     if [ "$USE_LOCAL" = "true" ]; then \
       echo "installing woltspace from the local tree"; \
-      uv tool install --python "$(command -v python3)" "/tmp/local-src"; \
+      uv tool install --managed-python --no-python-downloads --python "$WOLTSPACE_PYTHON_VERSION" "/tmp/local-src"; \
       (cd /tmp/local-src/tui && npm pack --pack-destination /tmp); \
       npm install -g /tmp/woltspace-tui-*.tgz; \
       rm -f /tmp/woltspace-tui-*.tgz; \
     else \
       echo "installing woltspace==${WOLTSPACE_PYPI_VERSION} + @woltspace/tui@${WOLTSPACE_TUI_VERSION}"; \
-      uv tool install --python "$(command -v python3)" "woltspace==${WOLTSPACE_PYPI_VERSION}"; \
+      uv tool install --managed-python --no-python-downloads --python "$WOLTSPACE_PYTHON_VERSION" "woltspace==${WOLTSPACE_PYPI_VERSION}"; \
       npm install -g "@woltspace/tui@${WOLTSPACE_TUI_VERSION}"; \
     fi; \
     npm cache clean --force; \
@@ -174,6 +190,7 @@ RUN set -eux; \
     ln -s "${UV_TOOL_DIR}/woltspace/bin/python" /usr/local/bin/woltspace-python; \
     chmod +x "$BUNDLE"/container/bin/*; \
     /usr/local/bin/woltspace --version | awk '{print $2}' > "$BUNDLE/.version"; \
+    gosu node /usr/local/bin/woltspace --version; \
     ln -sf /workspace/woltspace/container/config/tmux.conf /etc/tmux.conf
 
 # container/bin ahead of the installed console scripts, exactly as before: inside

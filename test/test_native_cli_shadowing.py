@@ -21,6 +21,7 @@ launcher refuses to boot over a live native colony.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -332,13 +333,26 @@ def _control_plane_decoy():
         process.wait(timeout=10)
 
 
-def _launch(wolts_dir, verb="start"):
+def _launch(wolts_dir, verb="start", **env):
     fake_bin = wolts_dir.parent / "fake-bin"
     fake_bin.mkdir(exist_ok=True)
-    # A docker that screams if the guard ever lets it through.
+    # A docker that screams if the guard ever lets it through. It logs its argv,
+    # lists the container once it has been run, and answers `image inspect` of
+    # the image `woltspace` with FAKE_IMAGE_LABEL, so a `start` that is let
+    # through goes all the way to `docker run`.
     docker = fake_bin / "docker"
-    docker.write_text("#!/bin/sh\necho 'DOCKER INVOKED' >&2\nexit 0\n")
+    docker.write_text(
+        "#!/bin/sh\necho 'DOCKER INVOKED' >&2\n"
+        'echo "$*" >> "$0.log"\n'
+        'case "$1 $*" in\n'
+        '  run*) touch "$0.ran" ;;\n'
+        '  ps*) [ -f "$0.ran" ] && echo "$WOLTSPACE_CONTAINER" ;;\n'
+        '  "image image inspect"*" woltspace") echo "$FAKE_IMAGE_LABEL" ;;\n'
+        "esac\nexit 0\n"
+    )
     docker.chmod(0o755)
+    (fake_bin / "sleep").write_text("#!/bin/sh\n")
+    (fake_bin / "sleep").chmod(0o755)
     # Both spellings of the data-root variable. The canonical name is what the
     # launcher prefers; the legacy one is still honoured, and setting both keeps
     # this correct on either side of the env-namespace rename.
@@ -349,7 +363,10 @@ def _launch(wolts_dir, verb="start"):
             wolts_dir.parent,
             WOLTSPACE_WOLTS_DIR=str(wolts_dir),
             WOLTS_DIR=str(wolts_dir),
+            WOLTSPACE_CONTAINER="lodge-test",
+            SHELL="/bin/sh",  # no rc file to offer, so no /dev/tty prompt
             PATH=f"{fake_bin}{os.pathsep}{SYSTEM_PATH}",
+            **env,
         ),
     )
 
@@ -376,6 +393,51 @@ def test_launcher_refusal_points_at_the_native_cli_and_an_escape_hatch(tmp_path)
     assert "woltspace stop" in out
     assert "which -a woltspace" in out
     assert "WOLTS_DIR=" in out
+
+
+# --------------------------------------------------------------------------
+# An image built with WOLTSPACE_NODE_SUDO=false runs with no-new-privileges
+# --------------------------------------------------------------------------
+
+def _docker_calls(tmp_path, verb="start", **env):
+    wolts_dir = _lodge(tmp_path)
+    # No tunnel, or _show_url polls for one.
+    (wolts_dir / ".env").write_text("WOLTSPACE_PUBLIC_TUNNEL=false\n")
+    result = _launch(wolts_dir, verb, **env)
+    log = tmp_path / "fake-bin" / "docker.log"
+    calls = [c.split() for c in log.read_text().splitlines()] if log.exists() else []
+    return result, calls, [c for c in calls if c[0] == "run"]
+
+
+def test_an_image_labelled_without_sudo_runs_with_no_new_privileges(tmp_path):
+    result, _, runs = _docker_calls(tmp_path, FAKE_IMAGE_LABEL="false")
+    assert result.returncode == 0, result.stdout
+    [argv] = runs
+    assert argv[-1] == "woltspace"  # anything after the image is its command
+    assert argv.count("no-new-privileges") == 1
+    assert argv[argv.index("no-new-privileges") - 1] == "--security-opt"
+
+
+@pytest.mark.parametrize("label, shell", [("true", None), ("", None), ("true", "false")])
+def test_no_flag_unless_the_image_says_false(tmp_path, label, shell):
+    # "" is an image from before the label; the launching shell no longer decides.
+    env = {} if shell is None else {"WOLTSPACE_NODE_SUDO": shell}
+    result, _, runs = _docker_calls(tmp_path, FAKE_IMAGE_LABEL=label, **env)
+    assert result.returncode == 0, result.stdout
+    [argv] = runs
+    assert "no-new-privileges" not in argv
+
+
+def test_the_dockerfile_labels_the_build_arg_the_launcher_reads():
+    key = re.search(r'Labels "([^"]+)"', LAUNCHER.read_text()).group(1)
+    assert f'LABEL {key}="${{WOLTSPACE_NODE_SUDO:-true}}"' in (ROOT / "container" / "Dockerfile").read_text()
+
+
+def test_a_bad_node_sudo_stops_rebuild_before_docker_changes_anything(tmp_path):
+    result, calls, _ = _docker_calls(tmp_path, "rebuild", WOLTSPACE_NODE_SUDO="False")
+    assert result.returncode == 1
+    assert "WOLTSPACE_NODE_SUDO must be true or false" in result.stderr
+    assert not [c for c in calls if c[0] in ("rm", "run", "build")]
 
 
 def test_launcher_still_boots_when_the_owner_is_a_container(tmp_path):

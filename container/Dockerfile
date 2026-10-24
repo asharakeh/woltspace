@@ -73,6 +73,7 @@ RUN apt-get update && apt-get install -y \
 # refuses its own removal without SUDO_FORCE_REMOVE). Boot is unaffected: the
 # root phase runs before gosu, not through sudo.
 ARG WOLTSPACE_NODE_SUDO=true
+LABEL woltspace.node_sudo="${WOLTSPACE_NODE_SUDO:-true}"
 RUN case "$WOLTSPACE_NODE_SUDO" in \
       ""|true) echo "node ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/node \
                && chmod 0440 /etc/sudoers.d/node ;; \

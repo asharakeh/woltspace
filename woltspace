@@ -195,13 +195,18 @@ _refuse_over_native_colony() {
   exit 1
 }
 
-_build_image() {
-  # Build args passed through from the launching shell (never from .env):
-  # docker reads each bare `--build-arg NAME` from this environment.
+# Checked by rebuild before the old container is removed, and by every build.
+_check_node_sudo() {
   case "${WOLTSPACE_NODE_SUDO:-}" in
     ''|true|false) ;;
     *) echo "error: WOLTSPACE_NODE_SUDO must be true or false" >&2; exit 1 ;;
   esac
+}
+
+_build_image() {
+  # Build args passed through from the launching shell (never from .env):
+  # docker reads each bare `--build-arg NAME` from this environment.
+  _check_node_sudo
   local cache_flag=""
   [ "$NO_CACHE" = true ] && cache_flag="--no-cache"
 
@@ -264,6 +269,11 @@ _start_container() {
     esac
     network_args="--network $WOLTSPACE_DOCKER_NETWORK"
   fi
+  # An image built without sudo says so in its label. Then no setuid binary
+  # may hand a process root either.
+  local privilege_args=""
+  [ "$(docker image inspect -f '{{index .Config.Labels "woltspace.node_sudo"}}' woltspace 2>/dev/null)" = false ] \
+    && privilege_args="--security-opt no-new-privileges"
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
   local extra_args=""
@@ -289,6 +299,7 @@ _start_container() {
     -v "$WOLTS_DIR/.claude:/home/node/.claude:rw" \
     -p "$publish":7777 \
     $network_args \
+    $privilege_args \
     $extra_args \
     woltspace > /dev/null
 
@@ -756,6 +767,7 @@ RESTORE
     ;;
   rebuild)
     _refuse_over_native_colony
+    _check_node_sudo
     # Resolve version: --version > --latest > current container version
     CURRENT_VERSION=""
     if [ -n "$BUILD_VERSION" ]; then

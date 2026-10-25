@@ -1,5 +1,6 @@
 """A lodge.db this build cannot open stops the boot with one readable line."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -40,16 +41,40 @@ def _too_new(wolts):
     conn.close()
 
 
+def _no_access(wolts):  # left by another uid, or a sudo run
+    lodge_db.connect(wolts).close()
+    os.chmod(lodge_db.path(wolts), 0)
+
+
+def _a_directory(wolts):
+    lodge_db.path(wolts).mkdir(parents=True)
+
+
+def _snapshot(db):
+    """What a restore would need left alone: the bytes, or a directory's listing."""
+    if db.is_dir():
+        return sorted(os.listdir(db))
+    mode = db.stat().st_mode
+    os.chmod(db, 0o600)
+    try:
+        return mode, db.read_bytes()
+    finally:
+        os.chmod(db, mode)
+
+
 @pytest.mark.parametrize("make_bad, reason", [
     (_corrupt, "file is not a database"),
     (_too_new, "Install that build or newer"),
-], ids=["corrupt", "too-new"])
+    pytest.param(_no_access, "Permission denied", marks=pytest.mark.skipif(
+        os.geteuid() == 0, reason="root opens a mode-000 file")),
+    (_a_directory, "Is a directory"),
+], ids=["corrupt", "too-new", "no-access", "a-directory"])
 def test_a_bad_lodge_db_refuses_the_boot_and_touches_nothing(tmp_path, capsys, make_bad, reason):
     layout = _layout(tmp_path)
     folder = _old_session(layout.wolts_dir, "alpha", "s1")
     make_bad(layout.wolts_dir)
     db = lodge_db.path(layout.wolts_dir)
-    before = db.read_bytes()
+    before = _snapshot(db)
 
     with pytest.raises(SystemExit) as exit_:
         adoption.adopt_runtime_sessions(layout)
@@ -60,7 +85,7 @@ def test_a_bad_lodge_db_refuses_the_boot_and_touches_nothing(tmp_path, capsys, m
     assert ".space/lodge.db" in err  # names the file to restore or move aside
     assert "Traceback" not in err
     # Nothing repaired, recreated, imported or reported: the file waits for a restore.
-    assert db.read_bytes() == before
+    assert _snapshot(db) == before
     assert (folder / "s1.json").exists()
     assert not (folder.parent / "sessions.imported").exists()
     assert not adoption.report_path(layout).exists()

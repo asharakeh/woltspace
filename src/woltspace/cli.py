@@ -413,8 +413,9 @@ def _db_show(args) -> int:
 
     try:
         conn = lodge_db.connect(layout.wolts_dir, readonly=True)
-    except sqlite3.Error:
-        print(f"no lodge.db at {lodge_db.path(layout.wolts_dir)}", file=sys.stderr)
+    except sqlite3.Error as exc:
+        db = lodge_db.path(layout.wolts_dir)
+        print(f"cannot read {db}: {exc}" if db.exists() else f"no lodge.db at {db}", file=sys.stderr)
         return 1
     try:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}

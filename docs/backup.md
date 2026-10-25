@@ -328,9 +328,12 @@ mid-write — gives a tidier snapshot, but nothing breaks if you do not wait.
 
 On Docker Desktop (macOS, Windows) the wolts folder is a bind mount across a
 VM boundary, and SQLite's WAL is not safe across it: never open `lodge.db`
-from the host, not even to read it. Read it with
-`docker exec <container> woltspace db show <table>`, and run backups inside
-the container (`docker exec <container> woltspace backup`).
+from the host, not even to read it. Read it inside the container, as the
+lodge's user: `docker exec -u node <container> woltspace db show <table>`.
+Back up inside it too and copy the archive out: `docker exec -u node
+<container> woltspace backup --tag <tag>` writes to `/workspace`, which is not
+the mount, so `docker cp <container>:/workspace/woltspace-backup-<tag>.tar.gz .`;
+for an encrypted one the container needs `-e WOLTSPACE_BACKUP_AGE_RECIPIENT`.
 
 ## Off the machine: a bucket (Cloudflare R2)
 

@@ -282,6 +282,40 @@ A refusal happens before extraction starts, so nothing is half-written, and
 nothing is ever created outside the target directory. An encrypted archive goes
 through the same audit.
 
+## First boot on the lodge DB, and how to go back
+
+Take a backup before upgrading to a release with `lodge.db`, with the release
+you are leaving: `woltspace backup --tag pre-upgrade`.
+
+The first boot imports the old state files into `.space/lodge.db` and renames
+each one it read to `<name>.imported`: `<wolt>/.state/sessions/` (a folder),
+`.space/auto-grants.json`, `.space/digs/grants.json`, `.space/wolf/` stamps
+and `jobs.jsonl`, `.space/telegram/chats/*.json`, the slack files under
+`<wolt>/.state/chat/slack/`, `.space/apps/*.json`. The app logs stay. A store
+that fails to import keeps its files, and the next boot tries it again.
+
+The lodge answers `/health` with 200 either way, so read readiness from the
+body: `db.error` (the file cannot be opened) and `db.import_error` (one entry
+per store that failed) must both be absent, and `db.imported` names every
+store taken in.
+
+To go back to the older release:
+
+```bash
+woltspace stop
+# install the older release, then put the old files back:
+cd "$WOLTSPACE_WOLTS_DIR"
+find . -maxdepth 5 \( -path './*/.state/*' -o -path './.space/*' -o -path './.archive/*' \) \
+     -name '*.imported' -prune -print | while read -r p; do mv -n "$p" "${p%.imported}"; done
+woltspace start
+```
+
+The older release reads the files and never `lodge.db`, so everything written
+after the import (new sessions, grants, cron runs, chat routing) is lost on
+the way back; restore the `pre-upgrade` backup instead if the lodge ran for a
+while. Upgrading again imports what the older release wrote in between, and a
+row already in `lodge.db` wins over a file.
+
 ## Running colonies
 
 No locks are taken, so a backup of a live lodge is safe, and `lodge.db` is

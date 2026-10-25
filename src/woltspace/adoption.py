@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -39,8 +40,17 @@ def adopt_runtime_sessions(layout: RuntimeLayout) -> dict:
     lib_dir = str(layout.install_root / "container" / "lib")
     if lib_dir not in sys.path:
         sys.path.insert(0, lib_dir)
+    import lodge_db
     from sessions import SessionRegistry
 
+    # One writable open up front: it creates a new lodge's file, and a corrupt
+    # or too-new one stops the boot here, untouched, before any import.
+    try:
+        lodge_db.connect(layout.wolts_dir).close()
+    except sqlite3.DatabaseError as exc:
+        print(f"[lodge-db] refusing to start: {exc}; restore {lodge_db.path(layout.wolts_dir)}"
+              " from a backup or move it aside", file=sys.stderr)
+        raise SystemExit(1) from None
     import_errors = import_lodge_state(layout)
     report = SessionRegistry(layout.wolts_dir).adopt_runtime_sessions()
     if import_errors:

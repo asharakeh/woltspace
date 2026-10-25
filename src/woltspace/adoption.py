@@ -47,9 +47,10 @@ def adopt_runtime_sessions(layout: RuntimeLayout) -> dict:
     # or too-new one stops the boot here, untouched, before any import.
     try:
         lodge_db.connect(layout.wolts_dir).close()
-    except sqlite3.DatabaseError as exc:
+    except (sqlite3.DatabaseError, OSError) as exc:
         print(f"[lodge-db] refusing to start: {exc}; restore {lodge_db.path(layout.wolts_dir)}"
-              " from a backup or move it aside", file=sys.stderr)
+              ' from a backup (docs/backup.md, "First boot on the lodge DB, and how to go back");'
+              " moving it aside starts an empty lodge", file=sys.stderr)
         raise SystemExit(1) from None
     import_errors = import_lodge_state(layout)
     report = SessionRegistry(layout.wolts_dir).adopt_runtime_sessions()

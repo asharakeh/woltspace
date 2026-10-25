@@ -304,11 +304,15 @@ To go back to the older release:
 ```bash
 woltspace stop
 # install the older release, then put the old files back:
-cd "$WOLTSPACE_WOLTS_DIR"
+cd "${WOLTSPACE_WOLTS_DIR:?set it to the lodge data root}"
 find . -maxdepth 5 \( -path './*/.state/*' -o -path './.space/*' -o -path './.archive/*' \) \
-     -name '*.imported' -prune -print | while read -r p; do mv -n "$p" "${p%.imported}"; done
+     \( -name '*.imported' -o -name '*.imported.[0-9]*' \) -prune -print | sort -rV |
+while read -r p; do b=${p%.imported*}; [ -e "$b" ] || mv "$p" "$b"; done
 woltspace start
 ```
+
+A file imported more than once (upgrade, downgrade, upgrade again) left
+`<name>.imported.2`, `.3`, ...; the newest one is put back.
 
 The older release reads the files and never `lodge.db`, so everything written
 after the import (new sessions, grants, cron runs, chat routing) is lost on

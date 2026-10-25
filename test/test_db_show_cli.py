@@ -88,3 +88,50 @@ def test_it_reads_without_writing_and_says_when_there_is_no_db(lodge, tmp_path, 
     monkeypatch.setenv("WOLTS_DIR", str(empty))
     code, out = _show(capsys, "sessions")
     assert code == 1 and "no lodge.db" in out.err and not lodge_db.path(empty).exists()
+
+
+def _corrupt(db):
+    for side in ("-wal", "-shm"):
+        Path(f"{db}{side}").unlink(missing_ok=True)
+    db.write_bytes(b"this is not an sqlite file\n" * 200)
+
+
+def _too_new(db):
+    conn = lodge_db.connect(db.parent.parent)
+    conn.execute("UPDATE meta SET value = '99' WHERE key = 'min_schema'")
+    conn.close()
+
+
+@pytest.mark.parametrize("make_bad, reason", [
+    (_corrupt, "file is not a database"),
+    (_too_new, "Install that build or newer"),
+], ids=["corrupt", "too-new"])
+def test_a_db_it_cannot_read_is_reported_as_that_not_as_missing(lodge, capsys, make_bad, reason):
+    db = lodge_db.path(lodge)
+    make_bad(db)
+    before = db.read_bytes()
+    code, out = _show(capsys, "sessions")
+    assert code == 1 and reason in out.err and str(db) in out.err
+    assert "no lodge.db" not in out.err and "Traceback" not in out.err
+    assert db.read_bytes() == before
+
+
+@pytest.mark.parametrize("argv, handler", [
+    (["db", "show", "sessions", "--json"], "_db_show"),
+    (["transcription", "show", "--json"], "_transcription_show"),
+    (["speech", "show"], "_speech_show"),
+    (["restore", "x.tar.gz.age", "--identity", "-"], "_restore"),
+])
+def test_the_merged_parser_routes_both_sides_verbs(argv, handler):
+    from woltspace.cli import build_parser
+
+    assert build_parser().parse_args(argv).func.__name__ == handler
+
+
+def test_transcription_show_runs_through_the_shared_graft(tmp_path, monkeypatch, capsys):
+    from woltspace import cli
+
+    layout = type("L", (), {"wolts_dir": tmp_path, "runtime_lib": ROOT / "container" / "lib"})()
+    monkeypatch.setattr(cli.RuntimeLayout, "from_env", classmethod(lambda cls, *a, **k: layout))
+    assert cli_main(["transcription", "show", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["transcription"]["model"] == "gpt-4o-transcribe"

@@ -413,8 +413,9 @@ def _db_show(args) -> int:
 
     try:
         conn = lodge_db.connect(layout.wolts_dir, readonly=True)
-    except sqlite3.Error:
-        print(f"no lodge.db at {lodge_db.path(layout.wolts_dir)}", file=sys.stderr)
+    except sqlite3.Error as exc:
+        db = lodge_db.path(layout.wolts_dir)
+        print(f"cannot read {db}: {exc}" if db.exists() else f"no lodge.db at {db}", file=sys.stderr)
         return 1
     try:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -598,10 +599,7 @@ def _graft_runtime_lib() -> RuntimeLayout:
 
 def _transcribe_module():
     """The runtime's own transcription settings: one validator, one writer."""
-    layout = RuntimeLayout.from_env()
-    lib_dir = str(layout.runtime_lib)
-    if lib_dir not in sys.path:
-        sys.path.insert(0, lib_dir)
+    layout = _graft_runtime_lib()
     import transcription_settings
 
     return layout, transcription_settings
@@ -687,10 +685,7 @@ def _transcription_clear(args) -> int:
 
 def _speech_module():
     """The runtime's own speech settings: one validator, one writer."""
-    layout = RuntimeLayout.from_env()
-    lib_dir = str(layout.runtime_lib)
-    if lib_dir not in sys.path:
-        sys.path.insert(0, lib_dir)
+    layout = _graft_runtime_lib()
     import speech_settings
 
     return layout, speech_settings

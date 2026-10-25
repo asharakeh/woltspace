@@ -147,6 +147,48 @@ def test_only_what_decides_a_rest_can_cancel_it(tmp_path):
     assert not reg.claim("s", judged, sessions.STOPPING)
 
 
+def test_two_deliveries_to_one_session_paste_one_after_the_other(tmp_path, monkeypatch):
+    """Each delivery's paste and Enter land whole, never inside another's."""
+    reg = SessionRegistry(tmp_path)
+    make_session(reg, name="s", wolt="alpha", harness_session_id="conv-1")
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda data: True)
+    monkeypatch.setattr(sessions, "session_has_agent_process", lambda *a: True)
+    monkeypatch.setattr(sessions, "_await_input_ready", lambda *a: True)
+    monkeypatch.setattr(sessions, "resolve_agent_handle",
+                        lambda *a, **k: RuntimeHandle("s", "s", pane_id="%1"))
+    from conftest import FakeSessionRuntime
+    buffer, pane = {}, []
+
+    class Tmux(FakeSessionRuntime):
+        def paste(self, handle, text, settle=0.0):
+            # As TmuxSessionRuntime.paste: one named buffer per session, set,
+            # pasted with -d, then the Enter after the settle.
+            buffer[handle.woltspace_session_id] = text
+            time.sleep(0.2)
+            if handle.woltspace_session_id not in buffer:
+                raise RuntimeError("paste-buffer: no buffer paste-s")
+            pane.append(buffer.pop(handle.woltspace_session_id))
+            time.sleep(0.05)
+            pane.append("<Enter>")
+
+    monkeypatch.setattr(sessions, "get_runtime", lambda: Tmux())
+    start, results, errors = threading.Barrier(2, timeout=10), {}, []
+
+    def deliver(text):
+        start.wait()
+        try:
+            results[text] = sessions.deliver_message("s", text, registry=reg)
+        except Exception as exc:
+            errors.append(f"{text}: {exc}")
+
+    _race(lambda: deliver("first message"), lambda: deliver("second message"))
+    assert errors == []
+    assert {t: r["status"] for t, r in results.items()} == {
+        "first message": "delivered", "second message": "delivered"}
+    assert pane[1::2] == ["<Enter>", "<Enter>"]
+    assert sorted(pane[0::2]) == ["first message", "second message"]
+
+
 def test_a_failed_stop_gives_back_the_status_and_keeps_what_came_meanwhile(tmp_path):
     reg = SessionRegistry(tmp_path)
     hold = {"until": None, "reason": "a build", "since": 1}

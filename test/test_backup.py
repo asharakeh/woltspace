@@ -805,6 +805,7 @@ def test_a_busy_checkpoint_is_one_line_and_the_backup_goes_on(wolts, tmp_path, c
 def test_no_lodge_db_means_no_lodge_db_in_the_manifest(wolts, tmp_path):
     result = create_backup(wolts, out_dir=tmp_path / "out")
     assert "lodge_db" not in result.manifest
+    assert result.verified
 
 
 def test_an_apps_own_sqlite_wal_is_kept(wolts, tmp_path):
@@ -818,12 +819,72 @@ def test_an_apps_own_sqlite_wal_is_kept(wolts, tmp_path):
         assert f"{ARCHIVE_ROOT}/beaverwolt/wolt/apps/shop/{name}" in names
 
 
-def test_an_unreadable_lodge_db_warns_rather_than_fails(wolts, tmp_path):
+def test_a_lodge_db_that_cannot_be_snapshotted_fails_the_backup(wolts, tmp_path):
+    """A backup without the lodge's state in it is not a backup."""
     (wolts / ".space" / "lodge.db").write_bytes(b"not a database at all" * 100)
+    with pytest.raises(ValueError, match="lodge.db"):
+        create_backup(wolts, out_dir=tmp_path / "out")
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_cli_reports_an_unsnapshottable_lodge_db_without_traceback(wolts, tmp_path, capsys):
+    (wolts / ".space" / "lodge.db").write_bytes(b"not a database at all" * 100)
+    code = cli_main(["backup", "--wolts-dir", str(wolts), "--out", str(tmp_path / "out")])
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "backup failed" in captured.out
+    assert "lodge.db" in captured.out
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_a_lodge_db_the_scan_cannot_read_fails_before_writing(wolts, tmp_path):
+    os.mkfifo(wolts / ".space" / "lodge.db")
+    with pytest.raises(ValueError, match="lodge.db"):
+        create_backup(wolts, out_dir=tmp_path / "out")
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_an_unlistable_space_dir_fails_before_writing(wolts, tmp_path, monkeypatch):
+    """`.space` unreadable: the scan can't say whether a lodge.db is there."""
+    space = (wolts / ".space").resolve()  # create_backup walks the resolved path
+    real_scandir = os.scandir
+
+    def scandir(path="."):
+        if Path(path) == space:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    with pytest.raises(ValueError, match="lodge.db"):
+        create_backup(wolts, out_dir=tmp_path / "out")
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_an_ordinary_file_vanishing_mid_write_stays_a_warning(wolts, tmp_path, monkeypatch):
+    gone = wolts / "beaverwolt" / "wolt" / "memory" / "identity.md"
+    real_add = backup_mod._add_entry
+
+    def add_entry(tar, entry):
+        if entry.path == gone:
+            gone.unlink()
+        return real_add(tar, entry)
+
+    monkeypatch.setattr(backup_mod, "_add_entry", add_entry)
     result = create_backup(wolts, out_dir=tmp_path / "out")
-    assert f"{ARCHIVE_ROOT}/.space/lodge.db" not in _members(result.archive)
-    assert ".space/lodge.db" in {item["path"] for item in result.manifest["unreadable"]}
-    assert "lodge_db" not in result.manifest
+    assert result.verified
+    assert "beaverwolt/wolt/memory/identity.md" in {
+        item["path"] for item in result.manifest["unreadable"]
+    }
+    assert f"{ARCHIVE_ROOT}/beaverwolt/wolt/memory/identity.md" not in _members(result.archive)
+
+
+@pytest.mark.parametrize("rel", [".space/pal.pipe", "beaverwolt/.space/lodge.db"])
+def test_only_the_lodges_own_db_is_required(wolts, tmp_path, rel):
+    (wolts / rel).parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(wolts / rel)
+    result = create_backup(wolts, out_dir=tmp_path / "out")
+    assert rel in {item["path"] for item in result.manifest["unreadable"]}
+    assert result.verified
 
 
 # ---------------------------------------------------------------------------

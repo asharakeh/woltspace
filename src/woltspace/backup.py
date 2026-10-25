@@ -595,6 +595,9 @@ def create_backup(
     archive = out / archive_name(tag, encrypted=bool(encryption))
 
     scan = scan_tree(wolts_dir)
+    for item in scan.unreadable:
+        if item["path"] in (".space", LODGE_DB):
+            raise ValueError(f"lodge.db could not be read: {item['path']}: {item['error']}")
     if encryption:
         keep_secrets(wolts_dir, scan)
         secrets = {"present": True, "recipient": encryption[1]}
@@ -647,15 +650,19 @@ def create_backup(
 
 def _write_members(tar: tarfile.TarFile, scan: Scan, manifest: dict) -> None:
     for entry in scan.entries:
-        try:
-            if entry.arcname == f"{ARCHIVE_ROOT}/{LODGE_DB}":
+        if entry.arcname == f"{ARCHIVE_ROOT}/{LODGE_DB}":
+            # The lodge's state is the one file a backup cannot do without.
+            try:
                 data, manifest["lodge_db"] = snapshot_lodge_db(entry.path)
                 info = tar.gettarinfo(str(entry.path), entry.arcname)
-                info.size = len(data)
-                tar.addfile(info, io.BytesIO(data))
-            else:
-                _add_entry(tar, entry)
-        except (OSError, sqlite3.Error) as exc:
+            except (OSError, sqlite3.Error) as exc:
+                raise ValueError(f"lodge.db could not be snapshotted: {exc}") from exc
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+            continue
+        try:
+            _add_entry(tar, entry)
+        except OSError as exc:
             # A file that vanished or turned unreadable between the scan
             # and the write is a warning, never a failed backup.
             manifest["unreadable"].append({

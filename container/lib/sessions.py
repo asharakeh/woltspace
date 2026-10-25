@@ -922,6 +922,19 @@ def _tmux_alive(session: str | dict | RuntimeHandle) -> bool:
     return _runtime().is_alive(_runtime_handle(session))
 
 
+# One paste at a time per session: the tmux paste buffer is per session, so
+# two server threads pasting at once can lose or merge a message. In-process
+# only; never pruned, as a lodge has few sessions. Hold it around _tmux_paste
+# alone, never inside a lodge_db write.
+_PASTE_LOCKS: dict[str, threading.Lock] = {}
+_PASTE_LOCKS_GUARD = threading.Lock()
+
+
+def _paste_lock(session: str) -> threading.Lock:
+    with _PASTE_LOCKS_GUARD:
+        return _PASTE_LOCKS.setdefault(session, threading.Lock())
+
+
 def _tmux_paste(target: str | dict | RuntimeHandle, text: str, settle: float = 0.0):
     """Paste text into a tmux pane and press Enter.
 
@@ -1298,7 +1311,8 @@ def deliver_message(session_id: str, text: str, from_wolt: str = "",
         return {"status": "session-dead", "session": session_id}
     settle = get_harness(harness).get("paste_settle", 0.0)
     body = format_attributed_message(text, from_wolt, from_session)
-    _tmux_paste(target, _guard_paste_text(harness, body), settle=settle)
+    with _paste_lock(session_id):
+        _tmux_paste(target, _guard_paste_text(harness, body), settle=settle)
     return {"status": "delivered", "session": session_id, "harness": harness}
 
 
@@ -2094,8 +2108,9 @@ def _paste_into_live_agent(registry: "SessionRegistry", wolt: str, name: str,
         wait_out_stopping(registry, name)
         return False
     if prompt:
-        _tmux_paste(target, _guard_paste_text(harness, prompt),
-                    settle=get_harness(harness).get("paste_settle", 0.0))
+        with _paste_lock(name):
+            _tmux_paste(target, _guard_paste_text(harness, prompt),
+                        settle=get_harness(harness).get("paste_settle", 0.0))
     return True
 
 
@@ -2239,7 +2254,8 @@ def resume_session(name: str, prompt: str = "") -> dict:
         if _runtime().handle_is_alive(target):
             # The exact dedicated pane survived; reuse it rather than creating
             # a new window on every ordinary agent exit.
-            _tmux_paste(target, resume_cmd)
+            with _paste_lock(name):
+                _tmux_paste(target, resume_cmd)
             registry.update(name, wolt=wolt, status="running")
             detail = "agent exited, restarted with --resume in existing pane"
         else:

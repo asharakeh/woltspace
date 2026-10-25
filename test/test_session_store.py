@@ -189,6 +189,72 @@ def test_two_deliveries_to_one_session_paste_one_after_the_other(tmp_path, monke
     assert sorted(pane[0::2]) == ["first message", "second message"]
 
 
+# One delivering process: a fake runtime whose paste writes "<text> start",
+# sleeps, then "<text> end" to a shared file. It waits for the go file first.
+_DELIVER_IN_A_PROCESS = """
+import sys, time
+from pathlib import Path
+lib, data, text, names = sys.argv[1:5]
+sys.path.insert(0, lib)
+import sessions
+from session_runtime import RuntimeHandle, SessionRuntime, set_runtime
+log = Path(data) / "pane.log"
+
+class Pane(SessionRuntime):
+    def __getattr__(self, name):
+        raise AssertionError(name)
+    def paste(self, handle, text, settle=0.0, **_):
+        with log.open("a") as f:
+            f.write(text + " start\\n")
+        time.sleep(0.3 if handle.woltspace_session_id == "s" else 0)
+        with log.open("a") as f:
+            f.write(text + " end\\n")
+
+set_runtime(Pane.__new__(Pane))
+sessions._tmux_alive = lambda data: True
+sessions.session_has_agent_process = lambda *a: True
+sessions._await_input_ready = lambda *a: True
+sessions.resolve_agent_handle = lambda d, *a, **k: RuntimeHandle(d["name"], d["name"], pane_id="%1")
+while not (Path(data) / "go").exists():
+    time.sleep(0.01)
+for name in names.split(","):
+    if text == "first":  # a chat message: the bot's process resumes into the live agent
+        print(sessions.resume_session(name, text)["status"])
+        continue
+    time.sleep(0.1 if text == "second" else 0)  # the server's delivery, a moment later
+    print(sessions.deliver_message(name, text, registry=sessions.SessionRegistry(data))["status"])
+"""
+
+
+def test_two_processes_paste_into_one_session_one_after_the_other(tmp_path):
+    """The lock holds across processes (the server delivers, a chat bot resumes), not only threads."""
+    import os
+    import subprocess
+    reg = SessionRegistry(tmp_path)
+    many = [f"s{i}" for i in range(40)]
+    for name in ["s", *many]:
+        make_session(reg, name=name, wolt="alpha", harness_session_id=f"conv-{name}")
+    lib = str(Path(sessions.__file__).parent)
+    env = {**os.environ, "WOLTSPACE_WOLTS_DIR": str(tmp_path), "WOLTS_DIR": str(tmp_path)}
+
+    def deliver(text, names="s"):
+        return subprocess.Popen([sys.executable, "-c", _DELIVER_IN_A_PROCESS, lib, str(tmp_path), text, names],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    procs = [deliver("first"), deliver("second")]
+    time.sleep(1.0)  # both processes imported and waiting at the gate
+    (tmp_path / "go").touch()
+    results = [p.communicate(timeout=30) for p in procs]
+    assert [out.strip() for out, _err in results] == ["delivered", "delivered"], results
+    lines = (tmp_path / "pane.log").read_text().splitlines()
+    assert sorted(lines[0::2]) == ["first start", "second start"]
+    assert [line.replace("start", "end") for line in lines[0::2]] == lines[1::2]
+    # A fixed set of lock files, however many sessions paste.
+    out, err = deliver("hi", ",".join(many)).communicate(timeout=60)
+    assert out.split() == ["delivered"] * 40, err
+    locks = sorted(p.name for p in (tmp_path / ".space" / "run" / "paste").iterdir())
+    assert 0 < len(locks) <= 32 and {f"{k}.lock" for k in range(32)} >= set(locks)
+
+
 def test_a_failed_stop_gives_back_the_status_and_keeps_what_came_meanwhile(tmp_path):
     reg = SessionRegistry(tmp_path)
     hold = {"until": None, "reason": "a build", "since": 1}

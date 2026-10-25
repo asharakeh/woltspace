@@ -13,6 +13,8 @@ Usage:
     reg.create("neowolt-chompy-dam-a3f1e2", wolt="neowolt", creature="beaver", ...)
 """
 
+import fcntl
+import hashlib
 import json
 import os
 import random
@@ -922,16 +924,33 @@ def _tmux_alive(session: str | dict | RuntimeHandle) -> bool:
 
 
 # One paste at a time per session: the tmux paste buffer is per session, so
-# two server threads pasting at once can lose or merge a message. In-process
-# only; never pruned, as a lodge has few sessions. Hold it around _tmux_paste
-# alone, never inside a lodge_db write.
-_PASTE_LOCKS: dict[str, threading.Lock] = {}
-_PASTE_LOCKS_GUARD = threading.Lock()
+# two pastes at once (server threads, a chat bot, the CLI) can lose or merge a
+# message. A flock, so it holds across processes, on one of PASTE_LOCKS fixed
+# files: a session's file is a stable hash of its name, and two sessions that
+# share one only wait for each other. Best-effort, like any lock file here: a
+# filesystem without flock falls through. Hold it around _tmux_paste alone,
+# never inside a lodge_db write.
+PASTE_LOCKS = 32
 
 
-def _paste_lock(session: str) -> threading.Lock:
-    with _PASTE_LOCKS_GUARD:
-        return _PASTE_LOCKS.setdefault(session, threading.Lock())
+@contextmanager
+def _paste_lock(session: str, wolts_dir: Path):
+    k = int(hashlib.sha256(session.encode()).hexdigest(), 16) % PASTE_LOCKS
+    lock = space_dir(Path(wolts_dir)) / "run" / "paste" / f"{k}.lock"
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_CREAT | os.O_WRONLY, 0o600)
+    except OSError:
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        yield
+    finally:
+        os.close(fd)
 
 
 def _tmux_paste(target: str | dict | RuntimeHandle, text: str, settle: float = 0.0):
@@ -1310,7 +1329,7 @@ def deliver_message(session_id: str, text: str, from_wolt: str = "",
         return {"status": "session-dead", "session": session_id}
     settle = get_harness(harness).get("paste_settle", 0.0)
     body = format_attributed_message(text, from_wolt, from_session)
-    with _paste_lock(session_id):
+    with _paste_lock(session_id, reg.db_dir):
         _tmux_paste(target, _guard_paste_text(harness, body), settle=settle)
     return {"status": "delivered", "session": session_id, "harness": harness}
 
@@ -2107,7 +2126,7 @@ def _paste_into_live_agent(registry: "SessionRegistry", wolt: str, name: str,
         wait_out_stopping(registry, name)
         return False
     if prompt:
-        with _paste_lock(name):
+        with _paste_lock(name, registry.db_dir):
             _tmux_paste(target, _guard_paste_text(harness, prompt),
                         settle=get_harness(harness).get("paste_settle", 0.0))
     return True
@@ -2253,7 +2272,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
         if _runtime().handle_is_alive(target):
             # The exact dedicated pane survived; reuse it rather than creating
             # a new window on every ordinary agent exit.
-            with _paste_lock(name):
+            with _paste_lock(name, registry.db_dir):
                 _tmux_paste(target, resume_cmd)
             registry.update(name, wolt=wolt, status="running")
             detail = "agent exited, restarted with --resume in existing pane"

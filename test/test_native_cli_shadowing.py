@@ -338,8 +338,9 @@ def _launch(wolts_dir, verb="start", **env):
     fake_bin.mkdir(exist_ok=True)
     # A docker that screams if the guard ever lets it through. It logs its argv,
     # lists the container once it has been run, and answers `image inspect` of
-    # the image `woltspace` with FAKE_IMAGE_LABEL, so a `start` that is let
-    # through goes all the way to `docker run`.
+    # the lodge's image (WOLTSPACE_IMAGE, else `woltspace`) with
+    # FAKE_IMAGE_LABEL, so a `start` that is let through goes all the way to
+    # `docker run`.
     docker = fake_bin / "docker"
     docker.write_text(
         "#!/bin/sh\necho 'DOCKER INVOKED' >&2\n"
@@ -347,7 +348,7 @@ def _launch(wolts_dir, verb="start", **env):
         'case "$1 $*" in\n'
         '  run*) touch "$0.ran" ;;\n'
         '  ps*) [ -f "$0.ran" ] && echo "$WOLTSPACE_CONTAINER" ;;\n'
-        '  "image image inspect"*" woltspace") echo "$FAKE_IMAGE_LABEL" ;;\n'
+        '  "image image inspect"*" ${WOLTSPACE_IMAGE:-woltspace}") echo "$FAKE_IMAGE_LABEL" ;;\n'
         "esac\nexit 0\n"
     )
     docker.chmod(0o755)
@@ -448,6 +449,111 @@ def test_a_bad_node_sudo_stops_rebuild_before_docker_changes_anything(tmp_path):
     assert result.returncode == 1
     assert "WOLTSPACE_NODE_SUDO must be true or false" in result.stderr
     assert not [c for c in calls if c[0] in ("rm", "run", "build")]
+
+
+# --------------------------------------------------------------------------
+# WOLTSPACE_IMAGE: each lodge on a machine builds and runs its own image
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("local", ["false", "true"])
+def test_build_tags_the_image_woltspace_image_names(tmp_path, local):
+    wolts_dir = tmp_path / "wolts"
+    wolts_dir.mkdir()
+    result = _launch(wolts_dir, "build", WOLTSPACE_IMAGE="lodge-b", WOLTSPACE_LOCAL=local)
+    assert result.returncode == 0, result.stderr
+    calls = [c.split() for c in (tmp_path / "fake-bin" / "docker.log").read_text().splitlines()]
+    [build] = [c for c in calls if c[0] == "build"]
+    assert build[build.index("-t") + 1] == "lodge-b"
+
+
+@pytest.mark.parametrize("verb", ["start", "init"])
+def test_start_inspects_and_runs_the_image_woltspace_image_names(tmp_path, verb):
+    result, calls, runs = _docker_calls(tmp_path, verb, WOLTSPACE_IMAGE="lodge-b", FAKE_IMAGE_LABEL="false")
+    assert result.returncode == 0, result.stdout
+    [argv] = runs
+    assert argv[-1] == "lodge-b"
+    assert "no-new-privileges" in argv  # the label was read from lodge-b
+    assert ["image", "inspect", "lodge-b"] in calls  # the "is it built yet" check
+    assert not [c for c in calls if "woltspace" in c]
+
+
+@pytest.mark.parametrize("verb", ["build", "start"])
+def test_without_woltspace_image_the_image_is_still_woltspace(tmp_path, verb):
+    _, calls, runs = _docker_calls(tmp_path, verb)
+    named = [c[c.index("-t") + 1] for c in calls if c[0] == "build"] + [c[-1] for c in runs]
+    assert named == ["woltspace"]
+
+
+@pytest.mark.parametrize("image", ["woltspace/woltspace:latest", "registry.example:5000/lodge-b@sha256:ab12"])
+def test_an_image_reference_such_as_the_desktop_apps_is_accepted(tmp_path, image):
+    result, calls, runs = _docker_calls(tmp_path, WOLTSPACE_IMAGE=image, FAKE_IMAGE_LABEL="false")
+    assert result.returncode == 0, result.stderr
+    [argv] = runs
+    assert argv[-1] == image
+    assert "no-new-privileges" in argv
+
+
+@pytest.mark.parametrize("verb", ["build", "start", "init", "rebuild"])
+@pytest.mark.parametrize("image", ["-lodge", "lodge-b --privileged", "lodge;id", "$(id)", ".lodge", "/lodge"])
+def test_a_bad_woltspace_image_stops_before_any_docker_call(tmp_path, verb, image):
+    result, calls, _ = _docker_calls(tmp_path, verb, WOLTSPACE_IMAGE=image)
+    assert result.returncode == 1
+    assert "WOLTSPACE_IMAGE must be an image name" in result.stderr
+    assert calls == []
+
+
+# --------------------------------------------------------------------------
+# The run-setting checks: a bad value stops `start` before the old container goes
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("env, message", [
+    ({"WOLTSPACE_PUBLISH_HOST": "localhost"}, "WOLTSPACE_PUBLISH_HOST must be an IP address"),
+    ({"WOLTSPACE_PUBLISH_HOST": "127.0.0.1 -v /:/host"}, "WOLTSPACE_PUBLISH_HOST must be an IP address"),
+    ({"WOLTSPACE_PUBLISH_HOST": "-p"}, "WOLTSPACE_PUBLISH_HOST must be an IP address"),
+    ({"WOLTSPACE_DOCKER_NETWORK": "host"}, "WOLTSPACE_DOCKER_NETWORK=host is not allowed"),
+    ({"WOLTSPACE_DOCKER_NETWORK": "none"}, "WOLTSPACE_DOCKER_NETWORK=none is not allowed"),
+    ({"WOLTSPACE_DOCKER_NETWORK": "--privileged"}, "WOLTSPACE_DOCKER_NETWORK must be a network name"),
+    ({"WOLTSPACE_DOCKER_NETWORK": "lodge net"}, "WOLTSPACE_DOCKER_NETWORK must be a network name"),
+    ({"WOLTSPACE_DOCKER_NETWORK": "net;id"}, "WOLTSPACE_DOCKER_NETWORK must be a network name"),
+])
+def test_a_rejected_run_setting_stops_start_before_rm_or_run(tmp_path, env, message):
+    result, calls, _ = _docker_calls(tmp_path, **env)
+    assert result.returncode == 1
+    assert message in result.stderr
+    assert not [c for c in calls if c[0] in ("rm", "run", "build")]
+
+
+@pytest.mark.parametrize("host, published", [("127.0.0.1", "127.0.0.1:7777:7777"), ("::1", "[::1]:7777:7777"),
+                                             ("fd00::2", "[fd00::2]:7777:7777")])
+def test_the_port_is_published_on_the_host_address_ipv6_in_brackets(tmp_path, host, published):
+    result, _, runs = _docker_calls(tmp_path, WOLTSPACE_PUBLISH_HOST=host)
+    assert result.returncode == 0, result.stderr
+    [argv] = runs
+    assert argv[argv.index("-p") + 1] == published
+
+
+def test_an_accepted_docker_network_is_joined(tmp_path):
+    result, _, runs = _docker_calls(tmp_path, WOLTSPACE_DOCKER_NETWORK="lodge-b_egress.1")
+    assert result.returncode == 0, result.stderr
+    [argv] = runs
+    assert argv[argv.index("--network") + 1] == "lodge-b_egress.1"
+
+
+@pytest.mark.parametrize("external", [True, False])
+def test_init_sees_an_existing_lodge_in_the_data_root_not_in_an_external_env_file(tmp_path, external):
+    wolts_dir = tmp_path / "wolts"
+    wolts_dir.mkdir()  # exists, and holds no lodge yet
+    env_file = tmp_path / "lodge-b.env" if external else wolts_dir / ".env"
+    env_file.write_text("WOLTSPACE_PUBLIC_TUNNEL=false\n")
+    env = {"WOLTSPACE_ENV_FILE": str(env_file)} if external else {}
+    result = _launch(wolts_dir, "init", WOLTSPACE_NONINTERACTIVE="true", WOLTSPACE_INIT_WOLT_NAME="first", **env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = [c.split() for c in (tmp_path / "fake-bin" / "docker.log").read_text().splitlines()]
+    [argv] = [c for c in calls if c[0] == "run"]
+    assert argv[argv.index("--env-file") + 1] == str(env_file)
+    # A pre-made external env file is not a lodge: init is a fresh one and names the first wolt.
+    assert ("lodge exists" in result.stdout) is not external
+    assert ("WOLTSPACE_WOLT_NAME=first" in argv) is external
 
 
 def test_launcher_still_boots_when_the_owner_is_a_container(tmp_path):

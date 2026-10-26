@@ -989,6 +989,22 @@ def test_a_recipient_encrypts_the_whole_archive_secrets_inside(
     assert f"{len(withheld) - inside} not in the archive, {inside} inside, encrypted" in report
 
 
+def test_a_symlinked_env_is_not_counted_inside_the_encrypted_archive(
+    wolts_with_credentials, fake_age, tmp_path,
+):
+    env = wolts_with_credentials / "beaverwolt" / "wolt" / "apps" / "shop" / ".env"
+    env.unlink()
+    env.symlink_to(tmp_path / "elsewhere.env")
+    result = create_backup(wolts_with_credentials, out_dir=tmp_path / "out", tag="t4")
+    withheld = result.manifest["withheld"]["paths"]
+    inside = sum(
+        item["rule"] in backup_mod.ENCRYPTED_RULES and item["path"] != "beaverwolt/wolt/apps/shop/.env"
+        for item in withheld
+    )
+    report = "\n".join(backup_mod.summary_lines(result))
+    assert f"{len(withheld) - inside} not in the archive, {inside} inside, encrypted" in report
+
+
 def test_no_plaintext_touches_the_disk(wolts, fake_age, tmp_path, monkeypatch):
     import tempfile
 

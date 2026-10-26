@@ -909,8 +909,12 @@ def summary_lines(result: BackupResult) -> list[str]:
     withheld = result.manifest["withheld"]["paths"]
     secrets = result.manifest["secrets"]
     if withheld:
-        # Encrypted, the .env files and bot tokens travel inside; only the rest stays out.
-        inside = sum(item["rule"] in ENCRYPTED_RULES for item in withheld) if secrets["present"] else 0
+        # Encrypted, the .env files and bot tokens travel inside, except a symlinked
+        # one keep_secrets skipped; the rest stays out.
+        skipped = {item["path"] for item in result.manifest["unreadable"]}
+        inside = sum(
+            item["rule"] in ENCRYPTED_RULES and item["path"] not in skipped for item in withheld
+        ) if secrets["present"] else 0
         where = [f"{count} {text}" for count, text in (
             (len(withheld) - inside, "not in the archive"), (inside, "inside, encrypted"),
         ) if count]

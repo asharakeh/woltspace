@@ -14,7 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "container"))
 sys.path.insert(0, str(ROOT / "container" / "lib"))
 
-from speech_settings import SettingsInvalid, SpeechSettings, load_settings, save_settings  # noqa: E402
+from speech_settings import (  # noqa: E402
+    SettingsInvalid, SpeechSettings, load_settings, parse_wolt_speech, save_settings,
+)
 
 from server import notify, speech  # noqa: E402
 from server.speech import SpeechError  # noqa: E402
@@ -53,6 +55,36 @@ def test_older_env_names_fill_only_what_the_file_leaves_out(tmp_path):
     path.write_text(json.dumps({"speech": {"voice": "alba"}}))
     settings = load_settings(path, model="tts-1", voice="nova")
     assert (settings.model, settings.voice) == ("tts-1", "alba")
+
+
+def test_a_wolt_without_speech_settings_has_none():
+    assert parse_wolt_speech(None) == {}
+    assert parse_wolt_speech({}) == {}
+
+
+def test_a_wolt_keeps_only_the_keys_it_sets():
+    assert parse_wolt_speech({"voice": "nova"}) == {"voice": "nova"}
+    assert parse_wolt_speech({"instructions": "  Speak slowly.\n"}) == {"instructions": "Speak slowly."}
+
+
+def test_the_instructions_limit_is_counted_after_strip():
+    assert parse_wolt_speech({"instructions": " " + "a" * 500 + " "}) == {"instructions": "a" * 500}
+
+
+@pytest.mark.parametrize("section, reason", [
+    ("nova", "speech must be an object"),
+    ({"model": "tts-1"}, "unknown speech keys: model"),
+    ({"voice": "two words"}, "voice must be a voice name"),
+    ({"voice": 3}, "voice must be a voice name"),
+    ({"instructions": 3}, "instructions must be text"),
+    ({"instructions": "  "}, "instructions must be 1 to 500 characters"),
+    ({"instructions": "a" * 501}, "instructions must be 1 to 500 characters"),
+    ({"instructions": "Speak\x00slowly."}, "instructions must not hold control characters"),
+    ({"instructions": "Speak\nslowly."}, "instructions must not hold control characters"),
+])
+def test_unusable_wolt_speech_settings_are_refused(section, reason):
+    with pytest.raises(SettingsInvalid, match=f"^{reason}$"):
+        parse_wolt_speech(section)
 
 
 def test_save_keeps_other_keys_and_clear_removes_only_its_own(tmp_path):

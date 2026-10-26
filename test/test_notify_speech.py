@@ -303,6 +303,11 @@ def test_a_stall_is_cut_off_well_inside_a_two_minute_caller():
     assert speech.SPEECH_TIMEOUT.read * speech.SPEECH_ATTEMPTS < 120
 
 
+def test_a_slow_start_gets_more_than_thirty_seconds():
+    """A long message on a busy service can take over 30 s before the first byte."""
+    assert speech.SPEECH_TIMEOUT.read >= 50
+
+
 @pytest.mark.asyncio
 async def test_a_retry_after_partial_audio_writes_a_clean_file(monkeypatch, tmp_path):
     """The first try writes some audio and drops; the second must not trip over

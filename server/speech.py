@@ -11,9 +11,10 @@ from pathlib import Path
 import httpx
 
 SPEECH_URL = "https://api.openai.com/v1/audio/speech"
-# A healthy answer starts within seconds; a stalled one is retried rather than
-# waited on, and two tries stay well inside a caller's two-minute patience.
-SPEECH_TIMEOUT = httpx.Timeout(30.0, read=30.0)
+# A healthy answer starts within seconds, but a long message on a busy service
+# can take over 30 s to start; a stalled one is retried rather than waited on,
+# and two tries stay inside a caller's two-minute patience.
+SPEECH_TIMEOUT = httpx.Timeout(30.0, read=50.0)
 SPEECH_ATTEMPTS = 2
 DEFAULT_SPEECH_MODEL = "gpt-4o-mini-tts"
 DEFAULT_SPEECH_VOICE = "alloy"

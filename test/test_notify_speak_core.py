@@ -338,6 +338,118 @@ async def test_calls_without_speak_never_reach_the_speech_client(lodge):
     assert [len(sent.message.attachments) for sent in lodge.sent] == [0, 1]
 
 
+# --- a wolt's own voice: from its wolt.json, found through the session record only ---
+
+def _wolt(lodge, name, config):
+    folder = lodge.tmp / name / "wolt"
+    folder.mkdir(parents=True)
+    (folder / "wolt.json").write_text(config if isinstance(config, str) else json.dumps(config))
+
+
+def _session_of(lodge, wolt):
+    lodge.routing = {"adapter": "telegram", "chat_id": "101", "wolt": wolt}
+
+
+def _said(lodge):
+    (spoken,) = lodge.spoken
+    return spoken.voice, getattr(spoken, "instructions", None)
+
+
+@pytest.mark.asyncio
+async def test_the_sending_wolt_s_voice_and_instructions_are_used(lodge):
+    _wolt(lodge, "alpha", {"speech": {"voice": "coral", "instructions": " Speak slowly. "}})
+    _session_of(lodge, "alpha")
+
+    await notify.send_notification("test-session", "hi\n", None, (), WORDS)
+
+    assert _said(lodge) == ("coral", "Speak slowly.")
+    assert len(lodge.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_wolt_s_voice_comes_before_the_lodge_s(lodge):
+    (lodge.tmp / "woltspace.json").write_text(json.dumps({"speech": {"voice": "nova"}}))
+    lodge.env["OPENAI_TTS_VOICE"] = "echo"
+    _wolt(lodge, "alpha", {"speech": {"voice": "coral"}})
+    _session_of(lodge, "alpha")
+
+    await notify.send_notification("test-session", "hi\n", None, (), WORDS)
+
+    assert _said(lodge) == ("coral", None)
+
+
+@pytest.mark.asyncio
+async def test_a_wolt_with_instructions_only_keeps_the_lodge_voice(lodge):
+    (lodge.tmp / "woltspace.json").write_text(json.dumps({"speech": {"voice": "nova"}}))
+    _wolt(lodge, "alpha", {"speech": {"instructions": "Speak slowly."}})
+    _session_of(lodge, "alpha")
+
+    await notify.send_notification("test-session", "hi\n", None, (), WORDS)
+
+    assert _said(lodge) == ("nova", "Speak slowly.")
+
+
+@pytest.mark.parametrize("routing, config", [
+    ({"adapter": "telegram", "chat_id": "101", "wolt": "beta"}, {"name": "beta"}),  # another wolt
+    (None, None),                                                       # no session record
+    ({"adapter": "telegram", "chat_id": "101"}, None),                  # a record without a wolt
+    ({"adapter": "telegram", "chat_id": "101", "wolt": "beta"}, "{not json"),
+    ({"adapter": "telegram", "chat_id": "101", "wolt": "beta"}, "[]"),
+    ({"adapter": "telegram", "chat_id": "101", "wolt": "gamma"}, None),  # no wolt.json
+    *(({"adapter": "telegram", "chat_id": "101", "wolt": wolt}, None)    # not one folder name
+      for wolt in ("../alpha", "alpha/..", ".", "..", "/alpha")),
+])
+@pytest.mark.asyncio
+async def test_without_a_wolt_speech_setting_of_its_own_the_lodge_voice_is_used(
+    lodge, routing, config,
+):
+    _wolt(lodge, "alpha", {"speech": {"voice": "coral", "instructions": "Speak slowly."}})
+    (lodge.tmp / "wolt").mkdir()
+    (lodge.tmp / "wolt" / "wolt.json").write_text(json.dumps({"speech": {"voice": "coral"}}))
+    if config is not None:
+        _wolt(lodge, "beta", config)
+    lodge.routing = routing
+
+    await notify.send_notification("test-session", "hi\n", None, (), WORDS)
+
+    assert _said(lodge) == ("alloy", None)
+
+
+@pytest.mark.asyncio
+async def test_the_wolt_comes_from_the_session_record_never_the_request(lodge):
+    _wolt(lodge, "alpha", {"speech": {"voice": "coral"}})
+    _wolt(lodge, "beta", {"speech": {"voice": "sage"}})
+    _session_of(lodge, "beta")
+    explicit = {"adapter": "telegram", "chat_id": "101", "wolt": "alpha"}
+
+    await notify.send_notification("test-session", "hi\n", explicit, (), WORDS | {"wolt": "alpha"})
+
+    assert _said(lodge) == ("sage", None)
+
+
+@pytest.mark.parametrize("section, reason", [
+    ("coral", "speech must be an object"),
+    ({"model": "tts-1"}, "unknown speech keys: model"),
+    ({"voice": "two words"}, "voice must be a voice name"),
+    ({"instructions": "Speak\x07slowly."}, "instructions must not hold control characters"),
+    ({"instructions": "a" * 501}, "instructions must be 1 to 500 characters"),
+])
+@pytest.mark.asyncio
+async def test_unusable_wolt_speech_settings_send_nothing(lodge, section, reason):
+    _wolt(lodge, "alpha", {"speech": section})
+    _session_of(lodge, "alpha")
+
+    with pytest.raises(notify.SpeechError) as error:
+        await notify.send_notification("test-session", "hi\n", None, (), WORDS)
+
+    assert error.value.reason == "speech_not_configured"
+    assert str(error.value) == (
+        f"the speech settings in wolt.json are unusable ({reason}); send the message as text"
+    )
+    assert lodge.spoken == [] and lodge.sent == []
+    lodge.history.assert_not_called()
+
+
 # --- both halves: the registered senders, and then the real speech client too ---
 
 @pytest.fixture
@@ -430,3 +542,35 @@ async def test_end_to_end_the_service_s_audio_is_what_telegram_is_handed(real_lo
     assert "🦝 Bob: The build is green.".encode() in sent.content
     assert result["attachments"][0]["kind"] == "voice"
     assert list(real_lodge.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_a_wolt_without_speech_settings_sends_today_s_body(real_lodge, monkeypatch):
+    folder = real_lodge.parent / "beta" / "wolt"
+    folder.mkdir(parents=True)
+    (folder / "wolt.json").write_text(json.dumps({"name": "beta"}))
+    monkeypatch.setattr(notify, "read_session_registry", lambda name: {
+        "adapter": "telegram", "chat_id": "101", "wolt": "beta",
+    })
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if str(request.url) == speech.SPEECH_URL:
+            return httpx.Response(200, content=OGG)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 7}})
+
+    class Client(httpx.AsyncClient):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+    today = httpx.Request("POST", speech.SPEECH_URL, json={
+        "model": "gpt-4o-mini-tts", "voice": "alloy",
+        "input": "The build is green.", "response_format": "opus",
+    })
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    monkeypatch.setattr(notify, "synthesize", speech.synthesize)
+
+    await notify.send_notification("test-session", "hi\n", None, (), {"text": "The build is green."})
+
+    assert requests[0].content == today.content

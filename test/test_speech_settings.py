@@ -183,6 +183,7 @@ async def test_notify_uses_openai_until_told_otherwise(spoken):
     assert spoken.calls[-1] == {
         "api_key": "sk-test", "model": "gpt-4o-mini-tts", "voice": "alloy", "max_bytes": 1024 * 1024,
         "url": "https://api.openai.com/v1/audio/speech", "key_env": "OPENAI_API_KEY", "local": False,
+        "instructions": None,
     }
 
 

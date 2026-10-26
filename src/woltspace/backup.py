@@ -907,12 +907,17 @@ def summary_lines(result: BackupResult) -> list[str]:
             + (f" (−{human_bytes(wolt['excluded_bytes'])} excluded)" if wolt["excluded_bytes"] else "")
         )
     withheld = result.manifest["withheld"]["paths"]
+    secrets = result.manifest["secrets"]
     if withheld:
+        # Encrypted, the .env files and bot tokens travel inside; only the rest stays out.
+        inside = sum(item["rule"] in ENCRYPTED_RULES for item in withheld) if secrets["present"] else 0
+        where = [f"{count} {text}" for count, text in (
+            (len(withheld) - inside, "not in the archive"), (inside, "inside, encrypted"),
+        ) if count]
         lines.append(
-            f"withheld: {len(withheld)} credential file(s) — not in the archive, "
+            f"withheld: {len(withheld)} credential file(s) — {', '.join(where)}, "
             f"listed in {MANIFEST_NAME}"
         )
-    secrets = result.manifest["secrets"]
     if secrets["present"]:
         lines.append(f"encrypted to {secrets['recipient']}, .env files and bot tokens inside")
     elif any(item["rule"] in ENCRYPTED_RULES for item in withheld):

@@ -160,8 +160,9 @@ The Claude Code CLI is installed in an isolated `claude` build stage, cached ind
 
 ### `src/woltspace/container_entrypoint.py`
 Container boot, as a subcommand of the installed CLI —
-`ENTRYPOINT ["/usr/local/bin/woltspace", "container-entrypoint"]`. The wheel
-ships no bash. The command runs twice, dispatched on uid:
+`ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/woltspace", "container-entrypoint"]`.
+tini is PID 1 and collects orphaned processes. The wheel ships no bash. The
+command runs twice, dispatched on uid:
 
 1. **root phase** — `groupmod`/`usermod` the `node` user onto `HOST_UID`/`HOST_GID`,
    re-own `/workspace`, `/home/node` and the wheel bundle, then re-exec itself

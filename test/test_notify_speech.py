@@ -101,6 +101,27 @@ async def test_it_asks_for_the_text_in_the_format_and_writes_a_private_file(monk
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
+@pytest.mark.asyncio
+async def test_without_instructions_the_body_is_byte_for_byte_today_s(monkeypatch, tmp_path):
+    service = _Service(monkeypatch)
+
+    await synthesize("hello", "opus", tmp_path / ("c" * 32), **SETTINGS, instructions=None)
+
+    today = httpx.Request("POST", speech.SPEECH_URL, json={
+        "model": "gpt-4o-mini-tts", "voice": "alloy", "input": "hello", "response_format": "opus",
+    })
+    assert service.requests[0].content == today.content
+
+
+@pytest.mark.asyncio
+async def test_instructions_are_sent_when_set(monkeypatch, tmp_path):
+    service = _Service(monkeypatch)
+
+    await synthesize("hello", "opus", tmp_path / ("c" * 32), **SETTINGS, instructions="Speak slowly.")
+
+    assert json.loads(service.requests[0].content)["instructions"] == "Speak slowly."
+
+
 @pytest.mark.parametrize("body", [MP3, b"\xff\xfb\x90\x00" + b"\x00" * 60])
 @pytest.mark.asyncio
 async def test_mp3_is_recognised_by_its_tag_or_its_frame_sync(monkeypatch, tmp_path, body):

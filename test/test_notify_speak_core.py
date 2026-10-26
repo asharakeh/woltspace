@@ -355,38 +355,21 @@ def _said(lodge):
     return spoken.voice, getattr(spoken, "instructions", None)
 
 
+@pytest.mark.parametrize("wolt_speech, said", [
+    ({"voice": "coral", "instructions": " Speak slowly. "}, ("coral", "Speak slowly.")),
+    ({"voice": "coral"}, ("coral", None)),                   # before woltspace.json and the .env
+    ({"instructions": "Speak slowly."}, ("nova", "Speak slowly.")),  # the lodge voice stands
+])
 @pytest.mark.asyncio
-async def test_the_sending_wolt_s_voice_and_instructions_are_used(lodge):
-    _wolt(lodge, "alpha", {"speech": {"voice": "coral", "instructions": " Speak slowly. "}})
-    _session_of(lodge, "alpha")
-
-    await notify.send_notification("test-session", "hi\n", None, (), WORDS)
-
-    assert _said(lodge) == ("coral", "Speak slowly.")
-    assert len(lodge.sent) == 1
-
-
-@pytest.mark.asyncio
-async def test_the_wolt_s_voice_comes_before_the_lodge_s(lodge):
+async def test_the_sending_wolt_s_own_speech_settings_come_first(lodge, wolt_speech, said):
     (lodge.tmp / "woltspace.json").write_text(json.dumps({"speech": {"voice": "nova"}}))
     lodge.env["OPENAI_TTS_VOICE"] = "echo"
-    _wolt(lodge, "alpha", {"speech": {"voice": "coral"}})
+    _wolt(lodge, "alpha", {"speech": wolt_speech})
     _session_of(lodge, "alpha")
 
     await notify.send_notification("test-session", "hi\n", None, (), WORDS)
 
-    assert _said(lodge) == ("coral", None)
-
-
-@pytest.mark.asyncio
-async def test_a_wolt_with_instructions_only_keeps_the_lodge_voice(lodge):
-    (lodge.tmp / "woltspace.json").write_text(json.dumps({"speech": {"voice": "nova"}}))
-    _wolt(lodge, "alpha", {"speech": {"instructions": "Speak slowly."}})
-    _session_of(lodge, "alpha")
-
-    await notify.send_notification("test-session", "hi\n", None, (), WORDS)
-
-    assert _said(lodge) == ("nova", "Speak slowly.")
+    assert _said(lodge) == said and len(lodge.sent) == 1
 
 
 @pytest.mark.parametrize("routing, config", [
@@ -430,9 +413,7 @@ async def test_the_wolt_comes_from_the_session_record_never_the_request(lodge):
 @pytest.mark.parametrize("section, reason", [
     ("coral", "speech must be an object"),
     ({"model": "tts-1"}, "unknown speech keys: model"),
-    ({"voice": "two words"}, "voice must be a voice name"),
     ({"instructions": "Speak\x07slowly."}, "instructions must not hold control characters"),
-    ({"instructions": "a" * 501}, "instructions must be 1 to 500 characters"),
 ])
 @pytest.mark.asyncio
 async def test_unusable_wolt_speech_settings_send_nothing(lodge, section, reason):

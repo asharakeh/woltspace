@@ -57,18 +57,13 @@ def test_older_env_names_fill_only_what_the_file_leaves_out(tmp_path):
     assert (settings.model, settings.voice) == ("tts-1", "alba")
 
 
-def test_a_wolt_without_speech_settings_has_none():
-    assert parse_wolt_speech(None) == {}
-    assert parse_wolt_speech({}) == {}
-
-
-def test_a_wolt_keeps_only_the_keys_it_sets():
-    assert parse_wolt_speech({"voice": "nova"}) == {"voice": "nova"}
-    assert parse_wolt_speech({"instructions": "  Speak slowly.\n"}) == {"instructions": "Speak slowly."}
-
-
-def test_the_instructions_limit_is_counted_after_strip():
-    assert parse_wolt_speech({"instructions": " " + "a" * 500 + " "}) == {"instructions": "a" * 500}
+@pytest.mark.parametrize("section, wolt", [
+    (None, {}), ({}, {}), ({"voice": "nova"}, {"voice": "nova"}),
+    ({"instructions": "  Speak slowly.\n"}, {"instructions": "Speak slowly."}),
+    ({"instructions": " " + "a" * 500 + " "}, {"instructions": "a" * 500}),  # counted after strip
+])
+def test_a_wolt_keeps_only_the_speech_keys_it_sets(section, wolt):
+    assert parse_wolt_speech(section) == wolt
 
 
 @pytest.mark.parametrize("section, reason", [

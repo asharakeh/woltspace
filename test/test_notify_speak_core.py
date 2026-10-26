@@ -410,6 +410,17 @@ async def test_the_wolt_comes_from_the_session_record_never_the_request(lodge):
     assert _said(lodge) == ("sage", None)
 
 
+@pytest.mark.asyncio
+async def test_without_a_session_a_wolt_named_in_the_request_is_ignored(lodge):
+    _wolt(lodge, "alpha", {"speech": {"voice": "coral"}})
+    _session_of(lodge, "alpha")                    # a record exists, but no session asks for it
+    explicit = {"adapter": "telegram", "chat_id": "101", "wolt": "alpha"}
+
+    await notify.send_notification("", "hi\n", explicit, (), WORDS | {"wolt": "alpha"})
+
+    assert _said(lodge) == ("alloy", None)
+
+
 @pytest.mark.parametrize("section, reason", [
     ("coral", "speech must be an object"),
     ({"model": "tts-1"}, "unknown speech keys: model"),

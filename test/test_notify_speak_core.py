@@ -425,9 +425,20 @@ LOCAL = {"speech": {"base_url": "http://127.0.0.1:8000/v1", "key_env": ""}}
 
 
 @pytest.mark.asyncio
-async def test_another_speech_server_gets_today_s_request_whatever_the_wolt_sets(lodge):
+async def test_another_speech_server_gets_the_wolt_s_voice_but_not_its_hint(lodge):
     (lodge.tmp / "woltspace.json").write_text(json.dumps(LOCAL))
-    _wolt(lodge, "alpha", {"speech": {"voice": "coral", "instructions": "Speak slowly."}})
+    _wolt(lodge, "alpha", {"speech": {"voice": "marius", "instructions": "Speak slowly."}})
+    _session_of(lodge, "alpha")
+
+    await notify.send_notification("test-session", "hi\n", None, (), WORDS)
+
+    assert _said(lodge) == ("marius", None)
+
+
+@pytest.mark.asyncio
+async def test_another_speech_server_gets_today_s_request_when_the_wolt_sets_nothing(lodge):
+    (lodge.tmp / "woltspace.json").write_text(json.dumps(LOCAL))
+    _wolt(lodge, "alpha", {"name": "alpha"})
     await notify.send_notification("", "hi\n", None, (), WORDS)       # no wolt: today's request
     _session_of(lodge, "alpha")
 
@@ -437,24 +448,16 @@ async def test_another_speech_server_gets_today_s_request_whatever_the_wolt_sets
     assert with_wolt == without and without["voice"] == "alloy"
 
 
-@pytest.mark.asyncio
-async def test_another_speech_server_ignores_unusable_wolt_speech_settings(lodge):
-    (lodge.tmp / "woltspace.json").write_text(json.dumps(LOCAL))
-    _wolt(lodge, "alpha", {"speech": {"voice": "two words", "speed": 2}})
-    _session_of(lodge, "alpha")
-
-    await notify.send_notification("test-session", "hi\n", None, (), WORDS)
-
-    assert _said(lodge) == ("alloy", None) and len(lodge.sent) == 1
-
-
 @pytest.mark.parametrize("section, reason", [
     ("coral", "speech must be an object"),
     ({"model": "tts-1"}, "unknown speech keys: model"),
     ({"instructions": "Speak\x07slowly."}, "instructions must not hold control characters"),
 ])
+@pytest.mark.parametrize("server", [None, LOCAL])
 @pytest.mark.asyncio
-async def test_unusable_wolt_speech_settings_send_nothing(lodge, section, reason):
+async def test_unusable_wolt_speech_settings_send_nothing(lodge, section, reason, server):
+    if server:
+        (lodge.tmp / "woltspace.json").write_text(json.dumps(server))
     _wolt(lodge, "alpha", {"speech": section})
     _session_of(lodge, "alpha")
 

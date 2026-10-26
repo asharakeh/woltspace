@@ -252,7 +252,8 @@ async def _spoken(speech: _Speech, sender: Plugin, adapter: str, wolt: str = "")
             "speech_not_configured",
             f"the speech settings in woltspace.json are unusable ({exc}); send the message as text",
         ) from None
-    wolt_speech = _wolt_speech(wolt)
+    # A wolt's own voice and hint are OpenAI's: any other server gets today's request.
+    wolt_speech = _wolt_speech(wolt) if settings.base_url == speech_settings.DEFAULT_BASE_URL else {}
     api_key = dotenv_env(settings.key_env) if settings.key_env else ""
     if settings.key_env and not api_key:
         raise SpeechError(

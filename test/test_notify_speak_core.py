@@ -421,6 +421,33 @@ async def test_without_a_session_a_wolt_named_in_the_request_is_ignored(lodge):
     assert _said(lodge) == ("alloy", None)
 
 
+LOCAL = {"speech": {"base_url": "http://127.0.0.1:8000/v1", "key_env": ""}}
+
+
+@pytest.mark.asyncio
+async def test_another_speech_server_gets_today_s_request_whatever_the_wolt_sets(lodge):
+    (lodge.tmp / "woltspace.json").write_text(json.dumps(LOCAL))
+    _wolt(lodge, "alpha", {"speech": {"voice": "coral", "instructions": "Speak slowly."}})
+    await notify.send_notification("", "hi\n", None, (), WORDS)       # no wolt: today's request
+    _session_of(lodge, "alpha")
+
+    await notify.send_notification("test-session", "hi\n", None, (), WORDS)
+
+    without, with_wolt = ({k: v for k, v in vars(s).items() if k != "target"} for s in lodge.spoken)
+    assert with_wolt == without and without["voice"] == "alloy"
+
+
+@pytest.mark.asyncio
+async def test_another_speech_server_ignores_unusable_wolt_speech_settings(lodge):
+    (lodge.tmp / "woltspace.json").write_text(json.dumps(LOCAL))
+    _wolt(lodge, "alpha", {"speech": {"voice": "two words", "speed": 2}})
+    _session_of(lodge, "alpha")
+
+    await notify.send_notification("test-session", "hi\n", None, (), WORDS)
+
+    assert _said(lodge) == ("alloy", None) and len(lodge.sent) == 1
+
+
 @pytest.mark.parametrize("section, reason", [
     ("coral", "speech must be an object"),
     ({"model": "tts-1"}, "unknown speech keys: model"),

@@ -242,7 +242,7 @@ A wolt may speak in its own voice: `"speech": {"voice": "coral", "instructions":
 "Speak slowly."}` in its `wolt/wolt.json`, both keys optional. The wolt is the
 sending session's; its voice comes before the lodge's, and `instructions` (at
 most 500 characters, sent only when set) is a hint on how to speak. Server,
-model and key stay the lodge's.
+model and key stay the lodge's. OpenAI only; ignored for any other speech server.
 
 **Harnesses** — `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`,
 `CLAUDE_CODE_DISABLE_AUTO_MEMORY`, `CODEX_HOME`, `OPENCODE_CONFIG_DIR` and the

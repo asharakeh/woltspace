@@ -35,6 +35,7 @@ KINDS = ("wolt", "session-name", "incarnation")
 READINESS = ("running", "resting", "unknown")  # what the runtime verified, supplied by the caller
 ENDED = ("stopped", "completed", "failed")
 LIFECYCLE = ("running", "resting", sessions.STOPPING, *ENDED)
+TERMINAL = (*ENDED, "archived")  # archive_session's status: never enrolled or reopened, nor set here
 HOLDS = ("target_resting", "target_stopping", "target_unknown")  # released once it runs again
 _INCARNATION_CHARS = 36
 _ENROLLED = "inbox:enrollments"  # meta key: enrollments ever made, never released
@@ -88,7 +89,7 @@ def _refusal(row) -> str | None:
         return "binding_mismatch"
     if row["status"] == sessions.STOPPING:
         return "target_stopping"  # retry later
-    return "target_ended" if row["status"] in ENDED else "target_unknown"
+    return "target_ended" if row["status"] in TERMINAL else "target_unknown"
 
 
 def _target(incarnation, revision) -> None:
@@ -124,8 +125,8 @@ class Authority:
                         row["inbox_generation"]) != (harness, conversation, readiness, generation):
                     raise Refused("already_enrolled")
                 return _binding(row)
-            if row["status"] == sessions.STOPPING or row["status"] in ENDED:
-                raise Refused("target_ended" if row["status"] in ENDED else "target_stopping")
+            if row["status"] == sessions.STOPPING or row["status"] in TERMINAL:
+                raise Refused("target_ended" if row["status"] in TERMINAL else "target_stopping")
             used = conn.execute("SELECT value FROM meta WHERE key=?", (_ENROLLED,)).fetchone()
             used = int(used[0]) if used else 0
             if used >= self.limits.enrollments:
@@ -184,7 +185,7 @@ class Authority:
         _target(incarnation, revision)
         with self._owned() as conn:
             row = self._current(conn, incarnation, revision)
-            if row["status"] in ENDED:
+            if row["status"] in TERMINAL:
                 raise Refused("target_ended")  # an end is for good
             generation = generation or row["inbox_generation"]
             if (status, readiness, generation) == (row["status"], row["inbox_readiness"], row["inbox_generation"]):

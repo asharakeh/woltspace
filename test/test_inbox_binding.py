@@ -49,6 +49,7 @@ def test_enrollment_makes_its_own_incarnation_and_freezes_the_session_it_found(t
     ({}, dict(harness="codex"), "binding_mismatch"),
     (dict(status="stopped"), {}, "target_ended"),
     (dict(status="failed"), {}, "target_ended"),
+    (dict(status="archived"), {}, "target_ended"),
     (dict(status=sessions.STOPPING), {}, "target_stopping"),
     ({}, dict(readiness="awake"), "Invalid"),
     ({}, dict(generation="g" * 41), "Invalid"),
@@ -116,6 +117,7 @@ def _recreated(tmp_path, auth):
 @pytest.mark.parametrize("change, by_name, by_incarnation", [
     (lambda root, auth: session(root, "s1", status=sessions.STOPPING), "target_stopping", "target_stopping"),
     (_ended, "target_ended", "target_ended"),
+    (lambda root, auth: session(root, "s1", status="archived"), "target_ended", "target_ended"),
     (lambda root, auth: session(root, "s1", status="orphaned"), "target_unknown", "target_unknown"),
     (lambda root, auth: session(root, "s1", status="resting"), "target_unknown", "target_unknown"),
     (lambda root, auth: session(root, "s1", conversation="conv-new"), "binding_mismatch", "binding_mismatch"),
@@ -416,6 +418,24 @@ def test_an_ended_session_keeps_its_mail_blocked_and_its_settled_mail_as_it_was(
         assert rows(tmp_path, "SELECT key FROM inbox_messages WHERE recipient=?", again.incarnation) == [
             ("k5",)]
         assert auth.store.claim(inc, "conv-s1", "g1") is None
+
+
+def test_an_archived_session_is_never_reopened_and_keeps_its_mail(tmp_path):
+    auth = authority(tmp_path)
+    binding = enroll(auth, "s1")
+    first = auth.admit("k1", "session-name", "s1", "hi")
+    session(tmp_path, "s1", status="archived")  # what sessions.archive_session stores
+    before = rows(tmp_path, "SELECT * FROM sessions"), rows(tmp_path, "SELECT * FROM inbox_events")
+    for status in ("running", "resting"):
+        with pytest.raises(inbox.Refused, match="target_ended"):
+            auth.transition(binding.incarnation, 1, status=status, readiness=status)
+    with pytest.raises(inbox.Invalid):  # not a destination either
+        auth.transition(binding.incarnation, 1, status="archived", readiness="unknown")
+    assert (rows(tmp_path, "SELECT * FROM sessions"), rows(tmp_path, "SELECT * FROM inbox_events")) == before
+    assert auth.store.claim(binding.incarnation, "conv-s1", "g1") is None
+    assert auth.admit("k1", "session-name", "s1", "hi") == first
+    assert [s.reason for s in auth.delete(binding.incarnation, 1)] == ["target_ended"]
+    assert state(tmp_path, "k1") == [("blocked", "target_ended", 0, 0)]
 
 
 def test_a_call_in_flight_when_its_session_changes_is_uncertain_and_its_late_answer_stale(tmp_path):

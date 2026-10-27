@@ -126,7 +126,7 @@ The only mount is `$WOLTSPACE_WOLTS_DIR:/workspace/wolts`. Everything else is ba
 
 The data-plane snapshot, in the python CLI, identical native and in-container:
 
-- `woltspace backup [--tag T] [--out DIR]` — one `woltspace-backup-<tag>.tar.gz`
+- `woltspace backup [--full] [--tag T] [--out DIR]` — one `woltspace-backup-<tag>.tar.gz`
   of the wolts tree (memory, sites, sparks, apps, `woltspace.json`, `.state`,
   `.space`, `.git` history), with caches and build products excluded by name
   below the root and symlinks archived as links. Writes a
@@ -140,14 +140,22 @@ The data-plane snapshot, in the python CLI, identical native and in-container:
   the backup fails) the whole archive is one `<archive>.tar.gz.age`, streamed
   through `age`, the `.env` files and `config.json` inside (never the OAuth
   files); no plaintext touches the disk.
-- `.space/lodge.db` goes in as an in-memory snapshot (SQLite backup API), every
-  row kept; its `-wal`/`-shm` stay out. Everything else goes in too (logs, chat
-  history and routing, queued messages, consents, running apps) except junk and
-  the two OAuth login files. `restore` blanks the apps' pids in the restored copy.
+- Backups are **slim** by default: all context (memory, identity, transcripts,
+  skills, lodge config, `.state`/`.space`, git history) at any size, plus text
+  and code up to 5MB a file. Media, binaries and other large files are left out
+  and listed by path and size in `backup-left-out.tsv`; app databases only by
+  opt-in (`"backup": {"keep": [...]}` in a `woltspace.json`). `--full` keeps
+  everything but the named junk.
+- `.space/lodge.db` is always kept, as an in-memory snapshot (SQLite backup
+  API), every row; its `-wal`/`-shm` stay out.
 - `woltspace restore <archive> [--to DIR] [--identity KEYFILE|-]` — extracts
   into a new directory and refuses a populated one (an `.age` archive is
-  decrypted twice, never to disk: audit pass, then extraction); prints what to re-authenticate and the `WOLTSPACE_WOLTS_DIR=…`
-  line to boot from it.
+  decrypted twice, never to disk: audit pass, then extraction); prints what to
+  re-authenticate and the `WOLTSPACE_WOLTS_DIR=…` line to boot from it. It
+  disarms the copy first, in the copy's own `lodge.db` (and any pre-lodge.db
+  state files): runtime records go, app pids are blanked, sessions come back
+  stopped, paths inside the old lodge are re-pointed at the copy, and the copy
+  runs on its own tmux server.
 
 Full guide, including what is excluded and why: `docs/backup.md`.
 

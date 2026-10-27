@@ -376,3 +376,51 @@ def test_importing_the_inbox_does_nothing(tmp_path):
                          capture_output=True, text=True, check=True).stdout
     assert out.split() == ["1"]
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"limit": -1}, {"limit": 0}, {"limit": True}, {"limit": 1.5}, {"limit": "2"},
+    {"after": -1}, {"after": True}, {"after": 1.5}, {"after": "0"},
+    {"after": 2**100},
+])
+def test_event_page_rejects_invalid_bounds_before_read(store, monkeypatch, kwargs):
+    def unexpected_read():
+        pytest.fail("malformed page opened storage")
+    monkeypatch.setattr(store, "_read", unexpected_read)
+    with pytest.raises(inbox.Invalid):
+        store.events(**kwargs)
+
+
+def test_negative_page_limit_cannot_return_the_whole_ring(tmp_path):
+    store = inbox.Store(tmp_path, limits(page=1))
+    for key in ("a", "b", "c"):
+        store.admit(key, "pal", "c1", "x")
+    with pytest.raises(inbox.Invalid):
+        store.events(limit=-1)
+    assert len(store.events().events) == 1
+    assert len(store.events(limit=2**100).events) == 1  # large positive requests clamp safely
+
+
+@pytest.mark.parametrize("field", ["key", "recipient", "conversation"])
+def test_unencodable_identity_is_invalid_before_write(store, monkeypatch, field):
+    args = dict(key="a", recipient="pal", conversation="c1", body="x")
+    args[field] = "\udcff"
+    def unexpected_write():
+        pytest.fail("unencodable identity opened storage")
+    monkeypatch.setattr(store, "_write", unexpected_write)
+    with pytest.raises(inbox.Invalid):
+        store.admit(**args)
+
+
+@pytest.mark.parametrize("generation", ["", "g" * 21, "\udcff", 7, None, b"g"])
+def test_claim_generation_is_bounded_utf8_before_write(tmp_path, store, monkeypatch, generation):
+    store.admit("a", "pal", "c1", "x")
+    before = (state(tmp_path, "a"), usage(tmp_path), rows(tmp_path, "SELECT * FROM inbox_events"))
+    with monkeypatch.context() as patch:
+        def unexpected_write():
+            pytest.fail("invalid generation opened storage")
+        patch.setattr(store, "_write", unexpected_write)
+        with pytest.raises(inbox.Invalid):
+            store.claim("pal", "c1", generation)
+    assert (state(tmp_path, "a"), usage(tmp_path), rows(tmp_path, "SELECT * FROM inbox_events")) == before
+    assert rows(tmp_path, "SELECT * FROM inbox_attempts") == []

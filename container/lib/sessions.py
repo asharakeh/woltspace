@@ -116,13 +116,131 @@ def _row_values(record: dict) -> tuple:
     )
 
 
+# --- Rows the inbox owns (inbox_binding.py, RFC #615) ---
+# A row with an inbox binding belongs to the inbox authority, which changes its
+# lifecycle with its own SQL. Every writer here may change only this metadata
+# on it, never delete it; the check runs on the writer's own connection, after
+# taking the lodge's write lock, so an enrollment cannot slip in between.
+BENIGN_FIELDS = frozenset({"last_activity", "hold", "title", "summary", "prompt_preview",
+                           "viewport_url", "viewport_port", "viewport_updated"})
+_BINDING = ("inbox_incarnation", "inbox_harness", "inbox_conversation", "inbox_readiness",
+            "inbox_generation", "inbox_revision")
+_INCARNATION = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+_COLUMN_FIELDS = (1, 2, 3, 5, 6, 7)  # _row_values: wolt, status, created_at, finished_at, harness, id
+
+
+class SessionWriteRefused(Exception):
+    """A write the row's owner forbids; nothing of it was written. `code` is one of
+    transaction_required, owned_session, binding_invalid. Deliberately neither a
+    ValueError nor an IntegrityError: no fallback that catches those may take it."""
+
+    def __init__(self, code: str):
+        super().__init__(f"session write refused ({code})")
+        self.code = code
+
+
+class SessionStoreUnavailable(Exception):
+    """lodge.db could not be read or written (`code`: store_busy, store_failed).
+    After a commit, whether it landed is unknown: read again."""
+
+    def __init__(self, code: str):
+        super().__init__(f"session store unavailable ({code})")
+        self.code = code
+
+
+def _lock(conn) -> None:
+    """Take the write lock on this very connection before anything is read. A
+    deferred transaction whose snapshot is stale fails here, never later."""
+    if not conn.in_transaction:
+        raise SessionWriteRefused("transaction_required")
+    conn.execute("UPDATE sessions SET name=name WHERE 0")
+
+
+def _fetch(conn, sql, args) -> list[dict]:
+    cursor = conn.execute(sql, args)  # any row_factory: a caller's plain connection too
+    names = [d[0] for d in cursor.description]
+    return [dict(zip(names, row)) for row in cursor.fetchall()]
+
+
+def _locked_row(conn, name: str) -> dict | None:
+    _lock(conn)
+    found = _fetch(conn, "SELECT * FROM sessions WHERE name=?", (name,))
+    return found[0] if found else None
+
+
+def _owned(row: dict) -> bool:
+    """True for a row the inbox owns, False only when every binding column is
+    NULL. Anything partial or malformed is neither: binding_invalid."""
+    values = [row.get(column) for column in _BINDING]
+    if all(value is None for value in values):
+        return False
+    incarnation, harness, conversation, readiness, generation, revision = values
+    if not (isinstance(incarnation, str) and _INCARNATION.match(incarnation)
+            and all(isinstance(v, str) and v for v in (harness, conversation, generation))
+            and readiness in ("running", "resting", "unknown")
+            and type(revision) is int and revision >= 1
+            and (row.get("harness"), row.get("harness_session_id")) == (harness, conversation)):
+        raise SessionWriteRefused("binding_invalid")
+    return True
+
+
+def _refuse_owned(rows: list[dict]) -> None:
+    for row in rows:
+        if _owned(row):
+            raise SessionWriteRefused("owned_session")
+
+
+def _canonical(value) -> str:
+    """Parsed-JSON equality: key order aside, true is not 1, missing is not null."""
+    try:
+        return json.dumps(value, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError):
+        raise SessionWriteRefused("binding_invalid") from None
+
+
+def _stored(row: dict) -> dict:
+    """An owned row's record, consistent with its columns, or binding_invalid."""
+    try:
+        record = json.loads(row["record"])
+    except (TypeError, ValueError):
+        raise SessionWriteRefused("binding_invalid") from None
+    if not isinstance(record, dict):
+        raise SessionWriteRefused("binding_invalid")
+    columns = _row_values({**record, "name": row["name"]})
+    if any(columns[i] != row[name] for i, name in zip(_COLUMN_FIELDS, (
+            "wolt", "status", "created_at", "finished_at", "harness", "harness_session_id"))):
+        raise SessionWriteRefused("binding_invalid")
+    return record
+
+
+def _with_benign(stored: dict, candidate: dict) -> dict:
+    """The stored record with only the candidate's benign fields taken over."""
+    kept = {key: value for key, value in stored.items() if key not in BENIGN_FIELDS}
+    kept.update({key: candidate[key] for key in BENIGN_FIELDS if key in candidate})
+    return kept
+
+
 def put_session(conn, record: dict) -> None:
     """Write one session row: the whole record as JSON, the queried fields as columns.
 
     An upsert on the name, never INSERT OR REPLACE: a REPLACE would delete
     another session that holds the same harness_session_id, where this must
     fail with IntegrityError so the second claimer of a conversation loses.
+
+    Runs inside the caller's transaction (transaction_required otherwise) and
+    returns once the statement ran, not once anything committed. On a row the
+    inbox owns, only BENIGN_FIELDS may change: anything else is refused.
     """
+    if any(str(key).startswith("inbox_") for key in record):
+        raise SessionWriteRefused("binding_invalid")
+    current = _locked_row(conn, record["name"])
+    if current is not None and _owned(current):
+        stored = _stored(current)
+        unchanged = {key: value for key, value in stored.items() if key not in BENIGN_FIELDS | {"name"}}
+        asked = {key: value for key, value in record.items() if key not in BENIGN_FIELDS | {"name"}}
+        if _canonical(unchanged) != _canonical(asked):
+            raise SessionWriteRefused("owned_session")
+        record = {**_with_benign(stored, record), "name": current["name"]}
     conn.execute(
         f"INSERT INTO sessions ({_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?)"
         " ON CONFLICT(name) DO UPDATE SET wolt=excluded.wolt, status=excluded.status,"
@@ -274,18 +392,27 @@ class SessionRegistry:
 
     @contextmanager
     def _tx(self):
-        """A write transaction, shared by nested registry calls on this thread."""
+        """A write transaction, shared by nested registry calls on this thread.
+
+        Database faults leave as fixed codes: a uniqueness conflict stays an
+        IntegrityError (callers retry on it), anything else is unavailable."""
         key = str(lodge_db.path(self.db_dir))
         conns = _TX.__dict__.setdefault("conns", {})
         if key in conns:
             yield conns[key]
             return
-        with lodge_db.write(self.db_dir) as conn:
-            conns[key] = conn
-            try:
-                yield conn
-            finally:
-                del conns[key]
+        try:
+            with lodge_db.write(self.db_dir) as conn:
+                conns[key] = conn
+                try:
+                    yield conn
+                finally:
+                    del conns[key]
+        except sqlite3.IntegrityError:
+            raise sqlite3.IntegrityError("session_integrity") from None
+        except (sqlite3.Error, OSError) as exc:
+            busy = isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+            raise SessionStoreUnavailable("store_busy" if busy else "store_failed") from None
 
     @contextmanager
     def _reader(self):
@@ -335,7 +462,13 @@ class SessionRegistry:
                   if visible.setdefault(row["wolt"], self._visible(row["wolt"])))
         return [data for data in loaded if data is not None]
 
-    def _put(self, conn, data: dict) -> None:
+    def _put(self, conn, data: dict, original: str | None = None) -> None:
+        current = _locked_row(conn, original or data["name"])
+        if current is not None and _owned(current):
+            if data.get("name") != current["name"]:
+                raise SessionWriteRefused("owned_session")
+            put_session(conn, self._benign_only(current, data))
+            return
         normalized = normalize_session_target(
             data, wolts_dir=self.wolts_dir, fallback_wolt=data.get("wolt", "")
         )
@@ -352,6 +485,27 @@ class SessionRegistry:
         if normalized.get("status") not in ("running", STOPPING):
             normalized.pop("hold", None)
         put_session(conn, normalized)
+
+    def _benign_only(self, current: dict, candidate: dict) -> dict:
+        """What may be written over an owned row: its stored record plus the
+        candidate's benign fields. Every other field of the candidate must be as
+        stored, or exactly what the read view (_load) derives for it; derived
+        fields are dropped, so a view never becomes stored authority."""
+        stored = _stored(current)
+        view = self._load(current)
+        if view is None:
+            raise SessionWriteRefused("binding_invalid")
+        missing = object()
+        for key in (set(candidate) | set(stored) | set(view)) - BENIGN_FIELDS:
+            asked = candidate.get(key, missing)
+            if key in stored:
+                same = asked is not missing and (_canonical(asked) == _canonical(stored[key])
+                                                 or key in view and _canonical(asked) == _canonical(view[key]))
+            else:
+                same = asked is missing or key in view and _canonical(asked) == _canonical(view[key])
+            if not same:
+                raise SessionWriteRefused("owned_session")
+        return {**_with_benign(stored, candidate), "name": current["name"]}
 
     def _read(self, wolt: str, name: str) -> dict | None:
         """One stored record, without liveness."""
@@ -378,7 +532,7 @@ class SessionRegistry:
             before = json.dumps(data, sort_keys=True, default=str)
             yield data
             if data is not None and json.dumps(data, sort_keys=True, default=str) != before:
-                self._put(conn, data)
+                self._put(conn, data, original=name)  # a renamed record is still checked as name
 
     def claim(self, name: str, seen: dict, status: str, *, wolt: str = None) -> bool:
         """Move a session to `status` only if what decides a stop is still as `seen`.
@@ -545,9 +699,10 @@ class SessionRegistry:
         """
         now = int(time.time())
         with self._tx() as conn:
-            row = conn.execute("SELECT wolt FROM sessions WHERE name=?", (name,)).fetchone()
+            row = _locked_row(conn, name)
             if row is None or (wolt and row["wolt"] != wolt) or not self._visible(row["wolt"]):
                 return False
+            _owned(row)  # activity is benign on an owned row; a malformed one refuses
             return conn.execute(
                 "UPDATE sessions SET last_activity=?, updated_at=?,"
                 " record=json_set(record, '$.last_activity', ?)"
@@ -871,14 +1026,21 @@ class SessionRegistry:
     def delete(self, name: str, *, wolt: str = None) -> bool:
         """Remove a session. Returns True if it existed."""
         with self._tx() as conn:
+            current = _locked_row(conn, name)
             if self._row(conn, name, wolt) is None:
                 return False
+            _refuse_owned([current])
             conn.execute("DELETE FROM sessions WHERE name=?", (name,))
         return True
 
     def forget_wolt(self, wolt: str) -> int:
-        """Remove every session of a wolt, visible or not. Returns how many."""
+        """Remove every session of a wolt, visible or not. Returns how many.
+        None at all if one of them is owned by the inbox."""
         with self._tx() as conn:
+            _lock(conn)
+            _refuse_owned(_fetch(
+                conn, "SELECT * FROM sessions WHERE wolt=? AND (" + " OR ".join(
+                    f"{column} IS NOT NULL" for column in _BINDING) + ")", (wolt,)))
             return conn.execute("DELETE FROM sessions WHERE wolt=?", (wolt,)).rowcount
 
     def _all_wolts(self) -> list[str]:

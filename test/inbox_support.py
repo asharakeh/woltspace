@@ -41,6 +41,17 @@ def session(root, name, wolt="pal", status="running", conversation=None, last_ac
             harness=harness, harness_session_id=conversation or f"conv-{name}"))
 
 
+def legacy_write(root, name, **fields):
+    """TEST ONLY: an unsupported writer (an older build, raw SQL) changing a row
+    the inbox owns behind sessions.py's guard, to test what the inbox does then.
+    Each field goes to its column and the record alike; conversation is the id."""
+    with lodge_db.write(root) as conn:
+        for field, value in fields.items():
+            column = "harness_session_id" if field == "conversation" else field
+            conn.execute(f"UPDATE sessions SET {column}=?, record=json_set(record, '$.{column}', ?)"
+                         " WHERE name=?", (value, value, name))
+
+
 def enroll(auth, name, readiness="running", generation="g1", **row):
     session(auth.store.root, name, **row)
     return auth.enroll(name, harness=row.get("harness", "claude"),
@@ -133,7 +144,8 @@ class FakeEngine:
 
 
 def spawn(root, op, pause=None, **over):
-    """Run one Authority call, op = (method, args, kwargs), in a new process; with pause, it stops inside its
+    """Run one Authority call, op = (method, args, kwargs), in a new process
+    ("registry.<method>" for a SessionRegistry call); with pause, it stops inside its
     write (the lodge's lock held) until pause.go exists."""
     return subprocess.Popen([sys.executable, __file__, str(root), json.dumps([op, over]), str(pause or "")],
                             stdout=subprocess.PIPE, text=True)
@@ -155,11 +167,11 @@ def ordered(first, second, pause, root, **over):
 
 def _child(root, spec, pause):
     (name, args, kwargs), over = json.loads(spec)
-    real = inbox.Store._write
+    real = lodge_db.write
 
     @contextmanager
-    def write(store):
-        with real(store) as conn:
+    def write(*a, **kw):
+        with real(*a, **kw) as conn:
             if pause:
                 Path(f"{pause}.in").touch()
                 deadline = time.monotonic() + 10
@@ -167,12 +179,14 @@ def _child(root, spec, pause):
                     time.sleep(0.01)
             yield conn
 
-    inbox.Store._write = write
-    auth = authority(root, **over)
+    lodge_db.write = write
+    owner = authority(root, **over)
+    if name.startswith("registry."):  # a legacy writer: the session registry
+        owner, name = sessions.SessionRegistry(wolts_dir=root), name.split(".", 1)[1]
     try:
-        result = getattr(auth, name)(*args, **kwargs)
+        result = getattr(owner, name)(*args, **kwargs)
         print(json.dumps({"ok": result}, default=dataclasses.asdict))
-    except inbox.Refused as exc:
+    except (inbox.Refused, sessions.SessionWriteRefused) as exc:
         print(json.dumps({"refused": exc.code}))
     except inbox.InboxError as exc:
         print(json.dumps({"error": type(exc).__name__}))

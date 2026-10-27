@@ -6,7 +6,7 @@ from contextlib import closing
 
 import pytest
 
-from inbox_support import accept, authority, enroll, ordered, rows, session, state, usage
+from inbox_support import accept, authority, enroll, legacy_write, ordered, rows, session, state, usage
 
 import inbox
 import inbox_binding
@@ -86,7 +86,7 @@ def test_a_wolt_request_takes_the_newest_eligible_session_and_never_moves(tmp_pa
     early = enroll(auth, "a", last_activity=20, created_at=1)
     session(tmp_path, "d", last_activity=90)  # not enrolled
     enroll(auth, "e", last_activity=80)
-    session(tmp_path, "e", status="stopped", last_activity=80)
+    legacy_write(tmp_path, "e", status="stopped")
     enroll(auth, "f", last_activity=70, readiness="unknown")
     enroll(auth, "g", last_activity=60, wolt="nunu")
     first = auth.admit("k1", "wolt", "pal", "hi")
@@ -105,7 +105,7 @@ def test_a_wolt_request_takes_the_newest_eligible_session_and_never_moves(tmp_pa
 
 
 def _ended(tmp_path, auth):
-    session(tmp_path, "s1", status="completed")
+    legacy_write(tmp_path, "s1", status="completed")
 
 
 def _recreated(tmp_path, auth):
@@ -115,13 +115,13 @@ def _recreated(tmp_path, auth):
 
 
 @pytest.mark.parametrize("change, by_name, by_incarnation", [
-    (lambda root, auth: session(root, "s1", status=sessions.STOPPING), "target_stopping", "target_stopping"),
+    (lambda root, auth: legacy_write(root, "s1", status=sessions.STOPPING), "target_stopping", "target_stopping"),
     (_ended, "target_ended", "target_ended"),
-    (lambda root, auth: session(root, "s1", status="archived"), "target_ended", "target_ended"),
-    (lambda root, auth: session(root, "s1", status="orphaned"), "target_unknown", "target_unknown"),
-    (lambda root, auth: session(root, "s1", status="resting"), "target_unknown", "target_unknown"),
-    (lambda root, auth: session(root, "s1", conversation="conv-new"), "binding_mismatch", "binding_mismatch"),
-    (lambda root, auth: session(root, "s1", harness="codex"), "binding_mismatch", "binding_mismatch"),
+    (lambda root, auth: legacy_write(root, "s1", status="archived"), "target_ended", "target_ended"),
+    (lambda root, auth: legacy_write(root, "s1", status="orphaned"), "target_unknown", "target_unknown"),
+    (lambda root, auth: legacy_write(root, "s1", status="resting"), "target_unknown", "target_unknown"),
+    (lambda root, auth: legacy_write(root, "s1", conversation="conv-new"), "binding_mismatch", "binding_mismatch"),
+    (lambda root, auth: legacy_write(root, "s1", harness="codex"), "binding_mismatch", "binding_mismatch"),
     (_recreated, "target_unbound", "no_target"),
 ])
 def test_a_new_key_for_a_session_that_cannot_take_mail_is_refused_whole(tmp_path, change, by_name,
@@ -157,7 +157,7 @@ def test_a_retry_returns_the_original_whatever_became_of_its_session(tmp_path, c
     if change == "activity":
         session(tmp_path, "s2", last_activity=99)
     elif change == "ended":
-        session(tmp_path, "s1", status="stopped", last_activity=20)
+        legacy_write(tmp_path, "s1", status="stopped")
     elif change == "deleted":
         with lodge_db.write(tmp_path) as conn:
             conn.execute("DELETE FROM sessions WHERE name='s1'")
@@ -372,8 +372,8 @@ def test_a_repeated_transition_changes_nothing_and_a_fenced_verdict_must_be_true
 
 
 @pytest.mark.parametrize("change", [
-    lambda root: session(root, "s1", conversation="conv-new"),  # a legacy upsert keeps the inbox columns
-    lambda root: session(root, "s1", status="orphaned"),
+    lambda root: legacy_write(root, "s1", conversation="conv-new"),  # an unsupported writer
+    lambda root: legacy_write(root, "s1", status="orphaned"),
     delete_row,
 ])
 def test_a_claim_sends_bound_mail_only_to_its_session_as_enrolled(tmp_path, change):
@@ -424,7 +424,7 @@ def test_an_archived_session_is_never_reopened_and_keeps_its_mail(tmp_path):
     auth = authority(tmp_path)
     binding = enroll(auth, "s1")
     first = auth.admit("k1", "session-name", "s1", "hi")
-    session(tmp_path, "s1", status="archived")  # what sessions.archive_session stores
+    legacy_write(tmp_path, "s1", status="archived")  # what archive_session stored before the guard
     before = rows(tmp_path, "SELECT * FROM sessions"), rows(tmp_path, "SELECT * FROM inbox_events")
     for status in ("running", "resting"):
         with pytest.raises(inbox.Refused, match="target_ended"):

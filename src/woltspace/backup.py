@@ -1316,8 +1316,9 @@ def _refuse_native_state(target: Path, wolts_dir: Path) -> None:
         if any(db.with_name(db.name + c).exists() for c in SQLITE_COMPANIONS):
             raise RestoreRefused("safe_state_unknown")  # what is left of a lodge.db is not none
         return  # no lodge.db: a release before it, nothing of the inbox
-    scratch = Path(tempfile.mkdtemp(prefix="woltspace-inspect-"))
+    scratch = None
     try:
+        scratch = Path(tempfile.mkdtemp(prefix="woltspace-inspect-"))
         shutil.copyfile(db, scratch / "lodge.db")
         if wal.exists():
             shutil.copyfile(wal, scratch / "lodge.db-wal")
@@ -1326,7 +1327,8 @@ def _refuse_native_state(target: Path, wolts_dir: Path) -> None:
     except (sqlite3.Error, OSError):
         raise RestoreRefused("safe_state_unknown") from None
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _disarm_lodge_db(wolts_dir: Path, source: str, target: Path, report: dict) -> None:

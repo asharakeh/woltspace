@@ -288,6 +288,13 @@ server). `OPENAI_TTS_MODEL` (default `gpt-4o-mini-tts`) and `OPENAI_TTS_VOICE`
 (default `alloy`) still pick the model and the voice when `speech` leaves them
 out. Read by `server/notify.py` on every spoken message; with OpenAI, each one
 is an API request billed to that key.
+A wolt may speak in its own voice: `"speech": {"voice": "coral", "instructions":
+"Speak slowly."}` in its `wolt/wolt.json`, both keys optional. The wolt is the
+sending session's; its voice comes before the lodge's, and `instructions` (at
+most 500 characters, sent only when set) is a hint on how to speak. Server,
+model and key stay the lodge's. The voice must be one the lodge's speech server
+knows (`coral` is OpenAI's); one it refuses sends the message as text. The
+hint goes to OpenAI only.
 
 **Harnesses** — `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`,
 `CLAUDE_CODE_DISABLE_AUTO_MEMORY`, `CODEX_HOME`, `OPENCODE_CONFIG_DIR` and the

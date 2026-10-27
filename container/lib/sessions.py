@@ -261,6 +261,7 @@ def put_session(conn, record: dict) -> None:
             if _canonical(unchanged) != _canonical(asked):
                 raise SessionWriteRefused("owned_session")
             record = {**_with_benign(stored, record), "name": current["name"]}
+            _canonical(record)  # a benign value JSON cannot hold: binding_invalid, not raw TypeError
         conn.execute(
             f"INSERT INTO sessions ({_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(name) DO UPDATE SET wolt=excluded.wolt, status=excluded.status,"

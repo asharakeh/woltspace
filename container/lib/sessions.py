@@ -226,7 +226,7 @@ def _stored(row: dict) -> dict:
         columns = _row_values({**record, "name": row["name"]})  # created_at may not be a number
     except (TypeError, ValueError, AttributeError):
         raise SessionWriteRefused("binding_invalid") from None
-    if any(columns[i] != row[name] for i, name in zip(_COLUMN_FIELDS, (
+    if record.get("name") != row["name"] or any(columns[i] != row[name] for i, name in zip(_COLUMN_FIELDS, (
             "wolt", "status", "created_at", "finished_at", "harness", "harness_session_id"))):
         raise SessionWriteRefused("binding_invalid")
     return record
@@ -480,6 +480,7 @@ class SessionRegistry:
     def _put(self, conn, data: dict, original: str | None = None) -> None:
         current = _locked_row(conn, original or data["name"])
         if current is not None and _owned(current):
+            _stored(current)  # an incoherent owned row is binding_invalid, whatever is asked
             if data.get("name") != current["name"]:
                 raise SessionWriteRefused("owned_session")
             put_session(conn, self._benign_only(current, data))

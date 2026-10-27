@@ -424,3 +424,48 @@ def test_claim_generation_is_bounded_utf8_before_write(tmp_path, store, monkeypa
             store.claim("pal", "c1", generation)
     assert (state(tmp_path, "a"), usage(tmp_path), rows(tmp_path, "SELECT * FROM inbox_events")) == before
     assert rows(tmp_path, "SELECT * FROM inbox_attempts") == []
+
+
+def test_event_page_and_gap_share_one_committed_snapshot(tmp_path, monkeypatch):
+    store = inbox.Store(tmp_path, limits(events=3, page=1))
+    for key in "abc":
+        store.admit(key, "pal", "c1", "x")
+    real_connect, pruned = lodge_db.connect, []
+
+    class Cursor:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        def fetchall(self):
+            result = self.cursor.fetchall()
+            if not pruned:
+                pruned.append(True)
+                # Another writer commits after the page is fetched, before
+                # any later query for the oldest/newest cursor.
+                store.admit("d", "pal", "c1", "x")
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self.cursor, name)
+
+    class Connection:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def execute(self, sql, *args):
+            cursor = self.conn.execute(sql, *args)
+            if "inbox_events" in sql and "ORDER BY cursor" in sql:
+                return Cursor(cursor)
+            return cursor
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+    def connect(root, **kwargs):
+        conn = real_connect(root, **kwargs)
+        return Connection(conn) if kwargs.get("readonly") else conn
+
+    monkeypatch.setattr(lodge_db, "connect", connect)
+    page = store.events()
+    assert ([e.cursor for e in page.events], page.gap) in [([1], False), ([2], True)]
+    assert rows(tmp_path, "SELECT min(cursor), max(cursor) FROM inbox_events") == [(2, 4)]

@@ -80,3 +80,22 @@ def test_an_inspection_outside_the_target_is_refused_before_reading(tmp_path):
             backup.disarm(candidate, "/x", target)
         assert str(tmp_path) not in str(refused.value)
     assert (root / RUNTIME).exists()
+
+
+@pytest.mark.parametrize("entry", ["disarm", "helper"])
+def test_a_rollback_journal_beside_lodge_db_refuses_before_anything_is_read(tmp_path, entry, monkeypatch):
+    root = lodge(tmp_path / "copy", mail=False)
+    db = root / backup.LODGE_DB
+    db.with_name(db.name + "-journal").write_bytes(b"\0" * 512)  # whatever it holds: not judged
+    files = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    opened = []
+    monkeypatch.setattr(backup.shutil, "copyfile", lambda *a: opened.append(a))
+    monkeypatch.setattr(backup.sqlite3, "connect", lambda *a, **k: opened.append(a))
+    report = {"untouched": True}
+    with pytest.raises(backup.RestoreRefused, match="safe_state_unknown"):
+        if entry == "disarm":
+            backup.disarm(root, "/elsewhere", tmp_path)
+        else:
+            backup._disarm_lodge_db(root, "/elsewhere", tmp_path, report)
+    assert opened == [] and report == {"untouched": True}
+    assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == files

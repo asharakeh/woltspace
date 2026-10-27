@@ -1311,6 +1311,10 @@ def _refuse_native_state(target: Path, wolts_dir: Path) -> None:
     and WAL so the original's bytes (and its -shm) stay as extracted."""
     _inspect_root(target, wolts_dir)
     db = wolts_dir / LODGE_DB
+    if db.with_name(db.name + "-journal").exists():
+        # A rollback journal may hold what an open would recover into the
+        # original: judged unknown before anything is read, copied or opened.
+        raise RestoreRefused("safe_state_unknown")
     wal = db.with_name(db.name + "-wal")
     if not db.exists():
         if any(db.with_name(db.name + c).exists() for c in SQLITE_COMPANIONS):

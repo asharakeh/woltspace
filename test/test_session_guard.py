@@ -244,3 +244,22 @@ def test_higher_callers_report_the_refusal_and_some_act_before_it(tmp_path, owne
     assert snapshot(tmp_path) == before
     legacy_write(tmp_path, "s1", status="resting")  # what an unguarded older build could still do
     assert rows(tmp_path, "SELECT status FROM sessions WHERE name='s1'") == [("resting",)]
+
+
+def test_a_fault_inside_a_nested_registry_write_is_a_fixed_code_too(tmp_path, owned, monkeypatch):
+    auth, binding, reg = owned
+    real = sessions._fetch
+    caught = []
+    with reg.edit("s2") as outer:  # a nested call reuses this transaction
+        def fail(conn, sql, args):
+            raise lodge_db.sqlite3.OperationalError("SENTINEL_NESTED")
+        monkeypatch.setattr(sessions, "_fetch", fail)
+        try:
+            reg.describe("s1", "t", "s")
+        except Exception as exc:  # a caller that carries on
+            caught.append(exc)
+        monkeypatch.setattr(sessions, "_fetch", real)
+        outer["title"] = "still mine"
+    assert isinstance(caught[0], sessions.SessionStoreUnavailable)
+    assert "SENTINEL" not in "".join(__import__("traceback").format_exception(caught[0]))
+    assert stored(tmp_path, "s2")["title"] == "still mine"

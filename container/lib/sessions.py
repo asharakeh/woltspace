@@ -419,8 +419,9 @@ class SessionRegistry:
         IntegrityError (callers retry on it), anything else is unavailable."""
         key = str(lodge_db.path(self.db_dir))
         conns = _TX.__dict__.setdefault("conns", {})
-        if key in conns:
-            yield conns[key]
+        if key in conns:  # a nested call: its faults leave as fixed codes too
+            with _store_errors():
+                yield conns[key]
             return
         with _store_errors(), lodge_db.write(self.db_dir) as conn:
             conns[key] = conn

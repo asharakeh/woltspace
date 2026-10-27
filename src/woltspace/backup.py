@@ -1216,10 +1216,27 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 # mail or an inbox-owned session would come back with that custody silently
 # changed. Such a copy is refused before anything in it is touched, and stays
 # as extracted for a person to reconcile. Only an offline copy is supported.
-_INBOX_TABLES = frozenset({"inbox_messages", "inbox_attempts", "inbox_events", "inbox_usage"})
 _INBOX_BINDING = ("inbox_incarnation", "inbox_harness", "inbox_conversation", "inbox_readiness",
                   "inbox_generation", "inbox_revision")
 _KNOWN_SCHEMA = 6  # lodge_db's newest migration this check understands
+# The inbox tables exactly as lodge_db's migrations 5 and 6 make them; any
+# other layout (a table or column more or less) is one this check cannot read.
+_INBOX_COLUMNS_5 = {
+    "inbox_messages": {"seq", "key", "recipient", "conversation", "body", "size", "digest", "state",
+                       "reason", "calls", "created_at"},
+    "inbox_attempts": {"id", "seq", "ordinal", "generation", "outcome"},
+    "inbox_events": {"cursor", "seq", "state", "reason", "repeats"},
+    "inbox_usage": {"scope", "pending", "bytes", "keys"},
+}
+_INBOX_COLUMNS_6 = {**_INBOX_COLUMNS_5,
+                    "inbox_messages": _INBOX_COLUMNS_5["inbox_messages"] | {
+                        "request_kind", "request_address", "bound_harness"},
+                    "inbox_attempts": _INBOX_COLUMNS_5["inbox_attempts"] | {"revision"}}
+_REFUSED = {
+    "safe_state_present": "it holds inbox mail or an inbox-owned session",
+    "safe_state_unknown": "its lodge.db could not be read as one without inbox state",
+    "inspect_path_unsafe": "a path to inspect runs through a symlink or out of the copy",
+}
 
 
 class RestoreRefused(ValueError):
@@ -1228,27 +1245,35 @@ class RestoreRefused(ValueError):
     it was changed, and it is not a usable restore."""
 
     def __init__(self, code: str):
-        super().__init__(f"restore refused ({code}): the copy was left as extracted and is not usable")
+        super().__init__(f"restore refused ({code}): {_REFUSED[code]};"
+                         " the copy was left as extracted and is not usable")
         self.code = code
 
 
 def _inspect_root(target: Path, wolts_dir: Path) -> None:
     """The copy to inspect lies inside the extraction target, through real
     directories only, and its lodge.db files are plain files (or absent)."""
-    try:
-        rel = Path(os.path.normpath(wolts_dir)).relative_to(os.path.normpath(target))
+    target, wolts_dir = Path(target), Path(wolts_dir)
+    try:  # as written, not normalized: a link/.. pair must not cancel out
+        rel = wolts_dir.relative_to(target)
     except ValueError:
         raise RestoreRefused("inspect_path_unsafe") from None
-    here = Path(target)
+    if ".." in rel.parts or target.is_symlink() or not target.is_dir():
+        raise RestoreRefused("inspect_path_unsafe")
+    here = target
     for part in rel.parts:
         here = here / part
-        if part == ".." or here.is_symlink() or here.exists() and not here.is_dir():
+        if here.is_symlink() or here.exists() and not here.is_dir():
             raise RestoreRefused("inspect_path_unsafe")
     db = wolts_dir / LODGE_DB
+    space = db.parent
+    if space.is_symlink() or space.exists() and not space.is_dir():
+        raise RestoreRefused("inspect_path_unsafe")
     for path in (db, *(db.with_name(db.name + c) for c in SQLITE_COMPANIONS)):
-        _guard(wolts_dir, path)  # no link from the copy down to it (a ValueError of its own)
-        if path.exists() and not path.is_file() or not path.parent.is_dir() and path.parent.exists():
+        if path.is_symlink() or path.exists() and not path.is_file():
             raise RestoreRefused("inspect_path_unsafe")
+    if wolts_dir.exists() and os.path.realpath(wolts_dir) != os.path.join(os.path.realpath(target), *rel.parts):
+        raise RestoreRefused("inspect_path_unsafe")
 
 
 def _refuse_inbox_state(conn: sqlite3.Connection) -> None:
@@ -1256,7 +1281,11 @@ def _refuse_inbox_state(conn: sqlite3.Connection) -> None:
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     inbox = {t for t in tables if t.startswith("inbox")}
     binding = {c for c in _columns(conn, "sessions") if c.startswith("inbox")} if "sessions" in tables else set()
-    if inbox and inbox != _INBOX_TABLES or binding and binding != set(_INBOX_BINDING):
+    found = {table: _columns(conn, table) for table in inbox}
+    if (inbox or binding) and not (found == _INBOX_COLUMNS_5 and not binding
+                                   or found == _INBOX_COLUMNS_6 and binding == set(_INBOX_BINDING)):
+        raise RestoreRefused("safe_state_unknown")
+    if conn.execute("PRAGMA user_version").fetchone()[0] != 0:  # lodge_db never sets it
         raise RestoreRefused("safe_state_unknown")
     if binding and conn.execute("SELECT 1 FROM sessions WHERE " + " OR ".join(
             f"{column} IS NOT NULL" for column in _INBOX_BINDING) + " LIMIT 1").fetchone():

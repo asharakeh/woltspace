@@ -303,3 +303,77 @@ async def test_a_coordinator_needs_a_valid_generation_and_reads_through_the_stor
     coordinator = inbox_actor.Coordinator(store, FakeEngine(tmp_path / "l"), generation="g", overdue_after=1)
     with pytest.raises(inbox.Unavailable):  # no store yet: unavailable, not missing
         await coordinator.wait("a", 1)
+
+
+@pytest.mark.parametrize("operation", ["admit", "status", "events", "wait"])
+@pytest.mark.asyncio
+async def test_public_storage_failure_stops_other_recipient_dispatch(tmp_path, lodge, monkeypatch, operation):
+    coordinator, engine = await lodge()
+    try:
+        method = "status" if operation == "wait" else operation
+        with monkeypatch.context() as patch:
+            def unavailable(*args, **kwargs):
+                raise inbox.Unavailable("injected public failure")
+            patch.setattr(coordinator.store, method, unavailable)
+            with pytest.raises(inbox.Unavailable):
+                if operation == "wait":
+                    await coordinator.wait("missing", 1)
+                elif operation == "admit":
+                    coordinator.admit("a", "pal", "c1", "x")
+                elif operation == "status":
+                    coordinator.status("missing")
+                else:
+                    coordinator.events()
+        # The store is usable again; the same authority must remain stopped.
+        try:
+            coordinator.admit("b", "nunu", "c2", "y")
+        except inbox_actor.Halted:
+            pass
+        await settle()
+        assert isinstance(coordinator.halted, inbox.Unavailable)
+        assert engine.calls == []
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_start_deferred_work_while_joining(tmp_path, lodge):
+    coordinator, engine = await lodge(work=1)
+    try:
+        coordinator.admit("a", "pal", "c1", "x")
+        coordinator.admit("b", "nunu", "c2", "y")
+        await engine.wait_calls(1)
+        await coordinator.stop()
+        await settle()
+        assert [call[0].key for call in engine.calls] == ["a"]
+        assert coordinator._actors == {} and coordinator._later == {}
+        assert state(tmp_path, "b")[0][0] == "queued"
+        # The joined old owner cannot overlap a successor's delivery.
+        successor, fresh = await lodge(generation="g2", work=1)
+        try:
+            assert (await fresh.wait_calls(1)).key == "b"
+            assert all(future.done() for _, future in engine.calls)
+        finally:
+            await successor.stop()
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+@pytest.mark.asyncio
+async def test_coordinator_cannot_dispatch_outside_started_ownership(tmp_path, stopped):
+    engine = FakeEngine(tmp_path / "ledger")
+    coordinator = inbox_actor.Coordinator(inbox.Store(tmp_path, limits()), engine,
+                                          generation="g", overdue_after=60)
+    if stopped:
+        await coordinator.start()
+        await coordinator.stop()
+    try:
+        try:
+            coordinator.admit("a", "pal", "c1", "x")
+        except inbox.InboxError:
+            pass  # explicit lifecycle refusal is also valid
+        await settle()
+        assert engine.calls == [] and coordinator._actors == {}
+    finally:
+        await coordinator.stop()

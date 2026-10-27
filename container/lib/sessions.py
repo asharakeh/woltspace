@@ -198,8 +198,14 @@ def _store_errors():
     uniqueness conflict stays an IntegrityError (callers retry on it)."""
     try:
         yield
-    except sqlite3.IntegrityError:
-        raise sqlite3.IntegrityError("session_integrity") from None
+    except sqlite3.IntegrityError as exc:
+        # Only a real UNIQUE/PK conflict, by SQLite's own code; a trigger's ABORT is not one.
+        name = getattr(exc, "sqlite_errorname", None)
+        if name in ("SQLITE_CONSTRAINT_UNIQUE", "SQLITE_CONSTRAINT_PRIMARYKEY"):
+            conflict = sqlite3.IntegrityError("session_integrity")
+            conflict.sqlite_errorname = name  # still one when a nested write passes it out
+            raise conflict from None
+        raise SessionStoreUnavailable("store_failed") from None
     except (sqlite3.Error, OSError) as exc:
         busy = isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
         raise SessionStoreUnavailable("store_busy" if busy else "store_failed") from None

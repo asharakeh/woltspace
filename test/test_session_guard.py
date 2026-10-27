@@ -263,3 +263,22 @@ def test_a_fault_inside_a_nested_registry_write_is_a_fixed_code_too(tmp_path, ow
     assert isinstance(caught[0], sessions.SessionStoreUnavailable)
     assert "SENTINEL" not in "".join(__import__("traceback").format_exception(caught[0]))
     assert stored(tmp_path, "s2")["title"] == "still mine"
+
+
+def test_only_a_real_uniqueness_conflict_stays_an_integrity_error(tmp_path, owned):
+    auth, binding, reg = owned
+    with pytest.raises(lodge_db.sqlite3.IntegrityError, match="session_integrity"):  # resume-id retry
+        reg.update("s2", harness_session_id="conv-s1")
+    caught = []
+    with reg.edit("s1") as outer:  # the same conflict, caught inside an outer write
+        try:
+            reg.update("s2", harness_session_id="conv-s1")
+        except lodge_db.sqlite3.IntegrityError as exc:
+            caught.append(exc)
+        outer["title"] = "kept"
+    assert caught[0].sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE" and stored(tmp_path)["title"] == "kept"
+    with lodge_db.write(tmp_path) as conn:
+        conn.execute("CREATE TRIGGER fail BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'SENTINEL_T'); END")
+    with pytest.raises(sessions.SessionStoreUnavailable) as failed:  # not a conflict to retry on
+        reg.update("s2", title="t")
+    assert "SENTINEL" not in "".join(__import__("traceback").format_exception(failed.value))

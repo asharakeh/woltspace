@@ -71,11 +71,24 @@ class Refused(InboxError):
 
 class Stale(InboxError):
     """A result for an attempt that is not the open one."""
+    code = "stale_attempt"
 
 
 class Unavailable(InboxError):
     """The store could not be read or written. After a write, whether it
-    committed is unknown: retry the same key, or read again later."""
+    committed is unknown: retry the same key, or read again later.
+
+    Its text is a fixed code: SQLite's own message (which may quote a body
+    or a path) is dropped, never chained."""
+
+    def __init__(self, code: str):
+        super().__init__(f"inbox store unavailable ({code})")
+        self.code = code
+
+
+def _unavailable(exc: BaseException) -> Unavailable:
+    busy = isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+    return Unavailable("store_busy" if busy else "store_failed")
 
 
 @dataclass(frozen=True)
@@ -307,7 +320,7 @@ class Store:
             with lodge_db.write(self.root, durable=True, busy_ms=self.limits.busy_ms) as conn:
                 yield conn
         except (sqlite3.Error, OSError) as exc:
-            raise Unavailable(f"inbox store: {exc}") from exc
+            raise _unavailable(exc) from None
 
     @contextmanager
     def _read(self):
@@ -318,7 +331,7 @@ class Store:
             finally:
                 conn.close()
         except (sqlite3.Error, OSError) as exc:
-            raise Unavailable(f"inbox store: {exc}") from exc
+            raise _unavailable(exc) from None
 
     @staticmethod
     def _usage(conn, scope):

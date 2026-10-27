@@ -251,7 +251,7 @@ def test_a_locked_or_unwritable_store_is_unavailable(tmp_path):
     holder = sqlite3.connect(lodge_db.path(tmp_path), isolation_level=None)
     holder.execute("BEGIN IMMEDIATE")
     started = time.monotonic()
-    with pytest.raises(inbox.Unavailable, match="locked"):
+    with pytest.raises(inbox.Unavailable, match="store_busy"):
         store.admit("b", "pal", "c1", "x")
     assert time.monotonic() - started < 2  # the supplied bound, not lodge_db's 5 s
     holder.execute("ROLLBACK")

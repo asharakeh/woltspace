@@ -38,7 +38,11 @@ _OWNED: set[str] = set()  # stores with a started Coordinator in this process
 
 
 class Halted(inbox.InboxError):
-    """Dispatch stopped after a storage failure."""
+    """Dispatch stopped; `code` says why (a fixed code, never raw text)."""
+
+    def __init__(self, code: str):
+        super().__init__(f"inbox dispatch halted ({code})")
+        self.code = code
 
 
 class Coordinator:
@@ -47,7 +51,7 @@ class Coordinator:
         self.store, self.adapter = store, adapter
         self.generation = inbox._text(generation, store.limits.name_chars, "generation")
         self.overdue_after, self.clock, self.observer = overdue_after, clock, observer
-        self.halted: Exception | None = None
+        self.halted: inbox.InboxError | None = None
         self._running = self._owner = False
         self._root = str(Path(store.root).resolve())
         self._actors: dict[tuple[str, str], asyncio.Task] = {}
@@ -77,12 +81,12 @@ class Coordinator:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        self._fail_waiters(Halted("coordinator stopped"))
+        self._fail_waiters(Halted("stopped"))
         if self._owner:
             _OWNED.discard(self._root)
             self._owner = False
         if self.halted is None:
-            self.halted = Halted("coordinator stopped")
+            self.halted = Halted("stopped")
 
     # -- the public library -------------------------------------------------
 
@@ -104,7 +108,7 @@ class Coordinator:
         if status is None or status.state in _SETTLED:
             return status
         if self.halted is not None:
-            raise Halted(str(self.halted))
+            raise Halted(self.halted.code)
         if self._n_waiters >= self.store.limits.waiters:
             raise inbox.Refused("waiters")
         future = asyncio.get_running_loop().create_future()
@@ -152,14 +156,24 @@ class Coordinator:
                 self._open[conversation] = self.clock()
                 try:
                     outcome = Outcome(await self.adapter(attempt))
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling():
+                        raise  # this task was cancelled: see below
+                    # The adapter's reply was cancelled: it may have acted.
+                    log.error("inbox: adapter call cancelled seq=%d attempt=%s", attempt.seq, attempt.id)
+                    outcome = Outcome.UNKNOWN
                 except Exception:  # it may have reached the agent anyway
-                    log.exception("inbox: adapter call %s failed", attempt.id)
+                    log.error("inbox: adapter call failed seq=%d attempt=%s", attempt.seq, attempt.id)
                     outcome = Outcome.UNKNOWN
                 finally:
                     del self._open[conversation]
                 self._publish(self.store.record(attempt, outcome))
         except inbox.InboxError as exc:  # Unavailable, or Stale: the store is not as we left it
             self._halt(exc)
+        except asyncio.CancelledError:
+            if self._running:  # not by stop(): an attempt may be left open
+                self._halt(Halted("actor_cancelled"))
+            raise
         finally:
             del self._actors[conversation]
             if self._later and self.halted is None:  # halting dropped the rest
@@ -177,13 +191,14 @@ class Coordinator:
             try:
                 self.observer(status)
             except Exception:  # an observer neither undoes a commit nor drives a retry
-                log.exception("inbox: observer failed on %s", status.key)
+                log.error("inbox: observer failed seq=%d state=%s", status.seq, status.state)
 
-    def _halt(self, exc: Exception) -> None:
-        log.error("inbox: dispatch halted: %s", exc)
+    def _halt(self, exc: inbox.InboxError) -> None:
+        """Diagnostics carry fixed codes and ids only, never exception text."""
+        log.error("inbox: dispatch halted code=%s", exc.code)
         self.halted = exc
         self._later.clear()
-        self._fail_waiters(Halted(str(exc)))
+        self._fail_waiters(Halted(exc.code))
 
     def _fail_waiters(self, exc: Exception) -> None:
         for futures in self._waiters.values():

@@ -1,7 +1,9 @@
 """inbox_actor: one delivery authority per store, a fake engine, and every way a call can end."""
 
 import asyncio
+import logging
 import sqlite3
+import traceback
 
 import pytest
 
@@ -96,6 +98,67 @@ async def test_a_call_that_swallows_its_cancel_cannot_start_another(tmp_path, lo
     await engine.wait_calls(1)
     await asyncio.wait_for(coordinator.stop(), 5)
     assert len(engine.calls) == 1 and state(tmp_path, "a")[0][:3] == ("queued", None, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_reply_is_uncertain_and_a_stray_task_cancel_halts(tmp_path, lodge):
+    coordinator, engine = await lodge()
+    coordinator.admit("a", "pal", "c1", "x")
+    coordinator.admit("b", "pal", "c1", "y")
+    await engine.wait_calls(1)
+    engine.calls[0][1].cancel()  # the adapter's reply, not a caller or stop()
+    assert (await coordinator.wait("a", 5)).state == "uncertain"
+    await settle()
+    assert state(tmp_path, "a") == [("uncertain", "unknown", 1, 0)]
+    assert len(engine.calls) == 1 and coordinator.halted is None  # b waits behind it
+    coordinator.admit("c", "pal", "c2", "z")
+    await engine.wait_calls(2)
+    coordinator._actors[("pal", "c2")].cancel()  # someone else cancels the actor itself
+    await settle()
+    assert coordinator.halted.code == "actor_cancelled" and state(tmp_path, "c")[0][0] == "attempting"
+    coordinator.admit("d", "pal", "c3", "w")
+    await settle()
+    assert len(engine.calls) == 2
+    await coordinator.stop()
+
+
+MARKER = "NEUTRAL_MARKER_615"
+
+
+@pytest.mark.parametrize("source", ["adapter", "observer", "store"])
+@pytest.mark.asyncio
+async def test_logs_and_public_errors_carry_codes_never_exception_text(
+        tmp_path, lodge, caplog, monkeypatch, source):
+    coordinator, engine = await lodge()
+    if source == "observer":
+        def broken(status):
+            raise RuntimeError(MARKER)
+        coordinator.observer = broken
+    caplog.set_level(logging.ERROR, logger="inbox_actor")
+    coordinator.admit("a", "pal", "c1", MARKER)
+    waiter = asyncio.create_task(coordinator.wait("a", 5))
+    await engine.wait_calls(1)
+    errors = []
+    if source == "store":
+        def broken(root, **kw):
+            raise sqlite3.OperationalError(MARKER)
+        with monkeypatch.context() as patch:
+            patch.setattr(lodge_db, "connect", broken)
+            with pytest.raises(inbox.Unavailable) as failed:
+                coordinator.status("a")
+            with pytest.raises(inbox.Unavailable) as failed_write:
+                coordinator.admit("b", "pal", "c2", "y")
+        errors = [failed.value, failed_write.value, (await asyncio.gather(waiter, return_exceptions=True))[0]]
+        assert isinstance(errors[-1], inbox_actor.Halted) and errors[-1].code == "store_failed"
+        engine.resolve(Outcome.ACCEPTED)
+    else:
+        engine.resolve(RuntimeError(MARKER) if source == "adapter" else Outcome.ACCEPTED)
+        assert (await waiter).state == ("uncertain" if source == "adapter" else "native_accepted")
+    await settle()
+    assert MARKER not in caplog.text and ("seq=" in caplog.text or "code=" in caplog.text)
+    for error in errors:
+        assert MARKER not in "".join(traceback.format_exception(error))
+    await coordinator.stop()
 
 
 @pytest.mark.asyncio

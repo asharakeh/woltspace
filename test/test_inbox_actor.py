@@ -99,8 +99,15 @@ async def test_a_call_that_swallows_its_cancel_cannot_start_another(tmp_path, lo
 
 
 @pytest.mark.asyncio
-async def test_no_transaction_is_open_while_the_engine_works(tmp_path, lodge):
-    probes = []
+async def test_no_transaction_is_open_while_the_engine_works(tmp_path, lodge, monkeypatch):
+    probes, writers = [], []
+    real_connect = lodge_db.connect
+    def connect(root, **kwargs):
+        conn = real_connect(root, **kwargs)
+        if kwargs.get("durable"):
+            writers.append(conn)
+        return conn
+    monkeypatch.setattr(lodge_db, "connect", connect)
 
     class Probing(FakeEngine):
         async def __call__(self, attempt):
@@ -109,6 +116,12 @@ async def test_no_transaction_is_open_while_the_engine_works(tmp_path, lodge):
             other.execute("INSERT INTO meta VALUES ('probe', '1')")
             other.execute("COMMIT")
             other.close()
+            assert writers
+            for conn in writers:
+                try:
+                    assert not conn.in_transaction
+                except sqlite3.ProgrammingError:
+                    pass  # closed connection cannot hold a transaction
             probes.append(lodge_db.in_write())
             return await super().__call__(attempt)
 
@@ -377,3 +390,31 @@ async def test_coordinator_cannot_dispatch_outside_started_ownership(tmp_path, s
         assert engine.calls == [] and coordinator._actors == {}
     finally:
         await coordinator.stop()
+
+
+@pytest.mark.parametrize("kind", ["never_started", "rejected", "former_owner"])
+@pytest.mark.asyncio
+async def test_stopping_nonowner_does_not_release_current_owner(tmp_path, lodge, kind):
+    owner, engine = await lodge()
+    outsider = inbox_actor.Coordinator(owner.store, engine, generation="other", overdue_after=60)
+    if kind == "rejected":
+        with pytest.raises(inbox.InboxError):
+            await outsider.start()
+    elif kind == "former_owner":
+        outsider = owner
+        await outsider.stop()
+        owner, engine = await lodge(generation="next")
+    challenger = inbox_actor.Coordinator(owner.store, engine, generation="third", overdue_after=60)
+    accepted = False
+    try:
+        await outsider.stop()
+        try:
+            await challenger.start()
+            accepted = True
+        except inbox.InboxError:
+            pass
+        assert not accepted, "nonowner stop released the current ownership registration"
+    finally:
+        if accepted:
+            await challenger.stop()
+        await owner.stop()

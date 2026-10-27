@@ -190,39 +190,16 @@ class Store:
         _text(key, self.limits.key_chars, "key")
         _text(recipient, self.limits.name_chars, "recipient")
         _text(conversation, self.limits.name_chars, "conversation")
-        payload = _text(body, MAX_PAYLOAD_BYTES, "body", 0).encode("utf-8")
-        if len(payload) > MAX_PAYLOAD_BYTES:
-            raise Invalid(f"body exceeds {MAX_PAYLOAD_BYTES} bytes of UTF-8")
-        digest = hashlib.sha256(payload).digest()
+        payload, digest = self._payload(body)
         with self._write() as conn:
-            row = conn.execute("SELECT * FROM inbox_messages WHERE key=?", (key,)).fetchone()
+            row = self._retained(conn, key, payload, digest, request_kind=None,
+                                 recipient=recipient, conversation=conversation)
             if row is not None:
-                same = (row["recipient"], row["conversation"], row["size"], row["digest"]) == (
-                    recipient, conversation, len(payload), digest)
-                if not same or row["body"] is not None and row["body"] != payload:
-                    raise Conflict(key)
                 return _status(row)
-            lodge, mine = self._usage(conn, ""), self._usage(conn, recipient)
-            limits = self.limits
-            for code, over in (
-                ("keys", lodge["keys"] >= limits.keys),
-                ("attempts", (lodge["keys"] + 1) * MAX_CALLS > limits.attempts),
-                ("pending", lodge["pending"] >= limits.pending),
-                ("pending_bytes", lodge["bytes"] + len(payload) > limits.pending_bytes),
-                ("recipient_pending", mine["pending"] >= limits.recipient_pending),
-                ("recipient_bytes", mine["bytes"] + len(payload) > limits.recipient_bytes),
-            ):
-                if over:
-                    raise Refused(code)
-            seq = conn.execute(
-                "INSERT INTO inbox_messages(key, recipient, conversation, body, size, digest,"
-                " state, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
-                (key, recipient, conversation, payload, len(payload), digest, time.time()),
-            ).lastrowid
-            self._charge(conn, recipient, 1, len(payload), 1)
-            self._event(conn, seq, "queued", None)
-            row = conn.execute("SELECT * FROM inbox_messages WHERE seq=?", (seq,)).fetchone()
-        return _status(row)
+            # An enrolled session takes mail only through inbox_binding.
+            if conn.execute("SELECT 1 FROM sessions WHERE inbox_incarnation=?", (recipient,)).fetchone():
+                raise Refused("bound_recipient")
+            return self._insert(conn, key, recipient, conversation, payload, digest)
 
     def status(self, key: str) -> Status | None:
         """None only when a readable store has no such key."""
@@ -311,6 +288,54 @@ class Store:
             rows = conn.execute(f"SELECT DISTINCT recipient, conversation FROM inbox_messages"
                                 f" WHERE {_UNRESOLVED}").fetchall()
         return [tuple(r) for r in rows]
+
+    # -- admission, shared with inbox_binding ---------------------------------
+
+    @staticmethod
+    def _payload(body) -> tuple[bytes, bytes]:
+        payload = _text(body, MAX_PAYLOAD_BYTES, "body", 0).encode("utf-8")
+        if len(payload) > MAX_PAYLOAD_BYTES:
+            raise Invalid(f"body exceeds {MAX_PAYLOAD_BYTES} bytes of UTF-8")
+        return payload, hashlib.sha256(payload).digest()
+
+    @staticmethod
+    def _retained(conn, key, payload, digest, **request):
+        """The row already under key, or None. Conflict unless it holds this
+        very request: the same fields and body, the body by digest once gone.
+        Both APIs share the keys, so a direct and a bound request never match."""
+        row = conn.execute("SELECT * FROM inbox_messages WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        if (any(row[field] != value for field, value in request.items())
+                or (row["size"], row["digest"]) != (len(payload), digest)
+                or row["body"] is not None and row["body"] != payload):
+            raise Conflict(key)
+        return row
+
+    def _insert(self, conn, key, recipient, conversation, payload, digest,
+                request=(None, None, None)) -> Status:
+        """Queue a new key, inside the caller's write, once every limit allows it."""
+        lodge, mine = self._usage(conn, ""), self._usage(conn, recipient)
+        limits = self.limits
+        for code, over in (
+            ("keys", lodge["keys"] >= limits.keys),
+            ("attempts", (lodge["keys"] + 1) * MAX_CALLS > limits.attempts),
+            ("pending", lodge["pending"] >= limits.pending),
+            ("pending_bytes", lodge["bytes"] + len(payload) > limits.pending_bytes),
+            ("recipient_pending", mine["pending"] >= limits.recipient_pending),
+            ("recipient_bytes", mine["bytes"] + len(payload) > limits.recipient_bytes),
+        ):
+            if over:
+                raise Refused(code)
+        seq = conn.execute(
+            "INSERT INTO inbox_messages(key, recipient, conversation, body, size, digest, state,"
+            " created_at, request_kind, request_address, bound_harness)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
+            (key, recipient, conversation, payload, len(payload), digest, time.time(), *request),
+        ).lastrowid
+        self._charge(conn, recipient, 1, len(payload), 1)
+        self._event(conn, seq, "queued", None)
+        return _status(conn.execute("SELECT * FROM inbox_messages WHERE seq=?", (seq,)).fetchone())
 
     # -- storage --------------------------------------------------------------
 

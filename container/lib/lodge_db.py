@@ -185,6 +185,31 @@ _MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             keys    INTEGER NOT NULL
         )""",
     )),
+    (6, (
+        # Who inbox mail is for (inbox_binding.py): a session enrolled by hand,
+        # never by the lodge yet. The incarnation is made at enrollment and
+        # dies with the row; harness and conversation are frozen there.
+        # sessions.status stays the session's only lifecycle.
+        "ALTER TABLE sessions ADD COLUMN inbox_incarnation TEXT",
+        "ALTER TABLE sessions ADD COLUMN inbox_harness TEXT",
+        "ALTER TABLE sessions ADD COLUMN inbox_conversation TEXT",
+        "ALTER TABLE sessions ADD COLUMN inbox_readiness TEXT",
+        "ALTER TABLE sessions ADD COLUMN inbox_generation TEXT",
+        "ALTER TABLE sessions ADD COLUMN inbox_revision INTEGER",
+        "CREATE UNIQUE INDEX IF NOT EXISTS sessions_inbox_incarnation"
+        " ON sessions(inbox_incarnation) WHERE inbox_incarnation IS NOT NULL",
+        # A wolt's pick, newest activity first; queries must order by these
+        # words and say `inbox_incarnation IS NOT NULL` to use it.
+        "CREATE INDEX IF NOT EXISTS sessions_inbox_pick ON sessions(wolt,"
+        " coalesce(last_activity, 0) DESC, created_at DESC, name) WHERE inbox_incarnation IS NOT NULL",
+        # What a bound request asked for, kept to match retries after the
+        # body is gone. NULL request_kind: a row of the direct Store API.
+        "ALTER TABLE inbox_messages ADD COLUMN request_kind TEXT",
+        "ALTER TABLE inbox_messages ADD COLUMN request_address TEXT",
+        "ALTER TABLE inbox_messages ADD COLUMN bound_harness TEXT",
+        # The binding's revision a bound attempt was claimed under.
+        "ALTER TABLE inbox_attempts ADD COLUMN revision INTEGER",
+    )),
 ]
 _BREAKING: set[int] = set()
 

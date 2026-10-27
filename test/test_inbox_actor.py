@@ -524,8 +524,8 @@ async def test_bound_mail_goes_to_its_incarnation_and_a_retry_wakes_it_there(tmp
 async def test_lifecycle_changes_reach_waiters_and_wake_mail_after_they_commit(tmp_path, bound):
     coordinator, engine, binding = await bound(status="resting", readiness="resting")
     coordinator.bound_admit("k1", "session-name", "s1", "one")
-    await settle()
-    assert engine.calls == []  # resting: nothing woken, nothing sent
+    held = await coordinator.wait("k1", 5)
+    assert (held.state, held.reason, engine.calls) == ("blocked", "target_resting", [])  # nothing sent
     coordinator.transition(binding.incarnation, 1, status="running", readiness="running")
     await engine.wait_calls(1)
     engine.resolve(Outcome.ACCEPTED)

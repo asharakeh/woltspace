@@ -211,6 +211,12 @@ def test_a_malformed_bound_request_is_refused_before_the_store_is_touched(tmp_pa
     with pytest.raises(inbox.Invalid):
         auth.admit(**{**dict(key="k1", kind="wolt", address="pal", body="hi"), **bad})
     assert not lodge_db.path(tmp_path).exists()
+    for incarnation, revision in (("x" * 37, 1), ("", 1), (str(uuid.uuid4()), 0), (str(uuid.uuid4()), True)):
+        with pytest.raises(inbox.Invalid):
+            auth.delete(incarnation, revision)
+        with pytest.raises(inbox.Invalid):
+            auth.transition(incarnation, revision, status="running", readiness="running")
+    assert not lodge_db.path(tmp_path).exists()
     with pytest.raises(inbox.Invalid, match="incarnation"):
         authority(tmp_path, name_chars=35)
     with pytest.raises(inbox.Invalid):
@@ -297,20 +303,69 @@ def test_a_transition_needs_the_current_revision_and_activity_is_not_one(tmp_pat
         auth.transition(binding.incarnation, 2**63 - 1, status="running", readiness="running")
 
 
-def test_resting_mail_waits_unsent_until_the_same_conversation_runs_again(tmp_path):
+def test_resting_mail_is_held_unsent_until_the_same_conversation_runs_again(tmp_path):
     auth = authority(tmp_path)
     binding = enroll(auth, "s1", status="resting", readiness="resting")
-    auth.admit("k1", "wolt", "pal", "hi")
+    receipt = auth.admit("k1", "wolt", "pal", "hi")
+    assert (receipt.state, receipt.reason) == ("blocked", "target_resting")  # one commit with the hold
+    assert auth.admit("k1", "wolt", "pal", "hi") == receipt
     assert auth.store.claim(binding.incarnation, "conv-s1", "g1") is None
     for change in (dict(status="running"), dict(status="resting", predecessor_fenced=True)):
         with pytest.raises(inbox.Refused, match="generation_unfenced"):
             auth.transition(binding.incarnation, 1, **{"readiness": "running", "generation": "g2", **change})
     woken, settled = auth.transition(binding.incarnation, 1, status="running", readiness="running",
                                      generation="g2", predecessor_fenced=True)
-    assert (woken.generation, woken.conversation, settled) == ("g2", "conv-s1", [])
+    assert (woken.generation, woken.conversation) == ("g2", "conv-s1")
+    assert [(s.key, s.state, s.reason) for s in settled] == [("k1", "queued", None)]
     assert auth.store.claim(binding.incarnation, "conv-s1", "g1") is None  # the old generation
     attempt = auth.store.claim(binding.incarnation, "conv-s1", "g2")
     assert rows(tmp_path, "SELECT generation, revision FROM inbox_attempts") == [("g2", 2)]
+    assert auth.store.record(attempt, inbox.Outcome.ACCEPTED).state == "native_accepted"
+
+
+def test_lifecycle_holds_follow_the_session_and_only_they_are_released(tmp_path):
+    auth = authority(tmp_path)
+    binding = enroll(auth, "s1")
+    inc = binding.incarnation
+    for key in ("k1", "k2", "k3"):
+        auth.admit(key, "session-name", "s1", key)
+    auth.store.record(auth.store.claim(inc, "conv-s1", "g1"), inbox.Outcome.USER_STOP)
+    revision, seen = 1, []
+    for status, readiness in ((sessions.STOPPING, "unknown"), ("running", "unknown"), ("resting", "resting"),
+                              ("running", "running")):
+        binding, settled = auth.transition(inc, revision, status=status, readiness=readiness)
+        revision = binding.revision
+        seen.append([(s.key, s.state, s.reason) for s in settled])
+    assert seen == [[("k2", "blocked", "target_stopping"), ("k3", "blocked", "target_stopping")],
+                    [("k2", "blocked", "target_unknown"), ("k3", "blocked", "target_unknown")],
+                    [("k2", "blocked", "target_resting"), ("k3", "blocked", "target_resting")],
+                    [("k2", "queued", None), ("k3", "queued", None)]]
+    assert state(tmp_path, "k1") == [("blocked", "user_stop", 1, 0)]  # never released
+    assert auth.store.status("k2").state == "queued"
+    assert auth.store.claim(inc, "conv-s1", "g1") is None  # k1, stopped by the user, still holds them
+    assert rows(tmp_path, "SELECT state, reason FROM inbox_events WHERE seq=? ORDER BY cursor",
+                auth.store.status("k3").seq) == [
+        ("queued", None), ("blocked", "target_stopping"), ("blocked", "target_unknown"),
+        ("blocked", "target_resting"), ("queued", None)]
+    binding, settled = auth.transition(inc, revision, status="resting", readiness="resting")
+    assert [s.reason for s in settled] == ["target_resting", "target_resting"]
+    assert [(s.key, s.state, s.reason) for s in end(auth, binding, "stopped")] == [
+        ("k2", "blocked", "target_ended"), ("k3", "blocked", "target_ended")]
+    assert state(tmp_path, "k1") == [("blocked", "user_stop", 1, 0)]
+
+
+def test_a_repeated_transition_changes_nothing_and_a_fenced_verdict_must_be_true(tmp_path):
+    auth = authority(tmp_path)
+    binding = enroll(auth, "s1")
+    auth.admit("k1", "wolt", "pal", "hi")
+    attempt = auth.store.claim(binding.incarnation, "conv-s1", "g1")
+    events = rows(tmp_path, "SELECT * FROM inbox_events")
+    assert auth.transition(binding.incarnation, 1, status="running", readiness="running") == (binding, [])
+    assert rows(tmp_path, "SELECT * FROM inbox_events") == events
+    for verdict in ("yes", 1):
+        with pytest.raises(inbox.Refused, match="generation_unfenced"):
+            auth.transition(binding.incarnation, 1, status="running", readiness="running", generation="g2",
+                            predecessor_fenced=verdict)
     assert auth.store.record(attempt, inbox.Outcome.ACCEPTED).state == "native_accepted"
 
 
@@ -350,6 +405,10 @@ def test_an_ended_session_keeps_its_mail_blocked_and_its_settled_mail_as_it_was(
     assert usage(tmp_path)[inc] == (3, 6, 4)
     with pytest.raises(inbox.Refused, match="no_target" if how == "delete" else "target_ended"):
         auth.transition(inc, binding.revision + 1, status="running", readiness="running")
+    if how != "delete":  # an ended session can still be deleted; its mail stays as it is
+        assert auth.delete(inc, binding.revision + 1) == []
+        assert rows(tmp_path, "SELECT count(*) FROM sessions") == [(0,)]
+        assert state(tmp_path, "k3") == [("blocked", "target_ended", 0, 0)]
     if how == "delete":  # the name again is a new session: none of the old mail moves to it
         again = enroll(auth, "s1")
         assert again.incarnation != inc

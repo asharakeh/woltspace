@@ -35,6 +35,7 @@ KINDS = ("wolt", "session-name", "incarnation")
 READINESS = ("running", "resting", "unknown")  # what the runtime verified, supplied by the caller
 ENDED = ("stopped", "completed", "failed")
 LIFECYCLE = ("running", "resting", sessions.STOPPING, *ENDED)
+HOLDS = ("target_resting", "target_stopping", "target_unknown")  # released once it runs again
 _INCARNATION_CHARS = 36
 _ENROLLED = "inbox:enrollments"  # meta key: enrollments ever made, never released
 
@@ -88,6 +89,12 @@ def _refusal(row) -> str | None:
     if row["status"] == sessions.STOPPING:
         return "target_stopping"  # retry later
     return "target_ended" if row["status"] in ENDED else "target_unknown"
+
+
+def _target(incarnation, revision) -> None:
+    """Checked before the store is opened."""
+    inbox._text(incarnation, _INCARNATION_CHARS, "incarnation")
+    inbox._count(revision, "revision", 1)
 
 
 class Authority:
@@ -155,8 +162,11 @@ class Authority:
             code = _refusal(target)
             if code is not None:
                 raise Refused(code)
-            return self.store._insert(conn, key, target["inbox_incarnation"], target["inbox_conversation"],
-                                      payload, digest, (kind, address, target["inbox_harness"]))
+            status = self.store._insert(conn, key, target["inbox_incarnation"], target["inbox_conversation"],
+                                        payload, digest, (kind, address, target["inbox_harness"]))
+            if target["status"] != "running":  # resting: held in the same commit
+                status = self._move(conn, status.seq, "blocked", "target_resting")
+            return status
 
     def transition(self, incarnation: str, revision: int, *, status: str, readiness: str,
                    generation: str | None = None,
@@ -171,10 +181,15 @@ class Authority:
             raise Invalid(f"readiness must be one of {READINESS}")
         if generation is not None:
             self._text(generation, "generation", self.store.limits.name_chars)
+        _target(incarnation, revision)
         with self._owned() as conn:
             row = self._current(conn, incarnation, revision)
+            if row["status"] in ENDED:
+                raise Refused("target_ended")  # an end is for good
             generation = generation or row["inbox_generation"]
-            if generation != row["inbox_generation"] and not (predecessor_fenced and status == "running"):
+            if (status, readiness, generation) == (row["status"], row["inbox_readiness"], row["inbox_generation"]):
+                return _binding(row), []  # nothing changed: a call in flight stays valid
+            if generation != row["inbox_generation"] and not (predecessor_fenced is True and status == "running"):
                 raise Refused("generation_unfenced")
             conn.execute(
                 "UPDATE sessions SET status=?, record=json_set(record, '$.status', ?), updated_at=?,"
@@ -185,7 +200,9 @@ class Authority:
 
     def delete(self, incarnation: str, revision: int) -> list[inbox.Status]:
         """Delete an enrolled session's row. Its mail stays, bound to an
-        incarnation that no longer exists: blocked, never sent elsewhere."""
+        incarnation that no longer exists: blocked, never sent elsewhere.
+        An ended session can be deleted too."""
+        _target(incarnation, revision)
         with self._owned() as conn:
             row = self._current(conn, incarnation, revision)
             settled = self._settle(conn, row, ended=True)
@@ -196,8 +213,6 @@ class Authority:
 
     def _current(self, conn, incarnation, revision):
         """The enrolled session, still as enrolled and at revision; or Refused."""
-        inbox._text(incarnation, _INCARNATION_CHARS, "incarnation")
-        inbox._count(revision, "revision", 1)
         row = self._session(conn, "inbox_incarnation", incarnation)
         if row is None:
             raise Refused("no_target")
@@ -205,36 +220,41 @@ class Authority:
             raise Refused("stale_revision")
         if (row["harness"], row["harness_session_id"]) != (row["inbox_harness"], row["inbox_conversation"]):
             raise Refused("binding_mismatch")
-        if row["status"] in ENDED:
-            raise Refused("target_ended")
         if revision >= inbox._MAX_INT:
             raise Refused("revision_overflow")
         return row
 
     def _settle(self, conn, row, ended):
-        """In the transition's own commit: a call in flight may have reached the
-        engine, so it is uncertain; once the session ends, queued mail is
-        blocked. Everything else keeps its state; queued mail waits until a
-        claim finds its session running again (Store._bound)."""
+        """Bring the session's unresolved mail in line with its state, in the
+        same commit. A call in flight may have reached the engine: uncertain.
+        Queued mail is held while the session cannot take it, and held mail
+        is queued again once it runs as enrolled; an end blocks both for good.
+        Accepted, uncertain and otherwise blocked mail keeps its state."""
+        if ended:
+            hold = "target_ended"
+        elif row["status"] == "running" and row["inbox_readiness"] == "running":
+            hold = None
+        elif row["status"] == "resting" and row["inbox_readiness"] == "resting":
+            hold = "target_resting"
+        else:
+            hold = "target_stopping" if row["status"] == sessions.STOPPING else "target_unknown"
         settled = []
-        for seq, state in conn.execute(
-                f"SELECT seq, state FROM inbox_messages WHERE recipient=? AND conversation=?"
+        for seq, state, reason in conn.execute(
+                f"SELECT seq, state, reason FROM inbox_messages WHERE recipient=? AND conversation=?"
                 f" AND {inbox._UNRESOLVED} ORDER BY seq",
                 (row["inbox_incarnation"], row["inbox_conversation"])).fetchall():
             if state == "attempting":
                 conn.execute("UPDATE inbox_attempts SET outcome='unknown' WHERE seq=? AND outcome IS NULL",
                              (seq,))
                 state, reason = "uncertain", "target_changed"
-            elif state == "queued" and ended:
-                state, reason = "blocked", "target_ended"
+            elif state == "queued" and hold is not None:
+                state, reason = "blocked", hold
+            elif state == "blocked" and reason in HOLDS and reason != hold:
+                state, reason = ("queued", None) if hold is None else ("blocked", hold)
             else:
                 continue
-            conn.execute("UPDATE inbox_messages SET state=?, reason=? WHERE seq=?", (state, reason, seq))
-            self.store._event(conn, seq, state, reason)
-            settled.append(inbox._status(conn.execute(
-                "SELECT * FROM inbox_messages WHERE seq=?", (seq,)).fetchone()))
+            settled.append(self._move(conn, seq, state, reason))
         return settled
-
 
     def _text(self, value, what, cap=None):
         return inbox._text(value, min(self.limits.field_chars, cap or self.limits.field_chars), what)
@@ -256,3 +276,8 @@ class Authority:
                     and os.path.realpath(main) == os.path.realpath(lodge_db.path(self.store.root))):
                 raise inbox.Unavailable("store_failed")
             yield conn
+
+    def _move(self, conn, seq, state, reason) -> inbox.Status:
+        conn.execute("UPDATE inbox_messages SET state=?, reason=? WHERE seq=?", (state, reason, seq))
+        self.store._event(conn, seq, state, reason)
+        return inbox._status(conn.execute("SELECT * FROM inbox_messages WHERE seq=?", (seq,)).fetchone())

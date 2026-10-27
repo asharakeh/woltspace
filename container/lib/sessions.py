@@ -544,6 +544,9 @@ class SessionRegistry:
         lodge writer waits for it.
         """
         with self._tx() as conn:
+            current = _locked_row(conn, name)
+            if current is not None and _owned(current):
+                _stored(current)  # before _load: an incoherent owned row is not "missing"
             data = self._row(conn, name, wolt)
             before = json.dumps(data, sort_keys=True, default=str)
             yield data
@@ -1044,9 +1047,13 @@ class SessionRegistry:
         """Remove a session. Returns True if it existed."""
         with self._tx() as conn:
             current = _locked_row(conn, name)
+            if current is not None and _owned(current):
+                _stored(current)  # judged before _load, which would call it missing
+                if (wolt and current["wolt"] != wolt) or not self._visible(current["wolt"]):
+                    return False  # not this caller's row: nothing to delete, as before
+                raise SessionWriteRefused("owned_session")
             if self._row(conn, name, wolt) is None:
                 return False
-            _refuse_owned([current])
             conn.execute("DELETE FROM sessions WHERE name=?", (name,))
         return True
 

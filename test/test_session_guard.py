@@ -141,6 +141,8 @@ def test_a_stale_full_record_cannot_bring_back_an_older_lifecycle(tmp_path, owne
                 ' "harness": "claude", "harness_session_id": "conv-s1"}'),  # names another row
     dict(record='{"wolt": "pal", "status": "running", "created_at": 1,'
                 ' "harness": "claude", "harness_session_id": "conv-s1"}'),  # names none
+    dict(record='{"name": '),  # not JSON
+    dict(record='[1]'),  # not an object
 ])
 def test_a_partial_or_malformed_binding_is_not_an_ordinary_session(tmp_path, owned, marker):
     auth, binding, reg = owned
@@ -149,7 +151,8 @@ def test_a_partial_or_malformed_binding_is_not_an_ordinary_session(tmp_path, own
     with lodge_db.write(tmp_path) as conn:
         conn.execute(f"UPDATE sessions SET {column}=? WHERE name=?", (value, target))
     before = snapshot(tmp_path)
-    direct = [lambda: _put(tmp_path, title="t")] if target == "s1" else []
+    readable = column != "record" or value.startswith("{") and value.endswith("}")
+    direct = [lambda: _put(tmp_path, title="t")] if target == "s1" and readable else []
     for write in (lambda: reg.describe(target, "t", "s"), lambda: reg.touch(target), *direct):
         with pytest.raises(Refused, match="binding_invalid"):
             write()

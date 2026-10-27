@@ -277,6 +277,9 @@ def test_only_a_real_uniqueness_conflict_stays_an_integrity_error(tmp_path, owne
             caught.append(exc)
         outer["title"] = "kept"
     assert caught[0].sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE" and stored(tmp_path)["title"] == "kept"
+    with pytest.raises(lodge_db.sqlite3.IntegrityError, match="session_integrity"):  # and escaping it
+        with reg.edit("s1"):
+            reg.update("s2", harness_session_id="conv-s1")
     with lodge_db.write(tmp_path) as conn:
         conn.execute("CREATE TRIGGER fail BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'SENTINEL_T'); END")
     with pytest.raises(sessions.SessionStoreUnavailable) as failed:  # not a conflict to retry on

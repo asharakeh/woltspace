@@ -75,7 +75,7 @@ def test_an_inspection_outside_the_target_is_refused_before_reading(tmp_path):
     target = tmp_path / "target"
     target.mkdir()
     (target / "link").symlink_to(tmp_path / "elsewhere")
-    for candidate in (root, target / "link" / ".." / "elsewhere"):  # a link and its .. cancel out
+    for candidate in (root, target / "link", target / "link" / ".." / "elsewhere"):  # a link, its .. too
         with pytest.raises(backup.RestoreRefused, match="inspect_path_unsafe") as refused:
             backup.disarm(candidate, "/x", target)
         assert str(tmp_path) not in str(refused.value)

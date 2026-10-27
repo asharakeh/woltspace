@@ -1485,8 +1485,8 @@ def disarm(wolts_dir: Path, source: str, target: Path) -> dict:
         "sessions_rebased": 0, "sessions_set_aside": [], "grants_rebased": 0,
         "grants_dropped": [],
     }
+    _refuse_native_state(target, wolts_dir)  # first: before any other check or removal
     _guard(wolts_dir, wolts_dir)
-    _refuse_native_state(target, wolts_dir)  # before the first thing it removes
     for rel in RUNTIME_RECORDS:
         path = _guard(wolts_dir, wolts_dir / rel)
         if path.is_file():

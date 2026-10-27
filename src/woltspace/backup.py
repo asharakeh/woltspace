@@ -1287,6 +1287,8 @@ def _refuse_inbox_state(conn: sqlite3.Connection) -> None:
         raise RestoreRefused("safe_state_unknown")
     if conn.execute("PRAGMA user_version").fetchone()[0] != 0:  # lodge_db never sets it
         raise RestoreRefused("safe_state_unknown")
+    if (inbox or binding) and "meta" not in tables:  # the enrollment count went with it
+        raise RestoreRefused("safe_state_unknown")
     if binding and conn.execute("SELECT 1 FROM sessions WHERE " + " OR ".join(
             f"{column} IS NOT NULL" for column in _INBOX_BINDING) + " LIMIT 1").fetchone():
         raise RestoreRefused("safe_state_present")
@@ -1311,8 +1313,8 @@ def _refuse_native_state(target: Path, wolts_dir: Path) -> None:
     db = wolts_dir / LODGE_DB
     wal = db.with_name(db.name + "-wal")
     if not db.exists():
-        if wal.exists():
-            raise RestoreRefused("safe_state_unknown")
+        if any(db.with_name(db.name + c).exists() for c in SQLITE_COMPANIONS):
+            raise RestoreRefused("safe_state_unknown")  # what is left of a lodge.db is not none
         return  # no lodge.db: a release before it, nothing of the inbox
     scratch = Path(tempfile.mkdtemp(prefix="woltspace-inspect-"))
     try:

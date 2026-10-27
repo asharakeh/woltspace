@@ -82,11 +82,13 @@ def test_an_inspection_outside_the_target_is_refused_before_reading(tmp_path):
     assert (root / RUNTIME).exists()
 
 
+@pytest.mark.parametrize("journal", [b"", b"\0" * 512])  # empty or not: its presence decides
 @pytest.mark.parametrize("entry", ["disarm", "helper"])
-def test_a_rollback_journal_beside_lodge_db_refuses_before_anything_is_read(tmp_path, entry, monkeypatch):
+def test_a_rollback_journal_beside_lodge_db_refuses_before_anything_is_read(tmp_path, entry, journal,
+                                                                            monkeypatch):
     root = lodge(tmp_path / "copy", mail=False)
     db = root / backup.LODGE_DB
-    db.with_name(db.name + "-journal").write_bytes(b"\0" * 512)  # whatever it holds: not judged
+    db.with_name(db.name + "-journal").write_bytes(journal)
     files = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
     opened = []
     monkeypatch.setattr(backup.shutil, "copyfile", lambda *a: opened.append(a))

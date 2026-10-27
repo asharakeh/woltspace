@@ -136,6 +136,7 @@ def test_a_stale_full_record_cannot_bring_back_an_older_lifecycle(tmp_path, owne
     dict(inbox_revision=0),
     dict(inbox_readiness="awake"),
     dict(inbox_conversation="conv-other"),  # disagrees with the row it froze
+    dict(record='{"name": "s1", "created_at": "soon"}'),  # a record its columns cannot come from
 ])
 def test_a_partial_or_malformed_binding_is_not_an_ordinary_session(tmp_path, owned, marker):
     auth, binding, reg = owned
@@ -144,12 +145,12 @@ def test_a_partial_or_malformed_binding_is_not_an_ordinary_session(tmp_path, own
     with lodge_db.write(tmp_path) as conn:
         conn.execute(f"UPDATE sessions SET {column}=? WHERE name=?", (value, target))
     before = snapshot(tmp_path)
-    for write in (lambda: reg.describe(target, "t", "s"), lambda: reg.touch(target),
-                  lambda: reg.delete(target)):
+    for write in (lambda: reg.describe(target, "t", "s"), lambda: reg.touch(target)):
         with pytest.raises(Refused, match="binding_invalid"):
             write()
-    with pytest.raises(Refused):  # s1 or the malformed row, whichever it meets first
-        reg.forget_wolt("pal")
+    for write in (lambda: reg.delete(target), lambda: reg.forget_wolt("pal")):
+        with pytest.raises(Refused):  # a delete refuses whichever it is
+            write()
     assert snapshot(tmp_path) == before
 
 

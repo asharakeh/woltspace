@@ -176,12 +176,33 @@ def _owned(row: dict) -> bool:
         return False
     incarnation, harness, conversation, readiness, generation, revision = values
     if not (isinstance(incarnation, str) and _INCARNATION.match(incarnation)
-            and all(isinstance(v, str) and v for v in (harness, conversation, generation))
+            and all(isinstance(v, str) and v and _utf8(v) for v in (harness, conversation, generation))
             and readiness in ("running", "resting", "unknown")
             and type(revision) is int and revision >= 1
             and (row.get("harness"), row.get("harness_session_id")) == (harness, conversation)):
         raise SessionWriteRefused("binding_invalid")
     return True
+
+
+def _utf8(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+@contextmanager
+def _store_errors():
+    """What crosses the guard leaves as a fixed code, raised from None: a
+    uniqueness conflict stays an IntegrityError (callers retry on it)."""
+    try:
+        yield
+    except sqlite3.IntegrityError:
+        raise sqlite3.IntegrityError("session_integrity") from None
+    except (sqlite3.Error, OSError) as exc:
+        busy = isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+        raise SessionStoreUnavailable("store_busy" if busy else "store_failed") from None
 
 
 def _refuse_owned(rows: list[dict]) -> None:
@@ -202,11 +223,9 @@ def _stored(row: dict) -> dict:
     """An owned row's record, consistent with its columns, or binding_invalid."""
     try:
         record = json.loads(row["record"])
-    except (TypeError, ValueError):
+        columns = _row_values({**record, "name": row["name"]})  # created_at may not be a number
+    except (TypeError, ValueError, AttributeError):
         raise SessionWriteRefused("binding_invalid") from None
-    if not isinstance(record, dict):
-        raise SessionWriteRefused("binding_invalid")
-    columns = _row_values({**record, "name": row["name"]})
     if any(columns[i] != row[name] for i, name in zip(_COLUMN_FIELDS, (
             "wolt", "status", "created_at", "finished_at", "harness", "harness_session_id"))):
         raise SessionWriteRefused("binding_invalid")
@@ -233,23 +252,24 @@ def put_session(conn, record: dict) -> None:
     """
     if any(str(key).startswith("inbox_") for key in record):
         raise SessionWriteRefused("binding_invalid")
-    current = _locked_row(conn, record["name"])
-    if current is not None and _owned(current):
-        stored = _stored(current)
-        unchanged = {key: value for key, value in stored.items() if key not in BENIGN_FIELDS | {"name"}}
-        asked = {key: value for key, value in record.items() if key not in BENIGN_FIELDS | {"name"}}
-        if _canonical(unchanged) != _canonical(asked):
-            raise SessionWriteRefused("owned_session")
-        record = {**_with_benign(stored, record), "name": current["name"]}
-    conn.execute(
-        f"INSERT INTO sessions ({_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?)"
-        " ON CONFLICT(name) DO UPDATE SET wolt=excluded.wolt, status=excluded.status,"
-        " created_at=excluded.created_at, last_activity=excluded.last_activity,"
-        " finished_at=excluded.finished_at, harness=excluded.harness,"
-        " harness_session_id=excluded.harness_session_id, record=excluded.record,"
-        " updated_at=excluded.updated_at",
-        _row_values(record),
-    )
+    with _store_errors():
+        current = _locked_row(conn, record["name"])
+        if current is not None and _owned(current):
+            stored = _stored(current)
+            unchanged = {key: value for key, value in stored.items() if key not in BENIGN_FIELDS | {"name"}}
+            asked = {key: value for key, value in record.items() if key not in BENIGN_FIELDS | {"name"}}
+            if _canonical(unchanged) != _canonical(asked):
+                raise SessionWriteRefused("owned_session")
+            record = {**_with_benign(stored, record), "name": current["name"]}
+        conn.execute(
+            f"INSERT INTO sessions ({_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(name) DO UPDATE SET wolt=excluded.wolt, status=excluded.status,"
+            " created_at=excluded.created_at, last_activity=excluded.last_activity,"
+            " finished_at=excluded.finished_at, harness=excluded.harness,"
+            " harness_session_id=excluded.harness_session_id, record=excluded.record,"
+            " updated_at=excluded.updated_at",
+            _row_values(record),
+        )
 
 
 def import_sessions(conn, wolts_dir) -> tuple[dict, list]:
@@ -401,18 +421,12 @@ class SessionRegistry:
         if key in conns:
             yield conns[key]
             return
-        try:
-            with lodge_db.write(self.db_dir) as conn:
-                conns[key] = conn
-                try:
-                    yield conn
-                finally:
-                    del conns[key]
-        except sqlite3.IntegrityError:
-            raise sqlite3.IntegrityError("session_integrity") from None
-        except (sqlite3.Error, OSError) as exc:
-            busy = isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
-            raise SessionStoreUnavailable("store_busy" if busy else "store_failed") from None
+        with _store_errors(), lodge_db.write(self.db_dir) as conn:
+            conns[key] = conn
+            try:
+                yield conn
+            finally:
+                del conns[key]
 
     @contextmanager
     def _reader(self):
@@ -702,7 +716,8 @@ class SessionRegistry:
             row = _locked_row(conn, name)
             if row is None or (wolt and row["wolt"] != wolt) or not self._visible(row["wolt"]):
                 return False
-            _owned(row)  # activity is benign on an owned row; a malformed one refuses
+            if _owned(row):  # activity is benign on an owned row; a malformed one refuses
+                _stored(row)
             return conn.execute(
                 "UPDATE sessions SET last_activity=?, updated_at=?,"
                 " record=json_set(record, '$.last_activity', ?)"

@@ -369,7 +369,7 @@ def test_the_migration_is_idempotent_and_its_tables_start_empty(tmp_path):
 
 def test_importing_the_inbox_does_nothing(tmp_path):
     lib = Path(inbox.__file__).parent
-    code = ("import sys, threading; sys.path.insert(0, sys.argv[1]); import inbox, inbox_actor;"
+    code = ("import sys, threading; sys.path.insert(0, sys.argv[1]); import inbox, inbox_actor, inbox_binding;"
             " print(threading.active_count())")
     env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "WOLTSPACE_WOLTS_DIR": str(tmp_path)}
     out = subprocess.run([sys.executable, "-I", "-c", code, str(lib)], cwd=tmp_path, env=env,

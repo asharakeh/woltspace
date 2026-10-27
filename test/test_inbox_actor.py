@@ -7,7 +7,8 @@ import traceback
 
 import pytest
 
-from inbox_support import FakeEngine, failing, limits, lose_confirmation, rows, state, usage
+from inbox_support import (FakeEngine, authority, enroll, failing, limits, lose_confirmation, rows,
+                           state, usage)
 
 import inbox
 import inbox_actor
@@ -481,3 +482,79 @@ async def test_stopping_nonowner_does_not_release_current_owner(tmp_path, lodge,
         if accepted:
             await challenger.stop()
         await owner.stop()
+
+
+# -- bound mail (inbox_binding) -----------------------------------------------
+
+@pytest.fixture
+def bound(tmp_path):
+    """A started coordinator over an authority, with session s1 enrolled as given;
+    each test stops its own."""
+
+    async def make(**row):
+        auth = authority(tmp_path)
+        binding = enroll(auth, "s1", **row)
+        engine = FakeEngine(tmp_path / "ledger")
+        coordinator = inbox_actor.Coordinator(auth.store, engine, generation="g1", overdue_after=60,
+                                              clock=Clock(), authority=auth)
+        await coordinator.start()
+        return coordinator, engine, binding
+
+    return make
+
+
+@pytest.mark.asyncio
+async def test_bound_mail_goes_to_its_incarnation_and_a_retry_wakes_it_there(tmp_path, bound):
+    coordinator, engine, binding = await bound()
+    receipt = coordinator.bound_admit("k1", "wolt", "pal", "hi")
+    attempt = await engine.wait_calls(1)
+    assert (receipt.recipient, attempt.key, attempt.generation) == (binding.incarnation, "k1", "g1")
+    engine.resolve(Outcome.ACCEPTED)
+    assert (await coordinator.wait("k1", 5)).state == "native_accepted"
+    assert coordinator.bound_admit("k1", "wolt", "pal", "hi").state == "native_accepted"
+    await settle()
+    assert len(engine.calls) == 1 and len(engine.effects()) == 1
+    with pytest.raises(inbox.InboxError, match="another store"):
+        inbox_actor.Coordinator(inbox.Store(tmp_path, limits(name_chars=40)), engine, generation="g1",
+                                overdue_after=60, authority=coordinator.authority)
+    await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_changes_reach_waiters_and_wake_mail_after_they_commit(tmp_path, bound):
+    coordinator, engine, binding = await bound(status="resting", readiness="resting")
+    coordinator.bound_admit("k1", "session-name", "s1", "one")
+    await settle()
+    assert engine.calls == []  # resting: nothing woken, nothing sent
+    coordinator.transition(binding.incarnation, 1, status="running", readiness="running")
+    await engine.wait_calls(1)
+    engine.resolve(Outcome.ACCEPTED)
+    coordinator.bound_admit("k2", "session-name", "s1", "two")
+    await engine.wait_calls(2)
+    waiter = asyncio.create_task(coordinator.wait("k2", 5))
+    await settle()
+    seen = []
+    coordinator.observer = seen.append
+    coordinator.transition(binding.incarnation, 2, status="stopped", readiness="unknown")
+    done = await waiter  # the commit settled it: no wait for the engine
+    assert (done.state, done.reason) == ("uncertain", "target_changed") and seen == [done]
+    engine.resolve(Outcome.ACCEPTED)  # it took the message anyway: ending cannot undo that
+    await settle()
+    assert coordinator.halted.code == "stale_attempt"
+    assert len(engine.effects()) == 2 and state(tmp_path, "k2") == [("uncertain", "target_changed", 1, 0)]
+    await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_bound_write_that_fails_halts_with_a_code_and_no_text(tmp_path, bound, caplog):
+    coordinator, engine, binding = await bound()
+    caplog.set_level(logging.ERROR, logger="inbox_actor")
+    with failing(tmp_path, "inbox_events"):
+        with pytest.raises(inbox.Unavailable) as failed:
+            coordinator.bound_admit("k1", "wolt", "pal", "secret-body")
+    assert coordinator.halted.code == "store_failed" and failed.value.code == "store_failed"
+    assert "injected" not in "".join(traceback.format_exception(failed.value)) + caplog.text
+    assert rows(tmp_path, "SELECT count(*) FROM inbox_messages") == [(0,)]
+    with pytest.raises(inbox.Refused, match="stale_revision"):  # refused, not a store failure
+        coordinator.authority.transition(binding.incarnation, 9, status="stopped", readiness="unknown")
+    await coordinator.stop()

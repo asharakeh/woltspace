@@ -17,6 +17,11 @@ records what came back. A message that may have reached the engine is never
 sent again: an unknown result, or an attempt nobody recorded, is `uncertain`
 and holds its conversation.
 
+Mail admitted through inbox_binding.py is bound to a session incarnation.
+Every claim of such a row, through any caller, checks in its own transaction
+that the session still runs as enrolled, under the claiming generation; its
+result is recorded only while that binding is unchanged.
+
 States: queued -> attempting -> native_accepted (body gone), or back to queued
 after a definite non-admission (three calls at most), or blocked (deferred,
 stopped by the user, calls used up), or uncertain.
@@ -234,11 +239,16 @@ class Store:
                 f" AND {_UNRESOLVED} ORDER BY seq LIMIT 1", (recipient, conversation)).fetchone()
             if row is None or row["state"] != "queued":
                 return None
+            revision = None
+            if row["request_kind"] is not None:  # bound: only to its session, running now
+                revision = self._bound(conn, row, generation)
+                if revision is None:
+                    return None
             attempt = Attempt(uuid.uuid4().hex, row["seq"], row["key"], row["calls"] + 1,
                               generation, row["body"].decode("utf-8"))
             conn.execute(
-                "INSERT INTO inbox_attempts(id, seq, ordinal, generation) VALUES (?, ?, ?, ?)",
-                (attempt.id, attempt.seq, attempt.ordinal, generation))
+                "INSERT INTO inbox_attempts(id, seq, ordinal, generation, revision) VALUES (?, ?, ?, ?, ?)",
+                (attempt.id, attempt.seq, attempt.ordinal, generation, revision))
             conn.execute("UPDATE inbox_messages SET state='attempting', reason=NULL, calls=?"
                          " WHERE seq=?", (attempt.ordinal, attempt.seq))
             self._event(conn, attempt.seq, "attempting", None)
@@ -250,11 +260,13 @@ class Store:
         outcome = Outcome(outcome)
         with self._write() as conn:
             row = conn.execute(
-                "SELECT m.*, a.generation, a.outcome FROM inbox_attempts a"
+                "SELECT m.*, a.generation, a.outcome, a.revision FROM inbox_attempts a"
                 " JOIN inbox_messages m ON m.seq = a.seq WHERE a.id=?", (attempt.id,)).fetchone()
             if (row is None or (row["seq"], row["generation"]) != (attempt.seq, attempt.generation)
                     or row["outcome"] is not None or row["state"] != "attempting"):
                 raise Stale(attempt.id)
+            if row["request_kind"] is not None and self._bound(conn, row, attempt.generation) != row["revision"]:
+                raise Stale(attempt.id)  # its binding changed unsettled: reconcile makes it uncertain
             conn.execute("UPDATE inbox_attempts SET outcome=? WHERE id=?", (outcome.value, attempt.id))
             body = row["body"]
             if outcome is Outcome.ACCEPTED:
@@ -336,6 +348,18 @@ class Store:
         self._charge(conn, recipient, 1, len(payload), 1)
         self._event(conn, seq, "queued", None)
         return _status(conn.execute("SELECT * FROM inbox_messages WHERE seq=?", (seq,)).fetchone())
+
+    @staticmethod
+    def _bound(conn, row, generation):
+        """The revision of a bound row's binding while its session may be sent
+        mail by this generation (enrolled as it was, running, verified), else
+        None. inbox_binding changes bindings; this only reads them."""
+        found = conn.execute(
+            "SELECT inbox_revision FROM sessions WHERE inbox_incarnation=? AND inbox_conversation=?"
+            " AND harness_session_id IS inbox_conversation AND inbox_harness=? AND harness IS inbox_harness"
+            " AND status='running' AND inbox_readiness='running' AND inbox_generation=?",
+            (row["recipient"], row["conversation"], row["bound_harness"], generation)).fetchone()
+        return None if found is None else found[0]
 
     # -- storage --------------------------------------------------------------
 

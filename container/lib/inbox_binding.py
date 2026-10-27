@@ -21,6 +21,7 @@ check and the binding cannot drift apart.
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ from inbox import Invalid, Refused
 KINDS = ("wolt", "session-name", "incarnation")
 READINESS = ("running", "resting", "unknown")  # what the runtime verified, supplied by the caller
 ENDED = ("stopped", "completed", "failed")
+LIFECYCLE = ("running", "resting", sessions.STOPPING, *ENDED)
 _INCARNATION_CHARS = 36
 _ENROLLED = "inbox:enrollments"  # meta key: enrollments ever made, never released
 
@@ -156,7 +158,83 @@ class Authority:
             return self.store._insert(conn, key, target["inbox_incarnation"], target["inbox_conversation"],
                                       payload, digest, (kind, address, target["inbox_harness"]))
 
+    def transition(self, incarnation: str, revision: int, *, status: str, readiness: str,
+                   generation: str | None = None,
+                   predecessor_fenced: bool = False) -> tuple[Binding, list[inbox.Status]]:
+        """Move an enrolled session to a new lifecycle state, as the runtime
+        verified it, if its binding is still at revision. A new generation is
+        for the same conversation only, once the caller has fenced the old one.
+        Returns the binding and the mail this settled, both committed."""
+        if status not in LIFECYCLE:
+            raise Invalid(f"status must be one of {LIFECYCLE}")
+        if readiness not in READINESS:
+            raise Invalid(f"readiness must be one of {READINESS}")
+        if generation is not None:
+            self._text(generation, "generation", self.store.limits.name_chars)
+        with self._owned() as conn:
+            row = self._current(conn, incarnation, revision)
+            generation = generation or row["inbox_generation"]
+            if generation != row["inbox_generation"] and not (predecessor_fenced and status == "running"):
+                raise Refused("generation_unfenced")
+            conn.execute(
+                "UPDATE sessions SET status=?, record=json_set(record, '$.status', ?), updated_at=?,"
+                " inbox_readiness=?, inbox_generation=?, inbox_revision=? WHERE name=?",
+                (status, status, int(time.time()), readiness, generation, revision + 1, row["name"]))
+            row = self._session(conn, "name", row["name"])
+            return _binding(row), self._settle(conn, row, ended=status in ENDED)
+
+    def delete(self, incarnation: str, revision: int) -> list[inbox.Status]:
+        """Delete an enrolled session's row. Its mail stays, bound to an
+        incarnation that no longer exists: blocked, never sent elsewhere."""
+        with self._owned() as conn:
+            row = self._current(conn, incarnation, revision)
+            settled = self._settle(conn, row, ended=True)
+            conn.execute("DELETE FROM sessions WHERE name=?", (row["name"],))
+            return settled
+
     # -- storage --------------------------------------------------------------
+
+    def _current(self, conn, incarnation, revision):
+        """The enrolled session, still as enrolled and at revision; or Refused."""
+        inbox._text(incarnation, _INCARNATION_CHARS, "incarnation")
+        inbox._count(revision, "revision", 1)
+        row = self._session(conn, "inbox_incarnation", incarnation)
+        if row is None:
+            raise Refused("no_target")
+        if row["inbox_revision"] != revision:
+            raise Refused("stale_revision")
+        if (row["harness"], row["harness_session_id"]) != (row["inbox_harness"], row["inbox_conversation"]):
+            raise Refused("binding_mismatch")
+        if row["status"] in ENDED:
+            raise Refused("target_ended")
+        if revision >= inbox._MAX_INT:
+            raise Refused("revision_overflow")
+        return row
+
+    def _settle(self, conn, row, ended):
+        """In the transition's own commit: a call in flight may have reached the
+        engine, so it is uncertain; once the session ends, queued mail is
+        blocked. Everything else keeps its state; queued mail waits until a
+        claim finds its session running again (Store._bound)."""
+        settled = []
+        for seq, state in conn.execute(
+                f"SELECT seq, state FROM inbox_messages WHERE recipient=? AND conversation=?"
+                f" AND {inbox._UNRESOLVED} ORDER BY seq",
+                (row["inbox_incarnation"], row["inbox_conversation"])).fetchall():
+            if state == "attempting":
+                conn.execute("UPDATE inbox_attempts SET outcome='unknown' WHERE seq=? AND outcome IS NULL",
+                             (seq,))
+                state, reason = "uncertain", "target_changed"
+            elif state == "queued" and ended:
+                state, reason = "blocked", "target_ended"
+            else:
+                continue
+            conn.execute("UPDATE inbox_messages SET state=?, reason=? WHERE seq=?", (state, reason, seq))
+            self.store._event(conn, seq, state, reason)
+            settled.append(inbox._status(conn.execute(
+                "SELECT * FROM inbox_messages WHERE seq=?", (seq,)).fetchone()))
+        return settled
+
 
     def _text(self, value, what, cap=None):
         return inbox._text(value, min(self.limits.field_chars, cap or self.limits.field_chars), what)

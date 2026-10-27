@@ -6,7 +6,7 @@ from contextlib import closing
 
 import pytest
 
-from inbox_support import accept, authority, enroll, ordered, rows, session, usage
+from inbox_support import accept, authority, enroll, ordered, rows, session, state, usage
 
 import inbox
 import inbox_binding
@@ -256,3 +256,152 @@ def test_the_last_enrollment_slot_goes_to_one_process_only(tmp_path):
                             tmp_path / "pause", tmp_path, enrollments=1)
     assert "ok" in first and second == {"refused": "enrollments"}
     assert rows(tmp_path, "SELECT name FROM sessions WHERE inbox_incarnation IS NOT NULL") == [("s1",)]
+
+
+
+# -- lifecycle ----------------------------------------------------------------
+
+def end(auth, binding, how):
+    if how == "delete":
+        return auth.delete(binding.incarnation, binding.revision)
+    return auth.transition(binding.incarnation, binding.revision, status=how, readiness="unknown")[1]
+
+
+def delete_row(root):
+    with lodge_db.write(root) as conn:
+        conn.execute("DELETE FROM sessions WHERE name='s1'")
+
+
+def test_a_transition_needs_the_current_revision_and_activity_is_not_one(tmp_path):
+    auth = authority(tmp_path)
+    binding = enroll(auth, "s1")
+    session(tmp_path, "s1", last_activity=50)  # the registry's own updates: activity, a hold
+    with lodge_db.write(tmp_path) as conn:
+        conn.execute("UPDATE sessions SET record=json_set(record, '$.hold', 1)")
+    auth.admit("k1", "session-name", "s1", "hi")
+    assert auth.store.claim(binding.incarnation, "conv-s1", "g1").key == "k1"
+    rested, _ = auth.transition(binding.incarnation, 1, status="resting", readiness="resting")
+    assert (rested.status, rested.readiness, rested.revision) == ("resting", "resting", 2)
+    assert rows(tmp_path, "SELECT status, json_extract(record, '$.status'), json_extract(record, '$.hold')"
+                          " FROM sessions") == [("resting", "resting", 1)]
+    for revision in (1, 3):
+        with pytest.raises(inbox.Refused, match="stale_revision"):
+            auth.transition(binding.incarnation, revision, status="running", readiness="running")
+    with pytest.raises(inbox.Refused, match="no_target"):
+        auth.transition(str(uuid.uuid4()), 1, status="running", readiness="running")
+    with pytest.raises(inbox.Invalid):
+        auth.transition(binding.incarnation, 2, status="archived", readiness="running")
+    with lodge_db.write(tmp_path) as conn:
+        conn.execute("UPDATE sessions SET inbox_revision=?", (2**63 - 1,))
+    with pytest.raises(inbox.Refused, match="revision_overflow"):
+        auth.transition(binding.incarnation, 2**63 - 1, status="running", readiness="running")
+
+
+def test_resting_mail_waits_unsent_until_the_same_conversation_runs_again(tmp_path):
+    auth = authority(tmp_path)
+    binding = enroll(auth, "s1", status="resting", readiness="resting")
+    auth.admit("k1", "wolt", "pal", "hi")
+    assert auth.store.claim(binding.incarnation, "conv-s1", "g1") is None
+    for change in (dict(status="running"), dict(status="resting", predecessor_fenced=True)):
+        with pytest.raises(inbox.Refused, match="generation_unfenced"):
+            auth.transition(binding.incarnation, 1, **{"readiness": "running", "generation": "g2", **change})
+    woken, settled = auth.transition(binding.incarnation, 1, status="running", readiness="running",
+                                     generation="g2", predecessor_fenced=True)
+    assert (woken.generation, woken.conversation, settled) == ("g2", "conv-s1", [])
+    assert auth.store.claim(binding.incarnation, "conv-s1", "g1") is None  # the old generation
+    attempt = auth.store.claim(binding.incarnation, "conv-s1", "g2")
+    assert rows(tmp_path, "SELECT generation, revision FROM inbox_attempts") == [("g2", 2)]
+    assert auth.store.record(attempt, inbox.Outcome.ACCEPTED).state == "native_accepted"
+
+
+@pytest.mark.parametrize("change", [
+    lambda root: session(root, "s1", conversation="conv-new"),  # a legacy upsert keeps the inbox columns
+    lambda root: session(root, "s1", status="orphaned"),
+    delete_row,
+])
+def test_a_claim_sends_bound_mail_only_to_its_session_as_enrolled(tmp_path, change):
+    auth = authority(tmp_path)
+    binding = enroll(auth, "s1")
+    auth.admit("k1", "session-name", "s1", "hi")
+    change(tmp_path)
+    for recipient in (binding.incarnation, "s1"):
+        assert auth.store.claim(recipient, "conv-s1", "g1") is None
+    assert auth.store.reconcile() == [(binding.incarnation, "conv-s1")]
+    assert state(tmp_path, "k1") == [("queued", None, 0, 0)]
+
+
+@pytest.mark.parametrize("kind", ["wolt", "session-name"])
+@pytest.mark.parametrize("how", ["stopped", "completed", "delete"])
+def test_an_ended_session_keeps_its_mail_blocked_and_its_settled_mail_as_it_was(tmp_path, kind, how):
+    auth = authority(tmp_path)
+    binding = enroll(auth, "s1")
+    inc = binding.incarnation
+    for key in ("k1", "k2", "k3", "k4"):
+        auth.admit(key, kind, "pal" if kind == "wolt" else "s1", key)
+    accept(auth.store, inc, "conv-s1")
+    auth.store.record(auth.store.claim(inc, "conv-s1", "g1"), inbox.Outcome.USER_STOP)
+    settled = end(auth, binding, how)
+    assert [(s.key, s.state, s.reason) for s in settled] == [("k3", "blocked", "target_ended"),
+                                                             ("k4", "blocked", "target_ended")]
+    assert rows(tmp_path, "SELECT key, state, reason, body FROM inbox_messages ORDER BY seq") == [
+        ("k1", "native_accepted", None, None), ("k2", "blocked", "user_stop", b"k2"),
+        ("k3", "blocked", "target_ended", b"k3"), ("k4", "blocked", "target_ended", b"k4")]
+    assert auth.admit("k3", kind, "pal" if kind == "wolt" else "s1", "k3") == settled[0]
+    assert usage(tmp_path)[inc] == (3, 6, 4)
+    with pytest.raises(inbox.Refused, match="no_target" if how == "delete" else "target_ended"):
+        auth.transition(inc, binding.revision + 1, status="running", readiness="running")
+    if how == "delete":  # the name again is a new session: none of the old mail moves to it
+        again = enroll(auth, "s1")
+        assert again.incarnation != inc
+        auth.admit("k5", "session-name", "s1", "new")
+        assert rows(tmp_path, "SELECT key FROM inbox_messages WHERE recipient=?", again.incarnation) == [
+            ("k5",)]
+        assert auth.store.claim(inc, "conv-s1", "g1") is None
+
+
+def test_a_call_in_flight_when_its_session_changes_is_uncertain_and_its_late_answer_stale(tmp_path):
+    auth = authority(tmp_path)
+    binding = enroll(auth, "s1")
+    auth.admit("k1", "wolt", "pal", "hi")
+    attempt = auth.store.claim(binding.incarnation, "conv-s1", "g1")
+    _, settled = auth.transition(binding.incarnation, 1, status=sessions.STOPPING, readiness="unknown")
+    assert [(s.state, s.reason) for s in settled] == [("uncertain", "target_changed")]
+    with pytest.raises(inbox.Stale):
+        auth.store.record(attempt, inbox.Outcome.ACCEPTED)
+    assert rows(tmp_path, "SELECT outcome FROM inbox_attempts") == [("unknown",)]
+    assert state(tmp_path, "k1") == [("uncertain", "target_changed", 1, 0)]
+    auth.transition(binding.incarnation, 2, status="running", readiness="running")
+    assert auth.store.claim(binding.incarnation, "conv-s1", "g1") is None  # never sent again
+
+
+def test_an_unsettled_binding_change_refuses_the_answer_and_reconcile_settles_it(tmp_path):
+    auth = authority(tmp_path)
+    binding = enroll(auth, "s1")
+    auth.admit("k1", "wolt", "pal", "hi")
+    attempt = auth.store.claim(binding.incarnation, "conv-s1", "g1")
+    delete_row(tmp_path)  # a legacy writer, not the authority
+    with pytest.raises(inbox.Stale):
+        auth.store.record(attempt, inbox.Outcome.ACCEPTED)
+    assert state(tmp_path, "k1") == [("attempting", None, 1, 0)]  # the body stays
+    auth.store.reconcile()
+    assert state(tmp_path, "k1") == [("uncertain", "interrupted", 1, 0)]
+
+
+@pytest.mark.parametrize("first", ["admit", "end"])
+def test_admission_and_end_in_two_processes_take_the_lock_in_turn(tmp_path, first):
+    auth = authority(tmp_path)
+    binding = enroll(auth, "s1")
+    admit = ("admit", ["k1", "session-name", "s1", "hi"], {})
+    stop = ("transition", [binding.incarnation, 1], dict(status="stopped", readiness="unknown"))
+    results = ordered(*((admit, stop) if first == "admit" else (stop, admit)), tmp_path / "pause", tmp_path)
+    admitted, ended = results if first == "admit" else results[::-1]
+    assert "ok" in ended
+    if first == "admit":
+        assert admitted["ok"]["state"] == "queued"
+        assert ended["ok"][1][0]["key"] == "k1"
+        assert state(tmp_path, "k1") == [("blocked", "target_ended", 0, 0)]
+        assert usage(tmp_path)[binding.incarnation] == (1, 2, 1)
+    else:
+        assert admitted == {"refused": "target_ended"}
+        assert written(tmp_path) == [0, 0, 0]
+    assert rows(tmp_path, "SELECT status, inbox_revision FROM sessions") == [("stopped", 2)]

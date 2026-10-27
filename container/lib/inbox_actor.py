@@ -16,6 +16,10 @@ the Coordinator only remembers which conversations to wake.
 The adapter is `async (inbox.Attempt) -> inbox.Outcome`; anything else it
 returns or raises is UNKNOWN, since the call may have reached the agent.
 
+With an inbox_binding.Authority on the same store, bound admission and
+lifecycle changes go through the Coordinator too: it wakes the session the
+store bound the mail to and publishes what a change settled, after commit.
+
 A storage failure halts every actor: no new claim until a new Coordinator,
 started once the store is back and this one is stopped, has reconciled what
 was left attempting (to uncertain, never sent again).
@@ -47,8 +51,10 @@ class Halted(inbox.InboxError):
 
 class Coordinator:
     def __init__(self, store: inbox.Store, adapter, *, generation: str, overdue_after: float,
-                 clock=time.monotonic, observer=None):
-        self.store, self.adapter = store, adapter
+                 clock=time.monotonic, observer=None, authority=None):
+        if authority is not None and authority.store is not store:
+            raise inbox.InboxError("the authority keeps another store")
+        self.store, self.adapter, self.authority = store, adapter, authority
         self.generation = inbox._text(generation, store.limits.name_chars, "generation")
         self.overdue_after, self.clock, self.observer = overdue_after, clock, observer
         self.halted: inbox.InboxError | None = None
@@ -95,6 +101,28 @@ class Coordinator:
         self._wake((recipient, conversation))
         return status
 
+    def bound_admit(self, key: str, kind: str, address: str, body: str) -> inbox.Status:
+        """Admit through the authority (inbox_binding); a retry wakes where the
+        original was bound."""
+        status = self._guard(self.authority.admit, key, kind, address, body)
+        self._wake((status.recipient, status.conversation))
+        return status
+
+    def transition(self, incarnation: str, revision: int, **change):
+        """Authority.transition, then publish what it settled and wake the
+        session's mail (a claim checks whether it may go)."""
+        binding, settled = self._guard(self.authority.transition, incarnation, revision, **change)
+        for status in settled:
+            self._publish(status)
+        self._wake((binding.incarnation, binding.conversation))
+        return binding
+
+    def delete(self, incarnation: str, revision: int) -> list[inbox.Status]:
+        settled = self._guard(self.authority.delete, incarnation, revision)
+        for status in settled:
+            self._publish(status)
+        return settled
+
     def status(self, key: str) -> inbox.Status | None:
         return self._guard(self.store.status, key)
 
@@ -131,10 +159,10 @@ class Coordinator:
 
     # -- the actors -----------------------------------------------------------
 
-    def _guard(self, operation, *args):
+    def _guard(self, operation, *args, **kwargs):
         """Any store failure, a caller's read included, halts dispatch."""
         try:
-            return operation(*args)
+            return operation(*args, **kwargs)
         except inbox.Unavailable as exc:
             self._halt(exc)
             raise

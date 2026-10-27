@@ -2,6 +2,7 @@
 engine, enrolled sessions, and (run as a script) one store call in a process of its own."""
 
 import asyncio
+import dataclasses
 import json
 import subprocess
 import sqlite3
@@ -170,7 +171,7 @@ def _child(root, spec, pause):
     auth = authority(root, **over)
     try:
         result = getattr(auth, name)(*args, **kwargs)
-        print(json.dumps({"ok": list(vars(result).values())}))
+        print(json.dumps({"ok": result}, default=dataclasses.asdict))
     except inbox.Refused as exc:
         print(json.dumps({"refused": exc.code}))
     except inbox.InboxError as exc:

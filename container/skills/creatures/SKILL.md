@@ -22,7 +22,7 @@ will change and wait for a yes. That includes changing **your own** creature.
 For example:
 
 > I'll register ⭐ star (raccoon-sized, codex model gpt-6-astra) and make
-> nova a star. Its next session will show ⭐; this session stays as it is.
+> alpha a star. Its next session will show ⭐; this session stays as it is.
 > Go?
 
 ## Commands
@@ -31,7 +31,7 @@ For example:
 woltspace creature list                     # the sizes and the lodge's custom creatures
 woltspace creature add star --emoji ⭐ --size raccoon \
   --model codex=gpt-6-astra --role "Reviewer and planner"
-woltspace creature assign nova star         # change a wolt's creature
+woltspace creature assign alpha star        # change a wolt's creature
 woltspace creature rm star                   # only when no wolt is one
 ```
 

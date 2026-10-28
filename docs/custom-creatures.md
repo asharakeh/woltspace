@@ -14,7 +14,7 @@ when you register one.
 
 ```bash
 woltspace creature add star --emoji ⭐ --size raccoon --model codex=gpt-6-astra
-woltspace creature assign nova star
+woltspace creature assign alpha star
 woltspace creature list
 woltspace creature rm star        # only once no wolt is a star
 ```
@@ -58,7 +58,7 @@ In the lodge's `woltspace.json`, next to the singleton bookkeeping:
 
 ```json
 "creatures": {
-  "active_wolf": "howlie",
+  "active_wolf": "clockwork",
   "custom": {
     "star": {"emoji": "⭐", "size": "raccoon", "models": {"codex": "gpt-6-astra"}}
   }

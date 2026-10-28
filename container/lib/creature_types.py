@@ -11,7 +11,7 @@ The owner's custom creatures live in the lodge's woltspace.json, next to the
 singleton bookkeeping that already sits in "creatures":
 
     "creatures": {
-      "active_wolf": "howlie",
+      "active_wolf": "clockwork",
       "custom": {
         "star": {"emoji": "⭐", "size": "raccoon",
                  "models": {"codex": "gpt-6-astra"}, "role": "..."}

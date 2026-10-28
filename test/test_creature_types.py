@@ -34,7 +34,7 @@ def lodge(tmp_path, monkeypatch):
     monkeypatch.setenv("WOLTSPACE_WOLTS_DIR", str(tmp_path))
     (tmp_path / "woltspace.json").write_text(json.dumps({
         "harness": {"default": "claude"},
-        "creatures": {"active_wolf": "howlie"},
+        "creatures": {"active_wolf": "beta"},
     }))
     return tmp_path
 
@@ -139,7 +139,7 @@ def test_invalid_creatures_are_refused_without_touching_settings(lodge, cid, ent
 def test_add_keeps_every_other_setting_and_refuses_overwrite(lodge):
     add_custom("star", STAR)
     settings = _settings(lodge)
-    assert settings["creatures"]["active_wolf"] == "howlie"
+    assert settings["creatures"]["active_wolf"] == "beta"
     assert settings["harness"] == {"default": "claude"}
     assert settings["creatures"]["custom"]["star"]["size"] == "raccoon"
     with pytest.raises(ValueError, match="already exists"):
@@ -156,14 +156,14 @@ def test_an_unreadable_settings_file_is_never_replaced(lodge):
 
 def test_remove_refuses_a_creature_a_wolt_still_is(lodge):
     add_custom("star", STAR)
-    _wolt(lodge, "nova", type="star")
-    with pytest.raises(ValueError, match="nova"):
+    _wolt(lodge, "alpha", type="star")
+    with pytest.raises(ValueError, match="alpha"):
         remove_custom("star")
     assert "star" in custom_creatures()
-    (lodge / "nova" / "wolt" / "wolt.json").write_text(json.dumps({"name": "nova", "type": "raccoon"}))
+    (lodge / "alpha" / "wolt" / "wolt.json").write_text(json.dumps({"name": "alpha", "type": "raccoon"}))
     remove_custom("star")
     assert "star" not in custom_creatures()
-    assert _settings(lodge)["creatures"]["active_wolf"] == "howlie"
+    assert _settings(lodge)["creatures"]["active_wolf"] == "beta"
 
 
 # --- creating a wolt of a custom creature ---------------------------------
@@ -174,12 +174,12 @@ def test_create_a_custom_creature_wolt_gets_a_site_its_role_and_base_lore(lodge)
     add_custom("star", STAR)
     with patch("wolts.WOLTS_DIR", lodge), patch("wolts.setup_wolt_claude_config"), \
             patch("wolts.subprocess.run"):
-        wolts.create_creature_wolt("nova", "star")
-    cfg = json.loads((lodge / "nova" / "wolt" / "wolt.json").read_text())
+        wolts.create_creature_wolt("alpha", "star")
+    cfg = json.loads((lodge / "alpha" / "wolt" / "wolt.json").read_text())
     assert cfg["type"] == "star" and cfg["role"] == "Reviewer"
-    index = (lodge / "nova" / "wolt" / "site" / "index.html").read_text()
+    index = (lodge / "alpha" / "wolt" / "site" / "index.html").read_text()
     assert "⭐" in index
-    claude_md = (lodge / "nova" / "CLAUDE.md").read_text()
+    claude_md = (lodge / "alpha" / "CLAUDE.md").read_text()
     assert "raccoon-sized: it works like a raccoon" in claude_md
     assert "## Native wolts" in claude_md  # the platform lore every wolt boots with
 
@@ -209,56 +209,56 @@ def test_api_add_list_remove(client, lodge):
 
 def test_assign_changes_only_the_type_and_reports_what_the_wolt_keeps(client, lodge):
     add_custom("star", STAR)
-    path = _wolt(lodge, "nova", type="raccoon", role="Planner", harness="codex", model="gpt-6-astra")
-    r = client.post("/wolts/nova/creature", json={"type": "star"})
+    path = _wolt(lodge, "alpha", type="raccoon", role="Planner", harness="codex", model="gpt-6-astra")
+    r = client.post("/wolts/alpha/creature", json={"type": "star"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["emoji"] == "⭐" and body["previous_type"] == "raccoon"
     assert body["kept"] == {"harness": "codex", "model": "gpt-6-astra", "role": "Planner"}
     assert body["applies"] == "next session"
     cfg = json.loads(path.read_text())
-    assert cfg == {"name": "nova", "type": "star", "role": "Planner",
+    assert cfg == {"name": "alpha", "type": "star", "role": "Planner",
                    "harness": "codex", "model": "gpt-6-astra"}
 
 
 def test_assign_without_a_pin_uses_the_creatures_model(client, lodge):
     add_custom("star", STAR)
-    _wolt(lodge, "nova", type="raccoon", harness="codex")
-    body = client.post("/wolts/nova/creature", json={"type": "star"}).json()
+    _wolt(lodge, "alpha", type="raccoon", harness="codex")
+    body = client.post("/wolts/alpha/creature", json={"type": "star"}).json()
     assert body["model"] == "gpt-5.5"
 
 
 def test_assign_follows_a_starter_site_emoji_but_not_a_chosen_one(client, lodge):
     add_custom("star", STAR)
-    _wolt(lodge, "nova", type="raccoon")
+    _wolt(lodge, "alpha", type="raccoon")
     _wolt(lodge, "kit", type="raccoon")
-    for name, emoji in (("nova", "🦝"), ("kit", "🦊")):
+    for name, emoji in (("alpha", "🦝"), ("kit", "🦊")):
         site = lodge / name / "wolt" / "site"
         site.mkdir()
         (site / "site.json").write_text(json.dumps({"title": name, "tokens": {"emoji": emoji}}))
-    assert client.post("/wolts/nova/creature", json={"type": "star"}).json()["site_emoji_updated"]
+    assert client.post("/wolts/alpha/creature", json={"type": "star"}).json()["site_emoji_updated"]
     assert not client.post("/wolts/kit/creature", json={"type": "star"}).json()["site_emoji_updated"]
-    assert json.loads((lodge / "nova/wolt/site/site.json").read_text())["tokens"]["emoji"] == "⭐"
+    assert json.loads((lodge / "alpha/wolt/site/site.json").read_text())["tokens"]["emoji"] == "⭐"
     assert json.loads((lodge / "kit/wolt/site/site.json").read_text())["tokens"]["emoji"] == "🦊"
 
 
 def test_assign_refuses_unknown_types_and_leaves_wolf_and_dog_alone(client, lodge):
-    _wolt(lodge, "howlie", type="wolf")
-    path = _wolt(lodge, "nova", type="raccoon")
+    _wolt(lodge, "beta", type="wolf")
+    path = _wolt(lodge, "alpha", type="raccoon")
     before = path.read_bytes()
-    assert client.post("/wolts/nova/creature", json={"type": "dragon"}).status_code == 400
-    assert client.post("/wolts/nova/creature", json={"type": "wolf"}).status_code == 400
-    assert client.post("/wolts/howlie/creature", json={"type": "beaver"}).status_code == 400
+    assert client.post("/wolts/alpha/creature", json={"type": "dragon"}).status_code == 400
+    assert client.post("/wolts/alpha/creature", json={"type": "wolf"}).status_code == 400
+    assert client.post("/wolts/beta/creature", json={"type": "beaver"}).status_code == 400
     assert path.read_bytes() == before
 
 
 def test_wolts_list_shows_the_custom_emoji_and_base_type(client, lodge):
     add_custom("star", STAR)
-    _wolt(lodge, "nova", type="star")
-    _wolt(lodge, "uxwolt", type="raccoon")
+    _wolt(lodge, "alpha", type="star")
+    _wolt(lodge, "pal", type="raccoon")
     by_name = {w["name"]: w for w in client.get("/wolts").json()}
-    assert (by_name["nova"]["emoji"], by_name["nova"]["base_type"]) == ("⭐", "raccoon")
-    assert (by_name["uxwolt"]["emoji"], by_name["uxwolt"]["base_type"]) == ("🦝", "raccoon")
+    assert (by_name["alpha"]["emoji"], by_name["alpha"]["base_type"]) == ("⭐", "raccoon")
+    assert (by_name["pal"]["emoji"], by_name["pal"]["base_type"]) == ("🦝", "raccoon")
 
 
 def test_lodge_create_route_accepts_a_custom_creature(client, lodge, monkeypatch):
@@ -268,10 +268,10 @@ def test_lodge_create_route_accepts_a_custom_creature(client, lodge, monkeypatch
     made = {}
     monkeypatch.setattr(server_app, "harness_install_problem", lambda *a, **k: None)
     monkeypatch.setattr("wolts.create_creature_wolt", lambda name, t, **k: made.update(name=name, type=t))
-    monkeypatch.setattr(server_app, "start_session", lambda **k: {"name": "nova-x"})
-    r = client.post("/sessions/new/create", json={"name": "nova", "type": "star"})
+    monkeypatch.setattr(server_app, "start_session", lambda **k: {"name": "alpha-x"})
+    r = client.post("/sessions/new/create", json={"name": "alpha", "type": "star"})
     assert r.status_code == 200, r.text
-    assert made == {"name": "nova", "type": "star"}
+    assert made == {"name": "alpha", "type": "star"}
     assert client.post("/sessions/new/create", json={"name": "rex", "type": "dragon"}).status_code == 400
 
 
@@ -290,10 +290,10 @@ def test_a_running_session_keeps_its_model_and_the_next_one_gets_the_change(
     monkeypatch.setattr(paths, "WOLTS_DIR", lodge)
     monkeypatch.setenv("WOLTSPACE_ISOLATION", "host")
     add_custom("quick", {"emoji": "⚡", "size": "otter"})
-    path = _wolt(lodge, "nova", type="raccoon", harness="claude", role="Planner")
-    (lodge / "nova" / "wolt" / "site").mkdir()
+    path = _wolt(lodge, "alpha", type="raccoon", harness="claude", role="Planner")
+    (lodge / "alpha" / "wolt" / "site").mkdir()
 
-    running = sessions.start_session(wolt="nova")
+    running = sessions.start_session(wolt="alpha")
     sessions.prepare_session_command(running["name"], "spawn")  # stamps the conversation id
     raccoon_model = tier_default_model("claude", "raccoon")
     assert running["model"] == raccoon_model
@@ -307,7 +307,7 @@ def test_a_running_session_keeps_its_model_and_the_next_one_gets_the_change(
     record = sessions.SessionRegistry(lodge).get(running["name"], check_alive=False)
     assert (record["creature"], record["model"]) == ("raccoon", raccoon_model)
     assert json.loads(path.read_text())["role"] == "Planner"  # the wolt's role is its own
-    following = sessions.start_session(wolt="nova")
+    following = sessions.start_session(wolt="alpha")
     assert following["model"] == tier_default_model("claude", "otter") != raccoon_model
     assert following["creature"] == "quick"
 
@@ -350,11 +350,11 @@ def test_removing_a_creature_waits_for_an_assignment_in_flight(client, lodge, mo
     from server import app as server_app
 
     add_custom("star", STAR)
-    _wolt(lodge, "nova", type="raccoon")
+    _wolt(lodge, "alpha", type="raccoon")
     wrapped, inside, release = _paused(server_app._write_wolt_settings)
     monkeypatch.setattr(server_app, "_write_wolt_settings", wrapped)
 
-    assign, _ = _run(server_app._assign_creature, "nova", "star")
+    assign, _ = _run(server_app._assign_creature, "alpha", "star")
     assert inside.wait(5)
     remove, removed = _run(remove_custom, "star")
     remove.join(0.3)
@@ -362,7 +362,7 @@ def test_removing_a_creature_waits_for_an_assignment_in_flight(client, lodge, mo
     release.set()
     assign.join(5)
     remove.join(5)
-    assert "still the creature of: nova" in str(removed["error"])
+    assert "still the creature of: alpha" in str(removed["error"])
     assert "star" in custom_creatures()
 
 
@@ -388,13 +388,13 @@ def test_assignment_and_a_settings_change_both_land(client, lodge, monkeypatch):
     from server import app as server_app
 
     add_custom("star", STAR)
-    path = _wolt(lodge, "nova", type="raccoon", harness="codex")
+    path = _wolt(lodge, "alpha", type="raccoon", harness="codex")
     wrapped, inside, release = _paused(server_app._write_wolt_settings)
     monkeypatch.setattr(server_app, "_write_wolt_settings", wrapped)
 
-    assign, _ = _run(server_app._assign_creature, "nova", "star")
+    assign, _ = _run(server_app._assign_creature, "alpha", "star")
     assert inside.wait(5)
-    patch_, _ = _run(server_app._update_wolt_settings, "nova", {"model": "gpt-5.6-sol"})
+    patch_, _ = _run(server_app._update_wolt_settings, "alpha", {"model": "gpt-5.6-sol"})
     patch_.join(0.3)
     assert patch_.is_alive()
     release.set()
@@ -409,25 +409,57 @@ def test_two_assignments_leave_the_site_with_the_last_creatures_emoji(client, lo
 
     add_custom("star", STAR)
     add_custom("quick", {"emoji": "⚡", "size": "otter"})
-    _wolt(lodge, "nova", type="raccoon")
-    site = lodge / "nova" / "wolt" / "site"
+    _wolt(lodge, "alpha", type="raccoon")
+    site = lodge / "alpha" / "wolt" / "site"
     site.mkdir()
     (site / "site.json").write_text(json.dumps({"tokens": {"emoji": "🦝"}}))
     wrapped, inside, release = _paused(server_app._follow_site_emoji)
     monkeypatch.setattr(server_app, "_follow_site_emoji", wrapped)
 
-    first, _ = _run(server_app._assign_creature, "nova", "star")
+    first, _ = _run(server_app._assign_creature, "alpha", "star")
     assert inside.wait(5)
-    second, _ = _run(server_app._assign_creature, "nova", "quick")
+    second, _ = _run(server_app._assign_creature, "alpha", "quick")
     second.join(0.3)
     assert second.is_alive()
     release.set()
     first.join(5)
     second.join(5)
-    assert json.loads((lodge / "nova/wolt/wolt.json").read_text())["type"] == "quick"
+    assert json.loads((lodge / "alpha/wolt/wolt.json").read_text())["type"] == "quick"
     assert json.loads((site / "site.json").read_text())["tokens"]["emoji"] == "⚡"
 
 
 def test_a_name_a_page_keeps_its_own_emoji_for_is_reserved(lodge):
     with pytest.raises(ValueError, match="built-in"):
         add_custom("eagle", STAR)
+
+
+@pytest.mark.parametrize("failure", ["replace", "serialize"])
+def test_failed_custom_settings_write_keeps_bytes_and_releases_lock(lodge, monkeypatch, failure):
+    import settings_files
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = lodge / "woltspace.json"
+    before = path.read_bytes()
+    with monkeypatch.context() as scoped:
+        if failure == "replace":
+            def refuse_replace(*args):
+                raise OSError("dummy replacement failure")
+            scoped.setattr(settings_files.os, "replace", refuse_replace)
+            expected = OSError
+        else:
+            def refuse_serialization(*args, **kwargs):
+                raise TypeError("dummy serialization failure")
+            scoped.setattr(settings_files.json, "dumps", refuse_serialization)
+            expected = TypeError
+        with pytest.raises(expected):
+            add_custom("star", STAR)
+    assert path.read_bytes() == before
+    assert not list(lodge.glob(".woltspace.json.*.tmp"))
+    # A different thread must acquire the flock after the failed writer exits.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(add_custom, "star", STAR).result(timeout=5)
+    assert custom_creatures()["star"]["emoji"] == "⭐"
+    assert _settings(lodge)["harness"] == {"default": "claude"}
+    remove_custom("star")
+    assert "star" not in custom_creatures()
+    assert _settings(lodge)["creatures"]["active_wolf"] == "beta"

@@ -74,7 +74,7 @@ test('the lodge engine picker and card use the same precedence', () => {
 
 test('the wolves page shows a custom creature with its emoji', () => {
   const emoji = (WOLTS, EMOJI_BY_TYPE) => pageExpression('wolves.js', 'const EMOJI =', { WOLTS, EMOJI_BY_TYPE }, 'EMOJI');
-  const shown = emoji([{ name: 'nova', type: 'star', emoji: '⭐' }, { name: 'ux', type: 'raccoon', emoji: '🦝' },
+  const shown = emoji([{ name: 'alpha', type: 'star', emoji: '⭐' }, { name: 'ux', type: 'raccoon', emoji: '🦝' },
     { name: 'old', type: 'spider' }], { raccoon: '🦝' });
-  assert.deepEqual({ ...shown }, { nova: '⭐', ux: '🦝', old: '🐾' });
+  assert.deepEqual({ ...shown }, { alpha: '⭐', ux: '🦝', old: '🐾' });
 });

@@ -355,6 +355,20 @@ def test_a_relaunched_or_stopped_session_holds_its_claim_while_other_mail_moves(
             store.fetch(token)
 
 
+def test_a_status_read_is_one_snapshot_with_its_reader_check(tmp_path, store, monkeypatch):
+    token = reader(store, "s1")
+    real = inbox.Store._reader
+
+    def checked_then_changed(conn, hashed):
+        found = real(conn, hashed)
+        store.admit("ops", "late", "pal", "x")  # another writer commits right after the check
+        session(tmp_path, "s1", status="stopped")
+        return found
+
+    monkeypatch.setattr(inbox.Store, "_reader", staticmethod(checked_then_changed))
+    assert store.status(token)["queued"] == 0  # what the checked snapshot held, nothing later
+
+
 def test_a_reader_sends_as_its_own_wolt_and_reads_only_its_mailbox(store):
     pal, nunu = reader(store, "s1"), reader(store, "s2", "nunu")
     sent = store.send(pal, "nunu", "k1", "hi")

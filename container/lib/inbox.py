@@ -296,6 +296,7 @@ class Store:
         Without: how many messages its mailbox holds in each state. Reads only."""
         reader, cutoff = _hash(token), time.time() - RETAIN_SECONDS
         with self._read() as conn:
+            conn.execute("BEGIN")  # one snapshot: the reader is checked in the read it allows
             mailbox, _ = self._reader(conn, reader)
             if key is not None:
                 return self._status(conn, f"m.sender=? AND m.key=? AND NOT ({_EXPIRED})",

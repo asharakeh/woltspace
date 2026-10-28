@@ -392,6 +392,19 @@ def test_archive_blocks_mail_and_claims_and_close_waits_for_custody(tmp_path, st
         store.admit("ops", "a", "pal", "a")  # its key is bound to the closed mailbox
 
 
+def test_a_recreated_sender_starts_its_own_key_namespace(tmp_path, store):
+    old = reader(store, "s1")
+    first = store.send(old, "nunu", "k1", "one")
+    store.set_state("pal", "closed")  # nothing waits in pal's own mailbox
+    new = reader(store, "s2")  # the name again: a new mailbox, a new sender id
+    second = store.send(new, "nunu", "k1", "two")  # the same key is new mail
+    assert (second.seq != first.seq, second.state, store.status(new, "k1")) == (True, "queued", second)
+    assert rows(tmp_path, "SELECT sender, sender_name, key, body FROM inbox_messages ORDER BY seq") == [
+        ("mailbox:1", "pal", "k1", b"one"), ("mailbox:3", "pal", "k1", b"two")]
+    with pytest.raises(inbox.Refused, match="reader_invalid"):
+        store.send(old, "nunu", "k2", "x")
+
+
 def test_acknowledged_metadata_goes_30_days_after_the_first_ack_and_nothing_else(tmp_path, store, monkeypatch):
     token = reader(store, "s1")
     for key in "abcd":

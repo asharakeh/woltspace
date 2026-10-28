@@ -45,8 +45,9 @@ def test_a_retry_returns_the_original_and_a_changed_one_conflicts(tmp_path, stor
     before = (rows(tmp_path, "SELECT * FROM inbox_events"), usage(tmp_path))
     assert store.admit("ops", "k1", "pal", "héllo") == first
     for changed in (("nunu", "héllo"), ("pal", "hello"), ("pal", "héllo ")):
-        with pytest.raises(inbox.Conflict):
+        with pytest.raises(inbox.Conflict) as conflict:
             store.admit("ops", "k1", *changed)
+        assert str(conflict.value) == "conflict"
     with pytest.raises(inbox.Conflict):
         store.admit("ops", "k1", "pal", "héllo", human=True)
     assert (rows(tmp_path, "SELECT * FROM inbox_events"), usage(tmp_path)) == before
@@ -346,10 +347,12 @@ def test_a_relaunched_or_stopped_session_holds_its_claim_while_other_mail_moves(
     assert store.status(new) == {"queued": 0, "claimed": 0, "held": 1, "acknowledged": 0}
     store.admit("owner", "h", "pal", "h", human=True)
     assert store.fetch(new).body == "h"  # held mail is not reassigned
-    stopped = reader(store, "s3")
+    stopped, moved = reader(store, "s3"), reader(store, "s4")
     session(tmp_path, "s3", status="stopped")
-    with pytest.raises(inbox.Refused, match="reader_invalid"):
-        store.fetch(stopped)
+    session(tmp_path, "s4", wolt="nunu")  # the row now names another wolt
+    for token in (stopped, moved):
+        with pytest.raises(inbox.Refused, match="reader_invalid"):
+            store.fetch(token)
 
 
 def test_a_reader_sends_as_its_own_wolt_and_reads_only_its_mailbox(store):

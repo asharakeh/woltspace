@@ -48,7 +48,7 @@ _MAX_INT = 2**63 - 1  # SQLite's INTEGER
 # A reader that may act now; binds ? to its hash.
 _VALID = ("SELECT r.mailbox, b.wolt FROM inbox_readers r JOIN inbox_mailboxes b ON b.id = r.mailbox"
           " JOIN sessions s ON s.name = r.session WHERE r.hash = ? AND r.revoked = 0"
-          " AND b.state = 'open' AND s.status = 'running'")
+          " AND b.state = 'open' AND s.status = 'running' AND s.wolt = b.wolt")
 
 
 def enabled(wolts_dir) -> bool:
@@ -337,7 +337,7 @@ class Store:
                 if ((row["mailbox"], row["priority"], row["size"], row["digest"])
                         != (current and current[0], priority, len(payload), digest)
                         or row["body"] is not None and row["body"] != payload):
-                    raise Conflict(key)
+                    raise Conflict("conflict")  # fixed: the key is the caller's text
                 return self._status(conn, "m.seq=?", (row["seq"],))
             mailbox = self._mailbox(conn, to, create=True)
             lodge, mine = self._usage(conn, ""), self._usage(conn, str(mailbox))

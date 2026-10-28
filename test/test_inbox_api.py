@@ -124,6 +124,8 @@ def test_the_cli_sends_fetches_and_acks_through_a_real_server(tmp_path, store, s
     assert json.loads(_cli(server, "fetch", token=nunu).stdout) is None
     refused = _cli(server, "ack", str(first["seq"]), str(first["claim"]), token=pal)
     assert (refused.returncode, refused.stderr.strip()) == (1, "woltspace inbox ack: stale_claim")
+    empty = _cli(server, "status", "--key", "", token=pal)  # a supplied key is checked, even empty
+    assert (empty.returncode, empty.stderr.strip()) == (1, "woltspace inbox status: invalid")
     missing = _cli(server, "fetch")
     assert (missing.returncode, missing.stderr.strip()) == (2, "woltspace: this session has no inbox reader")
     logged = caplog.text

@@ -1217,7 +1217,9 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 # changed. Such a copy is refused before anything in it is touched, and stays
 # as extracted for a person to reconcile. Only an offline copy is supported.
 # Mailboxes, usage, events and sequences alone restore as they are (ids are
-# never reused); every reader is revoked in the disarm write.
+# never reused); every reader is revoked in the disarm write. No clock here:
+# an acknowledged row past its 30 days still refuses until the lodge's next
+# inbox write prunes it.
 _KNOWN_SCHEMA = 5  # lodge_db's newest migration this check understands
 # The inbox tables exactly as lodge_db's migration 5 makes them; any other
 # layout (a table or column more or less) is one this check cannot read.

@@ -2,11 +2,12 @@
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from inbox_support import limits, reader, rows, session
+from inbox_support import acked, limits, reader, rows, session
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -113,3 +114,23 @@ def test_a_lodge_whose_inbox_holds_no_mail_restores_and_its_old_readers_stay_dea
     session(restored, "s1")  # running again later, as a resumed session would be
     with pytest.raises(inbox.Refused, match="reader_invalid"):
         inbox.Store(restored, limits()).fetch(token)
+
+
+def test_mail_acknowledged_more_than_30_days_ago_no_longer_blocks_a_restore(tmp_path, monkeypatch):
+    source = lodge(tmp_path / "wolts", mail=False)
+    store = inbox.Store(source, limits())
+    token = reader(store, "s1")
+    store.send(token, "pal", "k", "x")
+    acked(store, token)
+    later = time.time() + inbox.RETAIN_SECONDS + 1
+    monkeypatch.setattr(inbox.time, "time", lambda: later)
+    expired = backup.create_backup(source, out_dir=tmp_path / "out1").archive
+    with pytest.raises(backup.RestoreRefused, match="safe_state_present"):  # not pruned yet: no clock here
+        backup.restore_backup(expired, to=tmp_path / "back1")
+    assert store.fetch(token) is None  # an ordinary, successful write: the expired receipt goes
+    archive = backup.create_backup(source, out_dir=tmp_path / "out2").archive
+    restored = backup.restore_backup(archive, to=tmp_path / "back2").wolts_dir
+    assert rows(restored, "SELECT id, state, revoked FROM inbox_mailboxes, inbox_readers") == [(1, "open", 1)]
+    assert rows(restored, "SELECT scope, pending, bytes, keys FROM inbox_usage ORDER BY 1") == [
+        ("", 0, 0, 0), ("1", 0, 0, 0)]
+    assert rows(restored, "SELECT seq FROM sqlite_sequence WHERE name='inbox_messages'") == [(1,)]

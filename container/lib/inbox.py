@@ -278,7 +278,6 @@ class Store:
         freed and the event written, in one commit. Again: no change."""
         reader, now = _hash(token), time.time()
         with self._write() as conn:
-            self._prune(conn, now)  # an expired receipt is unknown, never acknowledged again
             row = self._claimed(conn, reader, seq, claim, ("claimed", "acknowledged"))
             if row["state"] == "claimed":
                 conn.execute("UPDATE inbox_messages SET state='acknowledged', body=NULL, acked_at=?"
@@ -342,7 +341,6 @@ class Store:
         digest, now = hashlib.sha256(payload).digest(), time.time()
         with self._write() as conn:
             sender, name = sender_of(conn)
-            self._prune(conn, now)
             row = conn.execute("SELECT * FROM inbox_messages WHERE sender=? AND key=?", (sender, key)).fetchone()
             if row is not None:
                 current = conn.execute("SELECT id FROM inbox_mailboxes WHERE wolt=? AND state != 'closed'",
@@ -428,8 +426,11 @@ class Store:
 
     @contextmanager
     def _write(self):
+        """Every durable write first drops what has expired: an expired
+        receipt is unknown from then on, never acknowledged again."""
         try:
             with lodge_db.write(self.root, durable=True, busy_ms=self.limits.busy_ms) as conn:
+                self._prune(conn, time.time())
                 yield conn
         except (sqlite3.Error, OSError) as exc:
             raise _unavailable(exc) from None

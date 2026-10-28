@@ -217,7 +217,7 @@ def cmd_inbox(args):
         body = {"to": args.to, "key": args.key, "text": sys.stdin.read()}
     elif args.verb in ("ack", "release"):
         body = {"seq": args.seq, "claim": args.claim}
-    elif args.verb == "status" and args.key:
+    elif args.verb == "status" and args.key is not None:
         body = {"key": args.key}
     status, result = _req("POST", f"/inbox/{args.verb}", body, headers={"X-Woltspace-Inbox-Token": token})
     if not result.get("ok"):

@@ -2564,7 +2564,9 @@ def cli():
             try:
                 if data is None:
                     raise inbox.Refused("no_session")
-                print(inbox.Store(reg.wolts_dir, inbox.LIMITS).grant(args[1], data["wolt"]))
+                token = inbox.Store(reg.wolts_dir, inbox.LIMITS).grant(args[1], data["wolt"] or "")
+                if token:  # none for a wolt that cannot have a mailbox
+                    print(token)
             except inbox.InboxError as exc:
                 print(f"inbox-grant: {exc.code}", file=sys.stderr)
                 sys.exit(1)

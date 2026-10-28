@@ -381,6 +381,9 @@ def test_a_reader_sends_as_its_own_wolt_and_reads_only_its_mailbox(store):
     for bad in ("", "short", None, "t" * 43):
         with pytest.raises(inbox.Refused, match="reader_invalid"):
             store.send(bad, "nunu", "k3", "hi")
+    for key in (7, "", "k" * 41):
+        with pytest.raises(inbox.Invalid):
+            store.status(pal, key)
 
 
 def test_archive_blocks_mail_and_claims_and_close_waits_for_custody(tmp_path, store):

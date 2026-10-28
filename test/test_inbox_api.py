@@ -88,6 +88,7 @@ def test_routes_take_only_a_reader_and_their_own_fields(tmp_path, store, client)
             ("send", token, dict(to="nunu", key="k", text=BODY, sender="owner"), (400, "invalid")),
             ("ack", token, dict(seq="1", claim=1), (400, "invalid")),
             ("ack", token, dict(seq=1, claim=1), (409, "stale_claim")),
+            ("status", token, dict(key=7), (400, "invalid")),
             ("purge", token, {}, (404, "unsupported"))):
         status, answer = call(client, verb, token_, **body)
         assert (status, answer) == (expect[0], {"error": expect[1]})
@@ -147,6 +148,9 @@ def test_the_launchers_grant_is_fresh_per_session_and_absent_while_off(tmp_path,
     with pytest.raises(inbox.Refused, match="reader_invalid"):
         store.fetch(first)  # the relaunch revoked it
     assert store.fetch(second).body == BODY
+    session(tmp_path, "s1", wolt="ghost")  # now a wolt with no manifest: no mailbox, launch goes on
+    assert _session_reg(tmp_path, "inbox-grant", "s1").stdout == ""
+    assert rows(tmp_path, "SELECT count(*) FROM inbox_readers WHERE session='s1' AND revoked=0") == [(0,)]
     assert rows(tmp_path, "SELECT count(*) FROM inbox_readers WHERE hash=?", first.encode()) == [(0,)]
     missing = _session_reg(tmp_path, "inbox-grant", "nope")  # on: no row is a failure, not "off"
     assert (missing.returncode, missing.stdout, missing.stderr) == (1, "", "inbox-grant: no_session\n")
@@ -173,6 +177,11 @@ def test_the_launcher_keeps_the_token_out_of_argv_logs_and_traces(tmp_path):
     (bin_dir / "session-reg").write_text((bin_dir / "session-reg").read_text().replace("echo " + token, "true"))
     subprocess.run(["bash", str(bin_dir / "run-session.sh"), "s1"], env=env, timeout=30, check=True)
     assert (tmp_path / "out").read_text().splitlines()[0] == "unset"  # off: an inherited one is dropped
+    (bin_dir / "session-reg").write_text((bin_dir / "session-reg").read_text().replace(
+        "inbox-grant) true", "inbox-grant) echo 'inbox-grant: store_failed' >&2; exit 1"))
+    failed = subprocess.run(["bash", str(bin_dir / "run-session.sh"), "s1"], env=env, timeout=30)
+    log = (tmp_path / ".space" / "logs" / "session-boot.log").read_text()
+    assert failed.returncode != 0 and "inbox-grant: store_failed" in log  # stopped, and says why
 
 
 def test_archive_blocks_the_mailbox_and_delete_waits_for_custody(tmp_path, store, live_runtime):

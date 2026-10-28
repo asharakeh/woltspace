@@ -53,9 +53,10 @@ export WOLTSPACE_WORKDIR="$WORK_DIR"
 
 # The lodge inbox's reader for this session (none while the inbox is off):
 # only in this process's environment, never argv, logs or a trace. A grant
-# that fails stops the launch: the session's earlier readers stay unrevoked.
+# that fails stops the launch, its fixed code in the boot log: the session's
+# earlier readers stay unrevoked.
 { set +x; } 2>/dev/null
-WOLTSPACE_INBOX_TOKEN=$($SESSION_REG inbox-grant "$SESSION_NAME" 2>/dev/null)
+WOLTSPACE_INBOX_TOKEN=$($SESSION_REG inbox-grant "$SESSION_NAME")
 if [ -n "$WOLTSPACE_INBOX_TOKEN" ]; then export WOLTSPACE_INBOX_TOKEN; else unset WOLTSPACE_INBOX_TOKEN; fi
 
 # Build the agent command. On spawn this also stamps harness_session_id

@@ -1211,11 +1211,13 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
 
 
-# --- Inbox state refuses a restore ---
+# --- Inbox mail refuses a restore ---
 # Disarming rewrites sessions and drops runtime records; a copy holding inbox
-# mail, retained keys or readers would come back with that custody silently
+# mail, acknowledged keys included, would come back with that custody silently
 # changed. Such a copy is refused before anything in it is touched, and stays
 # as extracted for a person to reconcile. Only an offline copy is supported.
+# Mailboxes, usage, events and sequences alone restore as they are (ids are
+# never reused); every reader is revoked in the disarm write.
 _KNOWN_SCHEMA = 5  # lodge_db's newest migration this check understands
 # The inbox tables exactly as lodge_db's migration 5 makes them; any other
 # layout (a table or column more or less) is one this check cannot read.
@@ -1228,7 +1230,7 @@ _INBOX_COLUMNS = {
     "inbox_usage": {"scope", "pending", "bytes", "keys"},
 }
 _REFUSED = {
-    "safe_state_present": "it holds inbox mail, mailboxes or readers",
+    "safe_state_present": "it holds inbox mail",
     "safe_state_unknown": "its lodge.db could not be read as one without inbox state",
     "inspect_path_unsafe": "a path to inspect runs through a symlink or out of the copy",
 }
@@ -1283,18 +1285,16 @@ def _refuse_inbox_state(conn: sqlite3.Connection) -> None:
         raise RestoreRefused("safe_state_unknown")
     if inbox and "meta" not in tables:  # the schema floor went with it
         raise RestoreRefused("safe_state_unknown")
-    for table in sorted(inbox):  # acknowledged mail too: its key is still custody
-        if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
-            raise RestoreRefused("safe_state_present")
+    if inbox and conn.execute("SELECT 1 FROM inbox_messages LIMIT 1").fetchone():
+        raise RestoreRefused("safe_state_present")  # acknowledged too: its key is still custody
+    if inbox and conn.execute("SELECT 1 FROM inbox_usage WHERE pending OR bytes OR keys LIMIT 1").fetchone():
+        raise RestoreRefused("safe_state_unknown")  # charges without mail: drift, not restored
     if "meta" in tables:
         if conn.execute("SELECT 1 FROM meta WHERE key LIKE 'inbox:%' LIMIT 1").fetchone():
             raise RestoreRefused("safe_state_present")
         floor = conn.execute("SELECT value FROM meta WHERE key='min_schema'").fetchone()
         if floor is not None and not (str(floor[0]).isdigit() and int(floor[0]) <= _KNOWN_SCHEMA):
             raise RestoreRefused("safe_state_unknown")
-    if "sqlite_sequence" in tables and conn.execute(
-            "SELECT 1 FROM sqlite_sequence WHERE name LIKE 'inbox%' AND seq > 0 LIMIT 1").fetchone():
-        raise RestoreRefused("safe_state_unknown")  # emptied, not empty
 
 
 def _refuse_native_state(target: Path, wolts_dir: Path) -> None:
@@ -1350,6 +1350,8 @@ def _disarm_lodge_db(wolts_dir: Path, source: str, target: Path, report: dict) -
         except sqlite3.Error:
             raise RestoreRefused("safe_state_unknown") from None
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "inbox_readers" in tables:  # no reader of the old lodge reads here
+            conn.execute("UPDATE inbox_readers SET revoked=1")
         if "apps_running" in tables and {"name", "record"} <= _columns(conn, "apps_running"):
             # On the machine a backup lands on, an old pid may be any live
             # process: the lodge would take the app as running, and stopping

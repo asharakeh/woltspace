@@ -197,15 +197,21 @@ class Store:
 
     # -- readers and mailboxes, for the launcher and the lodge -----------------
 
-    def grant(self, session: str, wolt: str) -> str:
+    def grant(self, session: str, wolt: str) -> str | None:
         """Revoke the session's earlier readers and mint a new one on the
-        wolt's mailbox, in one write. The token is returned once, never stored."""
+        wolt's mailbox, in one write. The token is returned once, never stored.
+        None for a wolt that cannot have a mailbox: the revocation still holds."""
         _text(session, self.limits.name_chars, "session")
-        _text(wolt, self.limits.name_chars, "wolt")
+        _text(wolt, self.limits.name_chars, "wolt", 0)
         token = secrets.token_urlsafe(32)
         with self._write() as conn:
             conn.execute("UPDATE inbox_readers SET revoked=1 WHERE session=?", (session,))
-            mailbox = self._mailbox(conn, wolt, create=True)
+            try:
+                mailbox = self._mailbox(conn, wolt, create=True)
+            except Refused as exc:
+                if exc.code != "no_mailbox":
+                    raise
+                return None
             conn.execute("INSERT INTO inbox_readers(hash, mailbox, session, created_at) VALUES (?, ?, ?, ?)",
                          (_hash(token), mailbox, session, time.time()))
         return token
@@ -295,6 +301,8 @@ class Store:
         """With key: a message this reader's wolt sent (None when not retained).
         Without: how many messages its mailbox holds in each state. Reads only."""
         reader, cutoff = _hash(token), time.time() - RETAIN_SECONDS
+        if key is not None:
+            _text(key, self.limits.key_chars, "key")
         with self._read() as conn:
             conn.execute("BEGIN")  # one snapshot: the reader is checked in the read it allows
             mailbox, _ = self._reader(conn, reader)
@@ -372,7 +380,7 @@ class Store:
             if row["state"] != "open":
                 raise Refused("mailbox_archived")
             return row["id"]
-        if not (create and wolt not in (".", "..") and "/" not in wolt
+        if not (create and wolt not in ("", ".", "..") and "/" not in wolt
                 and (Path(self.root) / wolt / "wolt" / "wolt.json").is_file()):
             raise Refused("no_mailbox")
         return conn.execute("INSERT INTO inbox_mailboxes(wolt, state, created_at) VALUES (?, 'open', ?)",

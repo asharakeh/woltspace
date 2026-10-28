@@ -10,19 +10,24 @@ from pathlib import Path
 
 import pytest
 
-from inbox_support import acked, limits, reader, session, wolt
+from inbox_support import acked, limits, reader, rows, session, wolt
 import inbox
 import lodge_db
 from woltspace import backup
 
 PRIVATE = "NEUTRAL_" + "PRIVATE_PATH"
-NATIVE = {
+METADATA = {  # inbox bookkeeping without mail: restores, every reader revoked
     "mailbox": "INSERT INTO inbox_mailboxes(wolt,state,created_at) VALUES('pal','open',1)",
     "event": "INSERT INTO inbox_events(seq,state) VALUES(999,'queued')",
     "usage": "INSERT INTO inbox_usage VALUES('',0,0,0)",
-    "counter": "INSERT INTO meta VALUES('inbox:enrollments','0')",
-    "binding-column": "ALTER TABLE sessions ADD COLUMN inbox_revision INTEGER",
     "sequence": "INSERT INTO sqlite_sequence VALUES('inbox_messages',7)",
+    "reader": "INSERT INTO inbox_mailboxes(wolt,state,created_at) VALUES('pal','open',1);"
+              "INSERT INTO inbox_readers(hash,mailbox,session,created_at) VALUES(x'00',1,'s1',1)",
+}
+NATIVE = {
+    "counter": "INSERT INTO meta VALUES('inbox:enrollments','0')",
+    "usage-drift": "INSERT INTO inbox_usage VALUES('7',0,0,1)",  # a charge with no mail
+    "binding-column": "ALTER TABLE sessions ADD COLUMN inbox_revision INTEGER",
     "extra-column": "ALTER TABLE inbox_messages ADD COLUMN future_field TEXT",
     "partial-tables": "DROP TABLE inbox_readers",
     "missing-tables": ";".join(f"DROP TABLE {t}" for t in
@@ -79,9 +84,9 @@ def offline(root, kind, temporary):
             token = reader(store, "s2")
             store.admit("ops", "k", "pal", "dummy-body")
             acked(store, token)
-        elif kind in NATIVE:
+        elif kind in NATIVE or kind in METADATA:
             with closing(sqlite3.connect(db)) as conn:
-                conn.executescript(NATIVE[kind])
+                conn.executescript({**NATIVE, **METADATA}[kind])
         elif kind == "invalid-db":
             db.write_bytes(b"not a SQLite database")
         elif kind.startswith("orphan-"):
@@ -113,8 +118,10 @@ def test_native_unknown_and_wal_custody_refuse_before_any_mutation(tmp_path, mon
         with pytest.raises(backup.RestoreRefused) as caught:
             call(entry, target, root, report)
         assert caught.value.code in ("safe_state_present", "safe_state_unknown")
-        if kind in ("acknowledged", "wal-only", "mailbox", "event", "usage", "counter"):
+        if kind in ("acknowledged", "wal-only", "counter"):
             assert caught.value.code == "safe_state_present"
+        if kind == "usage-drift":
+            assert caught.value.code == "safe_state_unknown"
     finally:
         after = fingerprint(target)
         request.node.user_properties.extend([("tree_before", json.dumps(before)), ("tree_after", json.dumps(after)),
@@ -188,7 +195,7 @@ def test_raw_helper_rechecks_predicate_in_its_actual_write_transaction(tmp_path,
     def inspected_then_changed(*args):
         inspect(*args)
         with closing(sqlite3.connect(lodge_db.path(root))) as conn:
-            conn.execute("INSERT INTO inbox_usage VALUES('',0,0,0)")
+            conn.execute("INSERT INTO meta VALUES('inbox:late','1')")
             conn.commit()
         after_injection.append(fingerprint(target))
     monkeypatch.setattr(backup, "_refuse_native_state", inspected_then_changed)
@@ -196,3 +203,16 @@ def test_raw_helper_rechecks_predicate_in_its_actual_write_transaction(tmp_path,
     with pytest.raises(backup.RestoreRefused, match="safe_state_present"):
         call("helper", target, root, report)
     assert fingerprint(target) == after_injection[0] and report == {"untouched": "sentinel"}
+
+
+@pytest.mark.parametrize("kind", METADATA)
+def test_inbox_metadata_without_mail_restores_with_every_reader_revoked(tmp_path, kind):
+    target, root = tmp_path / "target", tmp_path / "target/copy"
+    offline(root, kind, tmp_path)
+    kept = lambda: [rows(root, f"SELECT * FROM {t}") for t in (
+        "inbox_mailboxes", "inbox_events", "inbox_usage", "sqlite_sequence WHERE name LIKE 'inbox%'")]
+    before = kept()
+    assert any(before)
+    backup.disarm(root, "/dummy-source", target)
+    assert kept() == before  # ids, events and sequences stay: never reused
+    assert rows(root, "SELECT count(*) FROM inbox_readers WHERE revoked=0") == [(0,)]

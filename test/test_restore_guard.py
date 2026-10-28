@@ -102,3 +102,14 @@ def test_a_rollback_journal_beside_lodge_db_refuses_before_anything_is_read(tmp_
             backup._disarm_lodge_db(root, "/elsewhere", tmp_path, report)
     assert opened == [] and report == {"untouched": True}
     assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == files
+
+
+def test_a_lodge_whose_inbox_holds_no_mail_restores_and_its_old_readers_stay_dead(tmp_path):
+    source = lodge(tmp_path / "wolts", mail=False)
+    token = reader(inbox.Store(source, limits()), "s1")
+    archive = backup.create_backup(source, out_dir=tmp_path / "out").archive
+    restored = backup.restore_backup(archive, to=tmp_path / "back").wolts_dir
+    assert rows(restored, "SELECT id, state, revoked FROM inbox_mailboxes, inbox_readers") == [(1, "open", 1)]
+    session(restored, "s1")  # running again later, as a resumed session would be
+    with pytest.raises(inbox.Refused, match="reader_invalid"):
+        inbox.Store(restored, limits()).fetch(token)

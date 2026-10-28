@@ -119,3 +119,23 @@ def test_prune_failure_rolls_back_all_retention_counters_and_preserves_held_mail
                 hashlib.sha256(token.encode()).digest()) == [(1,)]
     with pytest.raises(inbox.Refused):
         store.ack(fresh, got.seq, got.claim)
+
+
+def test_launcher_reader_grant_failure_must_not_start_agent(tmp_path):
+    import os
+    import shutil
+    import subprocess
+    from pathlib import Path
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    source = Path(__file__).resolve().parents[1] / "container/bin/run-session.sh"
+    shutil.copy2(source, bin_dir)
+    marker = tmp_path / "agent-started"
+    (bin_dir / "session-reg").write_text(
+        "#!/bin/bash\ncase $1 in inbox-grant) exit 1;; prepare) "
+        f"echo \"touch '{marker}'\";; *) exit 0;; esac\n")
+    (bin_dir / "session-reg").chmod(0o755)
+    env = {"PATH": os.environ["PATH"], "WOLTSPACE_WOLTS_DIR": str(tmp_path)}
+    run = subprocess.run(["bash", str(bin_dir / "run-session.sh"), "s1"], env=env,
+                         capture_output=True, text=True, timeout=30)
+    assert run.returncode != 0 and not marker.exists()

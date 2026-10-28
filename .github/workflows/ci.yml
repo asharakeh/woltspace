@@ -55,6 +55,7 @@ jobs:
           test/test_lodge_db.py
           test/test_inbox.py
           test/test_inbox_api.py
+          test/test_inbox_core_independent.py
           test/test_restore_guard.py
           test/test_restore_guard_independent.py
           test/test_session_store.py

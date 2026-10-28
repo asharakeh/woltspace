@@ -46,6 +46,8 @@ RETAIN_SECONDS = 30 * 86400    # acknowledged metadata, from the first ack
 HUMAN, AGENT = 0, 1            # priority: lower is fetched first
 _MAX_INT = 2**63 - 1  # SQLite's INTEGER
 # A reader that may act now; binds ? to its hash.
+# Acknowledged metadata past its 30 days; binds ? to the cutoff. Absent to every read.
+_EXPIRED = "m.state = 'acknowledged' AND m.acked_at < ?"
 _VALID = ("SELECT r.mailbox, b.wolt FROM inbox_readers r JOIN inbox_mailboxes b ON b.id = r.mailbox"
           " JOIN sessions s ON s.name = r.session WHERE r.hash = ? AND r.revoked = 0"
           " AND b.state = 'open' AND s.status = 'running' AND s.wolt = b.wolt")
@@ -270,6 +272,7 @@ class Store:
         freed and the event written, in one commit. Again: no change."""
         reader, now = _hash(token), time.time()
         with self._write() as conn:
+            self._prune(conn, now)  # an expired receipt is unknown, never acknowledged again
             row = self._claimed(conn, reader, seq, claim, ("claimed", "acknowledged"))
             if row["state"] == "claimed":
                 conn.execute("UPDATE inbox_messages SET state='acknowledged', body=NULL, acked_at=?"
@@ -277,7 +280,6 @@ class Store:
                 conn.execute("UPDATE inbox_readers SET acks=acks+1 WHERE hash=?", (reader,))
                 self._charge(conn, row["mailbox"], -1, -row["size"], 0)
                 self._event(conn, seq, "acknowledged", None)
-                self._prune(conn, now)
             return self._status(conn, "m.seq=?", (seq,))
 
     def release(self, token: str, seq: int, claim: int) -> Status:
@@ -292,15 +294,17 @@ class Store:
     def status(self, token: str, key: str | None = None) -> Status | dict | None:
         """With key: a message this reader's wolt sent (None when not retained).
         Without: how many messages its mailbox holds in each state. Reads only."""
-        reader = _hash(token)
+        reader, cutoff = _hash(token), time.time() - RETAIN_SECONDS
         with self._read() as conn:
             mailbox, _ = self._reader(conn, reader)
             if key is not None:
-                return self._status(conn, "m.sender=? AND m.key=?", (f"mailbox:{mailbox}", key))
+                return self._status(conn, f"m.sender=? AND m.key=? AND NOT ({_EXPIRED})",
+                                    (f"mailbox:{mailbox}", key, cutoff))
             rows = conn.execute(
                 "SELECT state, count(*) FROM (SELECT CASE WHEN m.state='claimed' AND NOT EXISTS ("
                 + _VALID.replace("r.hash = ?", "r.hash = m.reader") + ") THEN 'held' ELSE m.state END state"
-                " FROM inbox_messages m WHERE m.mailbox=?) GROUP BY state", (mailbox,)).fetchall()
+                f" FROM inbox_messages m WHERE m.mailbox=? AND NOT ({_EXPIRED})) GROUP BY state",
+                (mailbox, cutoff)).fetchall()
         return {state: 0 for state in ("queued", "claimed", "held", "acknowledged")} | dict(rows)
 
     def events(self, after: int = 0, limit: int | None = None) -> Page:
@@ -404,10 +408,10 @@ class Store:
         """Acknowledged metadata past its 30 days, never anything else."""
         cutoff = now - RETAIN_SECONDS
         for mailbox, count in conn.execute(
-                "SELECT mailbox, count(*) FROM inbox_messages WHERE state='acknowledged' AND acked_at < ?"
-                " GROUP BY mailbox", (cutoff,)).fetchall():
+                f"SELECT mailbox, count(*) FROM inbox_messages m WHERE {_EXPIRED} GROUP BY mailbox",
+                (cutoff,)).fetchall():
             self._charge(conn, mailbox, 0, 0, -count)
-        conn.execute("DELETE FROM inbox_messages WHERE state='acknowledged' AND acked_at < ?", (cutoff,))
+        conn.execute(f"DELETE FROM inbox_messages AS m WHERE {_EXPIRED}", (cutoff,))
         conn.execute("DELETE FROM inbox_readers WHERE revoked=1 AND created_at < ? AND hash NOT IN"
                      " (SELECT reader FROM inbox_messages WHERE reader IS NOT NULL)", (cutoff,))
 

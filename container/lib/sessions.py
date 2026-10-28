@@ -2559,9 +2559,11 @@ def cli():
         # session-reg inbox-grant <name>: revoke the session's earlier inbox
         # readers and print a fresh one, once. Nothing while the inbox is off.
         import inbox
-        data = reg.get(args[1], check_alive=False) if len(args) > 1 else None
-        if data and inbox.enabled(reg.wolts_dir):
+        if inbox.enabled(reg.wolts_dir):
+            data = reg.get(args[1], check_alive=False) if len(args) > 1 else None
             try:
+                if data is None:
+                    raise inbox.Refused("no_session")
                 print(inbox.Store(reg.wolts_dir, inbox.LIMITS).grant(args[1], data["wolt"]))
             except inbox.InboxError as exc:
                 print(f"inbox-grant: {exc.code}", file=sys.stderr)

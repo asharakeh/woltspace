@@ -148,7 +148,8 @@ def test_the_launchers_grant_is_fresh_per_session_and_absent_while_off(tmp_path,
         store.fetch(first)  # the relaunch revoked it
     assert store.fetch(second).body == BODY
     assert rows(tmp_path, "SELECT count(*) FROM inbox_readers WHERE hash=?", first.encode()) == [(0,)]
-    assert _session_reg(tmp_path, "inbox-grant", "nope").stdout == ""
+    missing = _session_reg(tmp_path, "inbox-grant", "nope")  # on: no row is a failure, not "off"
+    assert (missing.returncode, missing.stdout, missing.stderr) == (1, "", "inbox-grant: no_session\n")
 
 
 def test_the_launcher_keeps_the_token_out_of_argv_logs_and_traces(tmp_path):

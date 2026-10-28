@@ -425,6 +425,19 @@ def test_acknowledged_metadata_goes_30_days_after_the_first_ack_and_nothing_else
     assert store.admit("ops", "a", "pal", "new").state == "queued"  # the key is free again
 
 
+def test_after_its_30_days_a_receipt_is_unknown_even_to_its_reader(tmp_path, store, monkeypatch):
+    token = reader(store, "s1")
+    clock = [time.time()]
+    monkeypatch.setattr(inbox.time, "time", lambda: clock[0])
+    store.send(token, "pal", "k", "x")
+    got = store.fetch(token)
+    store.ack(token, got.seq, got.claim)
+    clock[0] += inbox.RETAIN_SECONDS + 1
+    assert (store.status(token, "k"), store.status(token)["acknowledged"]) == (None, 0)
+    with pytest.raises(inbox.Refused, match="stale_claim"):
+        store.ack(token, got.seq, got.claim)  # never an invented success
+
+
 def test_the_event_ring_drops_its_oldest_shows_the_gap_and_keeps_the_facts(tmp_path, store):
     store = inbox.Store(tmp_path, limits(events=3, page=2))
     for key in "abcd":

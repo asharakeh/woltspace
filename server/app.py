@@ -114,6 +114,7 @@ from sites import ensure_site, site_dir
 import wolfcore
 import wolt_archive
 from site_shell import inject_shell, load_site_config, memory_payload, shell_manifest, shell_tags, shell_wanted
+from .inbox_routes import router as inbox_router
 from .state import (
     bot_log,
     get_current_meta,
@@ -268,6 +269,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
+app.include_router(inbox_router)  # off unless woltspace.json enables the inbox
 
 
 @app.get("/health")

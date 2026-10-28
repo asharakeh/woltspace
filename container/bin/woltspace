@@ -13,6 +13,7 @@ Phase 1 nouns:
   session send <wolt|session> [--from <wolt>]  # message on stdin
   session spawn <wolt> [--from <wolt>]  # optional seed prompt on stdin
   session hold [<duration> <reason> | off]  # keep up for a background task
+  inbox send <wolt> --key K | fetch | ack|release <seq> <claim> | status [--key K]
 
 A wolt self-identifies as the sender via $WOLTSPACE_WOLT_NAME /
 $WOLTSPACE_WOLT_SESSION (exported
@@ -46,10 +47,10 @@ API = os.environ.get("WOLTSPACE_API", "http://localhost:7777")
 _SESSION_RE = re.compile(r"-[0-9a-f]{6}$")
 
 
-def _req(method, path, body=None, *, hint=""):
+def _req(method, path, body=None, *, hint="", headers=None):
     url = f"{API}{path}"
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
+    req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
@@ -202,6 +203,27 @@ def cmd_wolt_delete(args):
     status, result = _req("DELETE", f"/wolts/archived/{quote(args.name, safe='')}", hint=WOLT_HINT)
     _refused(status, result)
     print(f"{args.name}: deleted; Auto grants revoked: {result['grants_revoked']}")
+
+
+def cmd_inbox(args):
+    """One call on this agent's lodge inbox, as the reader the launcher granted
+    this session. The token comes from the environment only, never argv."""
+    token = os.environ.get("WOLTSPACE_INBOX_TOKEN", "")
+    if not token:
+        print("woltspace: this session has no inbox reader", file=sys.stderr)
+        sys.exit(2)
+    body = {}
+    if args.verb == "send":
+        body = {"to": args.to, "key": args.key, "text": sys.stdin.read()}
+    elif args.verb in ("ack", "release"):
+        body = {"seq": args.seq, "claim": args.claim}
+    elif args.verb == "status" and args.key:
+        body = {"key": args.key}
+    status, result = _req("POST", f"/inbox/{args.verb}", body, headers={"X-Woltspace-Inbox-Token": token})
+    if not result.get("ok"):
+        print(f"woltspace inbox {args.verb}: {result.get('error', status)}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(result["result"], indent=2))
 
 
 def cmd_session_send(args):
@@ -447,7 +469,7 @@ LIFECYCLE = {"start", "stop", "rebuild", "backup", "shell", "chat", "logs", "ini
 # the real CLI — `doctor`, `paths`, `serve`, `restore`, and the whole lifecycle
 # set. In the container "elsewhere" means the host; natively it means the python
 # CLI sitting a few directories up from this script.
-LOCAL_NOUNS = {"session", "status", "auto", "app", "wolt", "tui"}
+LOCAL_NOUNS = {"session", "status", "auto", "app", "wolt", "tui", "inbox"}
 
 # Nouns the python CLI serves that only talk to this lodge's API, so they
 # belong to it in the container too — there is no host to send them to.
@@ -676,6 +698,20 @@ def main():
             ap.add_argument("--yes", action="store_true",
                             help="confirm Auto for this exact canonical directory")
         ap.set_defaults(func=func)
+
+    box = sub.add_parser("inbox", help="this agent's lodge inbox, when the lodge enables it")
+    bsub = box.add_subparsers(dest="verb")
+    bs = bsub.add_parser("send", help="mail another agent; the text comes on stdin")
+    bs.add_argument("to")
+    bs.add_argument("--key", required=True, help="your id for this message: a retry with it is safe")
+    bsub.add_parser("fetch", help="claim the next message, the same one again until ack or release")
+    for verb in ("ack", "release"):
+        bp = bsub.add_parser(verb, help="received" if verb == "ack" else "give a claim back unhandled")
+        bp.add_argument("seq", type=int)
+        bp.add_argument("claim", type=int)
+    bsub.add_parser("status", help="a sent message, or this mailbox's counts").add_argument("--key")
+    for verb_parser in bsub.choices.values():
+        verb_parser.set_defaults(func=cmd_inbox)
 
     argv = sys.argv[1:]
     # tui: exec the terminal cockpit (same app the host launcher runs; it

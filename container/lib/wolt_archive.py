@@ -20,6 +20,7 @@ import threading
 import time
 from pathlib import Path
 
+import inbox
 from execution_policy import AutoGrantStore
 from paths import space_wolf_dir
 from wolfcore import forget_last_run
@@ -147,6 +148,16 @@ def _end_live(registry: SessionRegistry, name: str, now: int, *, sweep: bool = F
             if r.get("tmux_alive") and _end_session(registry, r["name"], name, now, sweep=sweep)]
 
 
+def _mailbox(name: str, wolts_dir: Path, state: str) -> None:
+    """The wolt's inbox mailbox follows it (inbox.py); nothing without one."""
+    try:
+        inbox.Store(wolts_dir, inbox.LIMITS).set_state(name, state)
+    except inbox.Refused:
+        raise ArchiveError(409, f"{name} still holds unacknowledged inbox mail") from None
+    except inbox.InboxError as exc:
+        raise ArchiveError(500, f"the inbox could not be updated ({exc.code})") from None
+
+
 def archive_wolt(name: str, *, wolts_dir: Path, now: int | None = None) -> dict:
     check_wolt_name(name)
     wolts_dir = Path(wolts_dir)
@@ -164,11 +175,13 @@ def archive_wolt(name: str, *, wolts_dir: Path, now: int | None = None) -> dict:
         held = [_held(r) for r in registry.list(wolt=name) if hold_active(r, now)]
         if held:
             raise ArchiveError(409, f"{name} has a session that holds", held=held)
+        _mailbox(name, wolts_dir, "archived")  # no new mail or claims from here on
         stopped = _end_live(registry, name, now)
         target.parent.mkdir(exist_ok=True)
         try:
             os.rename(home, target)
         except OSError as exc:
+            _mailbox(name, wolts_dir, "open")
             raise ArchiveError(500, f"could not move {name} into {ARCHIVE_DIRNAME}: {exc}")
         # A message can wake a session, or a new one start, between the stop
         # pass and the move. The registry shows only wolts in wolts/, so look
@@ -243,6 +256,7 @@ def unarchive_wolt(name: str, *, wolts_dir: Path) -> dict:
             os.rename(source, home)
         except OSError as exc:
             raise ArchiveError(500, f"could not move {name} back: {exc}")
+        _mailbox(name, wolts_dir, "open")
     return {"unarchived": name}
 
 
@@ -292,7 +306,9 @@ def delete_archived_wolt(name: str, *, wolts_dir: Path) -> dict:
             raise ArchiveError(404, f"no archived wolt named {name}")
         # Grants, cron stamps and sessions are keyed by name: a later wolt with this
         # name must not inherit them. They go first, so a delete that fails
-        # halfway never leaves a grant behind.
+        # halfway never leaves a grant behind. Its mailbox closes first, and only
+        # once it holds no unacknowledged mail: a new wolt of this name gets a new one.
+        _mailbox(name, wolts_dir, "closed")
         revoked = AutoGrantStore(wolts_dir).revoke_wolt(name)
         SessionRegistry(wolts_dir).forget_wolt(name)
         forget_last_run(wolts_dir, name)

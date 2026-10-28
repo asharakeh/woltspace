@@ -1211,29 +1211,24 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
 
 
-# --- Inbox state refuses a restore (RFC #615) ---
+# --- Inbox state refuses a restore ---
 # Disarming rewrites sessions and drops runtime records; a copy holding inbox
-# mail or an inbox-owned session would come back with that custody silently
+# mail, retained keys or readers would come back with that custody silently
 # changed. Such a copy is refused before anything in it is touched, and stays
 # as extracted for a person to reconcile. Only an offline copy is supported.
-_INBOX_BINDING = ("inbox_incarnation", "inbox_harness", "inbox_conversation", "inbox_readiness",
-                  "inbox_generation", "inbox_revision")
-_KNOWN_SCHEMA = 6  # lodge_db's newest migration this check understands
-# The inbox tables exactly as lodge_db's migrations 5 and 6 make them; any
-# other layout (a table or column more or less) is one this check cannot read.
-_INBOX_COLUMNS_5 = {
-    "inbox_messages": {"seq", "key", "recipient", "conversation", "body", "size", "digest", "state",
-                       "reason", "calls", "created_at"},
-    "inbox_attempts": {"id", "seq", "ordinal", "generation", "outcome"},
+_KNOWN_SCHEMA = 5  # lodge_db's newest migration this check understands
+# The inbox tables exactly as lodge_db's migration 5 makes them; any other
+# layout (a table or column more or less) is one this check cannot read.
+_INBOX_COLUMNS = {
+    "inbox_mailboxes": {"id", "wolt", "state", "created_at"},
+    "inbox_readers": {"hash", "mailbox", "session", "created_at", "revoked", "acks"},
+    "inbox_messages": {"seq", "sender", "sender_name", "key", "mailbox", "priority", "body", "size",
+                       "digest", "state", "reader", "claim", "created_at", "acked_at"},
     "inbox_events": {"cursor", "seq", "state", "reason", "repeats"},
     "inbox_usage": {"scope", "pending", "bytes", "keys"},
 }
-_INBOX_COLUMNS_6 = {**_INBOX_COLUMNS_5,
-                    "inbox_messages": _INBOX_COLUMNS_5["inbox_messages"] | {
-                        "request_kind", "request_address", "bound_harness"},
-                    "inbox_attempts": _INBOX_COLUMNS_5["inbox_attempts"] | {"revision"}}
 _REFUSED = {
-    "safe_state_present": "it holds inbox mail or an inbox-owned session",
+    "safe_state_present": "it holds inbox mail, mailboxes or readers",
     "safe_state_unknown": "its lodge.db could not be read as one without inbox state",
     "inspect_path_unsafe": "a path to inspect runs through a symlink or out of the copy",
 }
@@ -1281,18 +1276,14 @@ def _refuse_inbox_state(conn: sqlite3.Connection) -> None:
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     inbox = {t for t in tables if t.startswith("inbox")}
     binding = {c for c in _columns(conn, "sessions") if c.startswith("inbox")} if "sessions" in tables else set()
-    found = {table: _columns(conn, table) for table in inbox}
-    if (inbox or binding) and not (found == _INBOX_COLUMNS_5 and not binding
-                                   or found == _INBOX_COLUMNS_6 and binding == set(_INBOX_BINDING)):
+    migrated = "meta" in tables and conn.execute("SELECT 1 FROM meta WHERE key='migration:5'").fetchone()
+    if binding or (inbox or migrated) and {table: _columns(conn, table) for table in inbox} != _INBOX_COLUMNS:
         raise RestoreRefused("safe_state_unknown")
     if conn.execute("PRAGMA user_version").fetchone()[0] != 0:  # lodge_db never sets it
         raise RestoreRefused("safe_state_unknown")
-    if (inbox or binding) and "meta" not in tables:  # the enrollment count went with it
+    if inbox and "meta" not in tables:  # the schema floor went with it
         raise RestoreRefused("safe_state_unknown")
-    if binding and conn.execute("SELECT 1 FROM sessions WHERE " + " OR ".join(
-            f"{column} IS NOT NULL" for column in _INBOX_BINDING) + " LIMIT 1").fetchone():
-        raise RestoreRefused("safe_state_present")
-    for table in sorted(inbox):  # accepted mail too: its key is still custody
+    for table in sorted(inbox):  # acknowledged mail too: its key is still custody
         if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
             raise RestoreRefused("safe_state_present")
     if "meta" in tables:

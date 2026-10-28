@@ -1,87 +1,90 @@
 """
-The inbox: mail the lodge holds for a wolt until its engine takes it (RFC #615).
+The lodge inbox: a mailbox for each agent, which its sessions pull from.
 
-Inactive: no route, CLI or connector admits mail here yet, and importing this
+Off unless woltspace.json says `"inbox": {"enabled": true}`; importing this
 module opens nothing. Callers hand it a wolts dir and explicit Limits.
 
 A message is queued only once its row, its usage and its event have committed
-together, in a durable (synchronous=FULL) write. The caller's key makes a retry
-safe: the same key with the same body and destination returns the original
-message, even after the body is gone; anything else under that key is a
-Conflict. A key is kept for good, so this slice refuses new keys once
-Limits.keys are used up.
+together, in a durable (synchronous=FULL) write. The sender's key makes a
+retry safe: the same key with the same body and destination returns the
+original message; anything else under that key is a Conflict. Keys belong to
+the sending mailbox's id, and a destination is a mailbox id: ids are never
+reused, so a recreated wolt neither inherits nor receives an old one's mail.
 
-One actor per conversation (inbox_actor.py) claims the oldest unresolved
-message, commits the attempt, calls the engine outside any transaction and
-records what came back. A message that may have reached the engine is never
-sent again: an unknown result, or an attempt nobody recorded, is `uncertain`
-and holds its conversation.
+A session reads through a reader: a token the launcher grants it, of which only
+the SHA-256 is stored. A reader is valid while it is not revoked, its session
+is running and its mailbox is open, checked inside every transaction. Every
+agent and app here runs as the same OS user: readers stop mistakes and stale
+sessions, not a misbehaving local program, which can open lodge.db directly.
 
-Mail admitted through inbox_binding.py is bound to a session incarnation.
-Every claim of such a row, through any caller, checks in its own transaction
-that the session still runs as enrolled, under the claiming generation; its
-result is recorded only while that binding is unchanged.
+fetch claims the next queued message, verified human mail first, then oldest,
+and returns it; until that claim is acknowledged or released, fetch returns it
+again, marked repeated. ack means "received", not "done": it drops the body in
+the same commit. A claim whose reader is no longer valid is held: it is never
+reassigned, and other mail keeps moving. Acknowledged metadata stays 30 days
+after the first ack, then goes; a key is free again after that.
 
-States: queued -> attempting -> native_accepted (body gone), or back to queued
-after a definite non-admission (three calls at most), or blocked (deferred,
-stopped by the user, calls used up), or uncertain.
+States: queued -> claimed -> acknowledged (body gone), or claimed -> queued
+on release. "held" is derived, never stored.
 """
 
 from __future__ import annotations
 
-import enum
 import hashlib
+import json
+import secrets
 import sqlite3
 import time
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import lodge_db
 
 MAX_PAYLOAD_BYTES = 32 * 1024  # of UTF-8
-MAX_CALLS = 3
+RETAIN_SECONDS = 30 * 86400    # acknowledged metadata, from the first ack
+HUMAN, AGENT = 0, 1            # priority: lower is fetched first
 _MAX_INT = 2**63 - 1  # SQLite's INTEGER
-_UNRESOLVED = "state != 'native_accepted'"  # word for word, or inbox_unresolved goes unused
+# A reader that may act now; binds ? to its hash.
+_VALID = ("SELECT r.mailbox, b.wolt FROM inbox_readers r JOIN inbox_mailboxes b ON b.id = r.mailbox"
+          " JOIN sessions s ON s.name = r.session WHERE r.hash = ? AND r.revoked = 0"
+          " AND b.state = 'open' AND s.status = 'running'")
 
 
-class Outcome(str, enum.Enum):
-    """What an engine adapter says happened to one call."""
-    ACCEPTED = "accepted"
-    NOT_ADMITTED = "definitive_non_admission"  # surely never reached the agent
-    DEFERRED = "defer_without_submission"
-    USER_STOP = "user_stop"
-    UNKNOWN = "unknown"
+def enabled(wolts_dir) -> bool:
+    """The lodge's switch: woltspace.json `inbox.enabled`, off when unreadable."""
+    try:
+        config = json.loads((Path(wolts_dir) / "woltspace.json").read_text())
+        return config.get("inbox", {}).get("enabled") is True
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 class InboxError(Exception):
-    pass
+    code = "inbox_error"
 
 
 class Invalid(InboxError, ValueError):
     """Malformed input; nothing was written."""
+    code = "invalid"
 
 
 class Conflict(InboxError):
     """The key holds a different body or destination."""
+    code = "conflict"
 
 
 class Refused(InboxError):
-    """A limit is reached; nothing was written. `code` names it."""
+    """Not allowed or a limit is reached; nothing was written. `code` names it."""
 
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
 
 
-class Stale(InboxError):
-    """A result for an attempt that is not the open one."""
-    code = "stale_attempt"
-
-
 class Unavailable(InboxError):
     """The store could not be read or written. After a write, whether it
-    committed is unknown: retry the same key, or read again later.
+    committed is unknown: retry the same call, or read again later.
 
     Its text is a fixed code: SQLite's own message (which may quote a body
     or a path) is dropped, never chained."""
@@ -99,18 +102,15 @@ def _unavailable(exc: BaseException) -> Unavailable:
 @dataclass(frozen=True)
 class Limits:
     """Every bound the inbox keeps, supplied by the caller: there are no defaults."""
-    pending: int            # unresolved messages, lodge-wide
+    pending: int            # unacknowledged messages, lodge-wide
     pending_bytes: int
-    recipient_pending: int
-    recipient_bytes: int
-    keys: int               # keys ever admitted; never released in this slice
-    attempts: int           # attempt rows; MAX_CALLS reserved per key at admission
+    mailbox_pending: int
+    mailbox_bytes: int
+    keys: int               # messages retained, acknowledged ones included
     key_chars: int
-    name_chars: int         # recipient and conversation
+    name_chars: int         # wolt, sender and session names
     events: int             # ring size
     page: int               # events per read
-    waiters: int            # callers waiting at once (inbox_actor)
-    work: int               # conversations dispatching at once (inbox_actor)
     busy_ms: int            # how long a write or read waits for another writer
 
     def __post_init__(self):
@@ -121,25 +121,30 @@ class Limits:
             raise Invalid("limit page exceeds events")
 
 
+# What the lodge's own service uses.
+LIMITS = Limits(pending=10_000, pending_bytes=64 * 2**20, mailbox_pending=1_000,
+                mailbox_bytes=16 * 2**20, keys=100_000, key_chars=200, name_chars=200,
+                events=10_000, page=500, busy_ms=5000)
+
+
 @dataclass(frozen=True)
 class Status:
     seq: int
+    sender: str     # the sending wolt's or provider's name, for display
     key: str
-    recipient: str
-    conversation: str
-    state: str
-    reason: str | None
-    calls: int
+    to: str
+    priority: int
+    state: str      # queued, claimed, held or acknowledged
 
 
 @dataclass(frozen=True)
-class Attempt:
-    id: str
+class Delivery:
     seq: int
-    key: str
-    ordinal: int
-    generation: str
+    sender: str
+    priority: int
     body: str
+    claim: int
+    repeated: bool
 
 
 @dataclass(frozen=True)
@@ -177,9 +182,10 @@ def _count(value, what: str, low: int) -> int:
     return value
 
 
-def _status(row) -> Status:
-    return Status(row["seq"], row["key"], row["recipient"], row["conversation"],
-                  row["state"], row["reason"], row["calls"])
+def _hash(token) -> bytes:
+    if type(token) is not str or not 20 <= len(token) <= 200:
+        raise Refused("reader_invalid")
+    return hashlib.sha256(token.encode("utf-8", "replace")).digest()
 
 
 class Store:
@@ -187,30 +193,115 @@ class Store:
         self.root = wolts_dir
         self.limits = limits
 
-    # -- public -------------------------------------------------------------
+    # -- readers and mailboxes, for the launcher and the lodge -----------------
 
-    def admit(self, key: str, recipient: str, conversation: str, body: str) -> Status:
-        """Queue body for (recipient, conversation), or return the message
-        already under key. The receipt is a committed snapshot, not delivery."""
-        _text(key, self.limits.key_chars, "key")
-        _text(recipient, self.limits.name_chars, "recipient")
-        _text(conversation, self.limits.name_chars, "conversation")
-        payload, digest = self._payload(body)
+    def grant(self, session: str, wolt: str) -> str:
+        """Revoke the session's earlier readers and mint a new one on the
+        wolt's mailbox, in one write. The token is returned once, never stored."""
+        _text(session, self.limits.name_chars, "session")
+        _text(wolt, self.limits.name_chars, "wolt")
+        token = secrets.token_urlsafe(32)
         with self._write() as conn:
-            row = self._retained(conn, key, payload, digest, request_kind=None,
-                                 recipient=recipient, conversation=conversation)
-            if row is not None:
-                return _status(row)
-            # An enrolled session takes mail only through inbox_binding.
-            if conn.execute("SELECT 1 FROM sessions WHERE inbox_incarnation=?", (recipient,)).fetchone():
-                raise Refused("bound_recipient")
-            return self._insert(conn, key, recipient, conversation, payload, digest)
+            conn.execute("UPDATE inbox_readers SET revoked=1 WHERE session=?", (session,))
+            mailbox = self._mailbox(conn, wolt, create=True)
+            conn.execute("INSERT INTO inbox_readers(hash, mailbox, session, created_at) VALUES (?, ?, ?, ?)",
+                         (_hash(token), mailbox, session, time.time()))
+        return token
 
-    def status(self, key: str) -> Status | None:
-        """None only when a readable store has no such key."""
+    def set_state(self, wolt: str, state: str) -> None:
+        """archived blocks admission and claims; open undoes that; closed
+        retires the mailbox for good, refused while it holds unacknowledged
+        mail. A wolt with no mailbox has nothing to change."""
+        if state not in ("open", "archived", "closed"):
+            raise Invalid("state")
+        with self._write() as conn:
+            row = conn.execute("SELECT id FROM inbox_mailboxes WHERE wolt=? AND state != 'closed'",
+                               (wolt,)).fetchone()
+            if row is None:
+                return
+            if state == "closed" and conn.execute(
+                    "SELECT 1 FROM inbox_messages WHERE mailbox=? AND state != 'acknowledged' LIMIT 1",
+                    (row[0],)).fetchone():
+                raise Refused("mailbox_custody")
+            conn.execute("UPDATE inbox_mailboxes SET state=? WHERE id=?", (state, row[0]))
+            if state == "closed":
+                conn.execute("UPDATE inbox_readers SET revoked=1 WHERE mailbox=?", (row[0],))
+
+    # -- the reader's -----------------------------------------------------------
+
+    def send(self, token: str, to: str, key: str, body: str) -> Status:
+        """Mail from the reader's own wolt, always at agent priority."""
+        reader = _hash(token)
+
+        def sender(conn):
+            mailbox, wolt = self._reader(conn, reader)
+            return f"mailbox:{mailbox}", wolt
+        return self._admit(sender, key, to, body, AGENT)
+
+    def admit(self, sender: str, key: str, to: str, body: str, *, human: bool = False) -> Status:
+        """Library admission for a trusted provider that has verified its
+        sender itself; only it may say human. Nothing in the lodge calls it yet."""
+        _text(sender, self.limits.name_chars, "sender")
+        return self._admit(lambda conn: (f"provider:{sender}", sender), key, to, body, HUMAN if human else AGENT)
+
+    def fetch(self, token: str) -> Delivery | None:
+        """The reader's open claim again, or a claim on the next queued
+        message (human first, then oldest), or None when there is none."""
+        reader = _hash(token)
+        with self._write() as conn:
+            mailbox, _ = self._reader(conn, reader)
+            row = conn.execute("SELECT * FROM inbox_messages WHERE reader=? AND state='claimed'",
+                               (reader,)).fetchone()
+            repeated = row is not None
+            if row is None:
+                row = conn.execute("SELECT * FROM inbox_messages WHERE mailbox=? AND state='queued'"
+                                   " ORDER BY priority, seq LIMIT 1", (mailbox,)).fetchone()
+                if row is None:
+                    return None
+                conn.execute("UPDATE inbox_messages SET state='claimed', reader=?, claim=claim+1"
+                             " WHERE seq=?", (reader, row["seq"]))
+                self._event(conn, row["seq"], "claimed", None)
+            claim = row["claim"] + (0 if repeated else 1)
+        return Delivery(row["seq"], row["sender_name"], row["priority"], row["body"].decode("utf-8"),
+                        claim, repeated)
+
+    def ack(self, token: str, seq: int, claim: int) -> Status:
+        """Receipt, by the claiming reader only: the body goes, its usage is
+        freed and the event written, in one commit. Again: no change."""
+        reader, now = _hash(token), time.time()
+        with self._write() as conn:
+            row = self._claimed(conn, reader, seq, claim, ("claimed", "acknowledged"))
+            if row["state"] == "claimed":
+                conn.execute("UPDATE inbox_messages SET state='acknowledged', body=NULL, acked_at=?"
+                             " WHERE seq=?", (now, seq))
+                conn.execute("UPDATE inbox_readers SET acks=acks+1 WHERE hash=?", (reader,))
+                self._charge(conn, row["mailbox"], -1, -row["size"], 0)
+                self._event(conn, seq, "acknowledged", None)
+                self._prune(conn, now)
+            return self._status(conn, "m.seq=?", (seq,))
+
+    def release(self, token: str, seq: int, claim: int) -> Status:
+        """Give an unhandled claim back: queued again, for any reader."""
+        reader = _hash(token)
+        with self._write() as conn:
+            self._claimed(conn, reader, seq, claim, ("claimed",))
+            conn.execute("UPDATE inbox_messages SET state='queued', reader=NULL WHERE seq=?", (seq,))
+            self._event(conn, seq, "queued", "released")
+            return self._status(conn, "m.seq=?", (seq,))
+
+    def status(self, token: str, key: str | None = None) -> Status | dict | None:
+        """With key: a message this reader's wolt sent (None when not retained).
+        Without: how many messages its mailbox holds in each state. Reads only."""
+        reader = _hash(token)
         with self._read() as conn:
-            row = conn.execute("SELECT * FROM inbox_messages WHERE key=?", (key,)).fetchone()
-        return None if row is None else _status(row)
+            mailbox, _ = self._reader(conn, reader)
+            if key is not None:
+                return self._status(conn, "m.sender=? AND m.key=?", (f"mailbox:{mailbox}", key))
+            rows = conn.execute(
+                "SELECT state, count(*) FROM (SELECT CASE WHEN m.state='claimed' AND NOT EXISTS ("
+                + _VALID.replace("r.hash = ?", "r.hash = m.reader") + ") THEN 'held' ELSE m.state END state"
+                " FROM inbox_messages m WHERE m.mailbox=?) GROUP BY state", (mailbox,)).fetchall()
+        return {state: 0 for state in ("queued", "claimed", "held", "acknowledged")} | dict(rows)
 
     def events(self, after: int = 0, limit: int | None = None) -> Page:
         _count(after, "after", 0)
@@ -227,139 +318,98 @@ class Store:
         return Page(events, events[-1].cursor if events else after, oldest > after + 1,
                     oldest, newest)
 
-    # -- the actor's ----------------------------------------------------------
+    # -- inside a write ---------------------------------------------------------
 
-    def claim(self, recipient: str, conversation: str, generation: str) -> Attempt | None:
-        """Commit an attempt on the conversation's oldest unresolved message, or
-        None when there is none or it is not queued (it holds the ones after)."""
-        _text(generation, self.limits.name_chars, "generation")
-        with self._write() as conn:
-            row = conn.execute(
-                f"SELECT * FROM inbox_messages WHERE recipient=? AND conversation=?"
-                f" AND {_UNRESOLVED} ORDER BY seq LIMIT 1", (recipient, conversation)).fetchone()
-            if row is None or row["state"] != "queued":
-                return None
-            revision = None
-            if row["request_kind"] is not None:  # bound: only to its session, running now
-                revision = self._bound(conn, row, generation)
-                if revision is None:
-                    return None
-            attempt = Attempt(uuid.uuid4().hex, row["seq"], row["key"], row["calls"] + 1,
-                              generation, row["body"].decode("utf-8"))
-            conn.execute(
-                "INSERT INTO inbox_attempts(id, seq, ordinal, generation, revision) VALUES (?, ?, ?, ?, ?)",
-                (attempt.id, attempt.seq, attempt.ordinal, generation, revision))
-            conn.execute("UPDATE inbox_messages SET state='attempting', reason=NULL, calls=?"
-                         " WHERE seq=?", (attempt.ordinal, attempt.seq))
-            self._event(conn, attempt.seq, "attempting", None)
-        return attempt
-
-    def record(self, attempt: Attempt, outcome: Outcome) -> Status:
-        """Store what the engine said about the open attempt. Accepted drops the
-        body and frees its pending usage in the same transaction."""
-        outcome = Outcome(outcome)
-        with self._write() as conn:
-            row = conn.execute(
-                "SELECT m.*, a.generation, a.outcome, a.revision FROM inbox_attempts a"
-                " JOIN inbox_messages m ON m.seq = a.seq WHERE a.id=?", (attempt.id,)).fetchone()
-            if (row is None or (row["seq"], row["generation"]) != (attempt.seq, attempt.generation)
-                    or row["outcome"] is not None or row["state"] != "attempting"):
-                raise Stale(attempt.id)
-            if row["request_kind"] is not None and self._bound(conn, row, attempt.generation) != row["revision"]:
-                raise Stale(attempt.id)  # its binding changed unsettled: reconcile makes it uncertain
-            conn.execute("UPDATE inbox_attempts SET outcome=? WHERE id=?", (outcome.value, attempt.id))
-            body = row["body"]
-            if outcome is Outcome.ACCEPTED:
-                state, reason, body = "native_accepted", None, None
-                self._charge(conn, row["recipient"], -1, -row["size"], 0)
-            elif outcome is Outcome.NOT_ADMITTED:
-                state, reason = ("queued", None) if row["calls"] < MAX_CALLS else ("blocked", "calls_used")
-            elif outcome is Outcome.UNKNOWN:
-                state, reason = "uncertain", "unknown"
-            else:
-                state, reason = "blocked", outcome.value
-            conn.execute("UPDATE inbox_messages SET state=?, reason=?, body=? WHERE seq=?",
-                         (state, reason, body, attempt.seq))
-            self._event(conn, attempt.seq, state, reason)
-            row = conn.execute("SELECT * FROM inbox_messages WHERE seq=?", (attempt.seq,)).fetchone()
-        return _status(row)
-
-    def reconcile(self) -> list[tuple[str, str]]:
-        """After a restart, with the old actors stopped: every attempt nobody
-        recorded becomes uncertain (it may have reached the engine). Returns the
-        conversations with unresolved mail."""
-        with self._write() as conn:
-            open_ = conn.execute(
-                f"SELECT seq FROM inbox_messages WHERE {_UNRESOLVED} AND state='attempting'").fetchall()
-            for (seq,) in open_:
-                conn.execute("UPDATE inbox_attempts SET outcome='unknown'"
-                             " WHERE seq=? AND outcome IS NULL", (seq,))
-                conn.execute("UPDATE inbox_messages SET state='uncertain', reason='interrupted'"
-                             " WHERE seq=?", (seq,))
-                self._event(conn, seq, "uncertain", "interrupted")
-            rows = conn.execute(f"SELECT DISTINCT recipient, conversation FROM inbox_messages"
-                                f" WHERE {_UNRESOLVED}").fetchall()
-        return [tuple(r) for r in rows]
-
-    # -- admission, shared with inbox_binding ---------------------------------
-
-    @staticmethod
-    def _payload(body) -> tuple[bytes, bytes]:
+    def _admit(self, sender_of, key, to, body, priority) -> Status:
+        _text(key, self.limits.key_chars, "key")
+        _text(to, self.limits.name_chars, "to")
         payload = _text(body, MAX_PAYLOAD_BYTES, "body", 0).encode("utf-8")
         if len(payload) > MAX_PAYLOAD_BYTES:
             raise Invalid(f"body exceeds {MAX_PAYLOAD_BYTES} bytes of UTF-8")
-        return payload, hashlib.sha256(payload).digest()
+        digest, now = hashlib.sha256(payload).digest(), time.time()
+        with self._write() as conn:
+            sender, name = sender_of(conn)
+            self._prune(conn, now)
+            row = conn.execute("SELECT * FROM inbox_messages WHERE sender=? AND key=?", (sender, key)).fetchone()
+            if row is not None:
+                current = conn.execute("SELECT id FROM inbox_mailboxes WHERE wolt=? AND state != 'closed'",
+                                       (to,)).fetchone()
+                if ((row["mailbox"], row["priority"], row["size"], row["digest"])
+                        != (current and current[0], priority, len(payload), digest)
+                        or row["body"] is not None and row["body"] != payload):
+                    raise Conflict(key)
+                return self._status(conn, "m.seq=?", (row["seq"],))
+            mailbox = self._mailbox(conn, to, create=True)
+            lodge, mine = self._usage(conn, ""), self._usage(conn, str(mailbox))
+            limits = self.limits
+            for code, over in (
+                ("keys", lodge["keys"] >= limits.keys),
+                ("pending", lodge["pending"] >= limits.pending),
+                ("pending_bytes", lodge["bytes"] + len(payload) > limits.pending_bytes),
+                ("mailbox_pending", mine["pending"] >= limits.mailbox_pending),
+                ("mailbox_bytes", mine["bytes"] + len(payload) > limits.mailbox_bytes),
+            ):
+                if over:
+                    raise Refused(code)
+            seq = conn.execute(
+                "INSERT INTO inbox_messages(sender, sender_name, key, mailbox, priority, body, size, digest,"
+                " state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                (sender, name, key, mailbox, priority, payload, len(payload), digest, now)).lastrowid
+            self._charge(conn, mailbox, 1, len(payload), 1)
+            self._event(conn, seq, "queued", None)
+            return self._status(conn, "m.seq=?", (seq,))
+
+    def _mailbox(self, conn, wolt, *, create=False) -> int:
+        """The wolt's open mailbox; a new one for a wolt the lodge knows."""
+        row = conn.execute("SELECT id, state FROM inbox_mailboxes WHERE wolt=? AND state != 'closed'",
+                           (wolt,)).fetchone()
+        if row is not None:
+            if row["state"] != "open":
+                raise Refused("mailbox_archived")
+            return row["id"]
+        if not (create and wolt not in (".", "..") and "/" not in wolt
+                and (Path(self.root) / wolt / "wolt" / "wolt.json").is_file()):
+            raise Refused("no_mailbox")
+        return conn.execute("INSERT INTO inbox_mailboxes(wolt, state, created_at) VALUES (?, 'open', ?)",
+                            (wolt, time.time())).lastrowid
 
     @staticmethod
-    def _retained(conn, key, payload, digest, **request):
-        """The row already under key, or None. Conflict unless it holds this
-        very request: the same fields and body, the body by digest once gone.
-        Both APIs share the keys, so a direct and a bound request never match."""
-        row = conn.execute("SELECT * FROM inbox_messages WHERE key=?", (key,)).fetchone()
+    def _reader(conn, reader: bytes) -> tuple[int, str]:
+        row = conn.execute(_VALID, (reader,)).fetchone()
         if row is None:
-            return None
-        if (any(row[field] != value for field, value in request.items())
-                or (row["size"], row["digest"]) != (len(payload), digest)
-                or row["body"] is not None and row["body"] != payload):
-            raise Conflict(key)
+            raise Refused("reader_invalid")
+        return row[0], row[1]
+
+    def _claimed(self, conn, reader, seq, claim, states):
+        """The message this valid reader holds under exactly this claim."""
+        _count(seq, "seq", 1)
+        _count(claim, "claim", 1)
+        self._reader(conn, reader)
+        row = conn.execute("SELECT * FROM inbox_messages WHERE seq=? AND reader=? AND claim=?",
+                           (seq, reader, claim)).fetchone()
+        if row is None or row["state"] not in states:
+            raise Refused("stale_claim")
         return row
 
-    def _insert(self, conn, key, recipient, conversation, payload, digest,
-                request=(None, None, None)) -> Status:
-        """Queue a new key, inside the caller's write, once every limit allows it."""
-        lodge, mine = self._usage(conn, ""), self._usage(conn, recipient)
-        limits = self.limits
-        for code, over in (
-            ("keys", lodge["keys"] >= limits.keys),
-            ("attempts", (lodge["keys"] + 1) * MAX_CALLS > limits.attempts),
-            ("pending", lodge["pending"] >= limits.pending),
-            ("pending_bytes", lodge["bytes"] + len(payload) > limits.pending_bytes),
-            ("recipient_pending", mine["pending"] >= limits.recipient_pending),
-            ("recipient_bytes", mine["bytes"] + len(payload) > limits.recipient_bytes),
-        ):
-            if over:
-                raise Refused(code)
-        seq = conn.execute(
-            "INSERT INTO inbox_messages(key, recipient, conversation, body, size, digest, state,"
-            " created_at, request_kind, request_address, bound_harness)"
-            " VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)",
-            (key, recipient, conversation, payload, len(payload), digest, time.time(), *request),
-        ).lastrowid
-        self._charge(conn, recipient, 1, len(payload), 1)
-        self._event(conn, seq, "queued", None)
-        return _status(conn.execute("SELECT * FROM inbox_messages WHERE seq=?", (seq,)).fetchone())
-
     @staticmethod
-    def _bound(conn, row, generation):
-        """The revision of a bound row's binding while its session may be sent
-        mail by this generation (enrolled as it was, running, verified), else
-        None. inbox_binding changes bindings; this only reads them."""
-        found = conn.execute(
-            "SELECT inbox_revision FROM sessions WHERE inbox_incarnation=? AND inbox_conversation=?"
-            " AND harness_session_id IS inbox_conversation AND inbox_harness=? AND harness IS inbox_harness"
-            " AND status='running' AND inbox_readiness='running' AND inbox_generation=?",
-            (row["recipient"], row["conversation"], row["bound_harness"], generation)).fetchone()
-        return None if found is None else found[0]
+    def _status(conn, where, args) -> Status | None:
+        row = conn.execute(
+            "SELECT m.seq, m.sender_name, m.key, b.wolt, m.priority, CASE WHEN m.state='claimed' AND NOT EXISTS ("
+            + _VALID.replace("r.hash = ?", "r.hash = m.reader") + ") THEN 'held' ELSE m.state END"
+            " FROM inbox_messages m JOIN inbox_mailboxes b ON b.id = m.mailbox WHERE " + where,
+            args).fetchone()
+        return None if row is None else Status(*row)
+
+    def _prune(self, conn, now) -> None:
+        """Acknowledged metadata past its 30 days, never anything else."""
+        cutoff = now - RETAIN_SECONDS
+        for mailbox, count in conn.execute(
+                "SELECT mailbox, count(*) FROM inbox_messages WHERE state='acknowledged' AND acked_at < ?"
+                " GROUP BY mailbox", (cutoff,)).fetchall():
+            self._charge(conn, mailbox, 0, 0, -count)
+        conn.execute("DELETE FROM inbox_messages WHERE state='acknowledged' AND acked_at < ?", (cutoff,))
+        conn.execute("DELETE FROM inbox_readers WHERE revoked=1 AND created_at < ? AND hash NOT IN"
+                     " (SELECT reader FROM inbox_messages WHERE reader IS NOT NULL)", (cutoff,))
 
     # -- storage --------------------------------------------------------------
 
@@ -388,8 +438,8 @@ class Store:
         return row or {"pending": 0, "bytes": 0, "keys": 0}
 
     @staticmethod
-    def _charge(conn, recipient, pending, size, keys):
-        for scope in ("", recipient):
+    def _charge(conn, mailbox, pending, size, keys):
+        for scope in ("", str(mailbox)):
             conn.execute(
                 "INSERT INTO inbox_usage(scope, pending, bytes, keys) VALUES (?, ?, ?, ?)"
                 " ON CONFLICT(scope) DO UPDATE SET pending=pending+excluded.pending,"

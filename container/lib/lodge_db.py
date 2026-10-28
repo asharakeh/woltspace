@@ -138,36 +138,52 @@ _MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
         "CREATE INDEX IF NOT EXISTS connector_events_ts ON connector_events(ts)",
     )),
     (5, (
-        # The inbox (inbox.py, RFC #615): mail held until the recipient's
-        # engine takes it. Nothing in the lodge writes it yet. A row is never
-        # deleted, so seq and key are never reused; body goes once accepted,
-        # while size and the SHA-256 of its UTF-8 bytes stay to match retries.
+        # The lodge inbox (inbox.py): a mailbox per agent, pulled by its
+        # sessions. Off unless woltspace.json enables it. Ids are never reused:
+        # a recreated wolt gets a new mailbox, and a closed one stays closed.
+        """CREATE TABLE IF NOT EXISTS inbox_mailboxes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            wolt       TEXT NOT NULL,
+            state      TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS inbox_mailbox_wolt"
+        " ON inbox_mailboxes(wolt) WHERE state != 'closed'",
+        # A session's grant to read its wolt's mailbox: the token's SHA-256,
+        # never the token. acks counts first acknowledgements only.
+        """CREATE TABLE IF NOT EXISTS inbox_readers (
+            hash       BLOB PRIMARY KEY,
+            mailbox    INTEGER NOT NULL REFERENCES inbox_mailboxes(id),
+            session    TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            revoked    INTEGER NOT NULL DEFAULT 0,
+            acks       INTEGER NOT NULL DEFAULT 0
+        )""",
+        "CREATE INDEX IF NOT EXISTS inbox_reader_session ON inbox_readers(session)",
+        # Mail. sender is the key's namespace (mailbox:<id> or provider:<name>);
+        # body goes at acknowledgement, while size and the SHA-256 of its UTF-8
+        # bytes stay to match retries until the row is pruned.
         """CREATE TABLE IF NOT EXISTS inbox_messages (
-            seq          INTEGER PRIMARY KEY AUTOINCREMENT,
-            key          TEXT NOT NULL UNIQUE,
-            recipient    TEXT NOT NULL,
-            conversation TEXT NOT NULL,
-            body         BLOB,
-            size         INTEGER NOT NULL,
-            digest       BLOB NOT NULL,
-            state        TEXT NOT NULL,
-            reason       TEXT,
-            calls        INTEGER NOT NULL DEFAULT 0,
-            created_at   REAL NOT NULL
+            seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender      TEXT NOT NULL,
+            sender_name TEXT NOT NULL,
+            key         TEXT NOT NULL,
+            mailbox     INTEGER NOT NULL REFERENCES inbox_mailboxes(id),
+            priority    INTEGER NOT NULL,
+            body        BLOB,
+            size        INTEGER NOT NULL,
+            digest      BLOB NOT NULL,
+            state       TEXT NOT NULL,
+            reader      BLOB,
+            claim       INTEGER NOT NULL DEFAULT 0,
+            created_at  REAL NOT NULL,
+            acked_at    REAL,
+            UNIQUE (sender, key)
         )""",
-        # Each conversation's oldest unresolved message, without reading the
-        # accepted ones; queries must say `state != 'native_accepted'` to use it.
-        "CREATE INDEX IF NOT EXISTS inbox_unresolved"
-        " ON inbox_messages(recipient, conversation, seq) WHERE state != 'native_accepted'",
-        # One row per engine call, kept for good (at most three per message).
-        """CREATE TABLE IF NOT EXISTS inbox_attempts (
-            id         TEXT PRIMARY KEY,
-            seq        INTEGER NOT NULL REFERENCES inbox_messages(seq),
-            ordinal    INTEGER NOT NULL,
-            generation TEXT NOT NULL,
-            outcome    TEXT,
-            UNIQUE (seq, ordinal)
-        )""",
+        "CREATE INDEX IF NOT EXISTS inbox_queued"
+        " ON inbox_messages(mailbox, priority, seq) WHERE state = 'queued'",
+        "CREATE INDEX IF NOT EXISTS inbox_claimed ON inbox_messages(reader) WHERE state = 'claimed'",
+        "CREATE INDEX IF NOT EXISTS inbox_acked ON inbox_messages(acked_at) WHERE state = 'acknowledged'",
         # A fixed-size ring of state changes for observers; the oldest go.
         """CREATE TABLE IF NOT EXISTS inbox_events (
             cursor  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,7 +192,7 @@ _MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             reason  TEXT,
             repeats INTEGER NOT NULL DEFAULT 1
         )""",
-        # Running totals, one row for the lodge ('') and one per recipient,
+        # Running totals, one row for the lodge ('') and one per mailbox id,
         # changed in the same transaction as the rows they count.
         """CREATE TABLE IF NOT EXISTS inbox_usage (
             scope   TEXT PRIMARY KEY,
@@ -184,31 +200,6 @@ _MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             bytes   INTEGER NOT NULL,
             keys    INTEGER NOT NULL
         )""",
-    )),
-    (6, (
-        # Who inbox mail is for (inbox_binding.py): a session enrolled by hand,
-        # never by the lodge yet. The incarnation is made at enrollment and
-        # dies with the row; harness and conversation are frozen there.
-        # sessions.status stays the session's only lifecycle.
-        "ALTER TABLE sessions ADD COLUMN inbox_incarnation TEXT",
-        "ALTER TABLE sessions ADD COLUMN inbox_harness TEXT",
-        "ALTER TABLE sessions ADD COLUMN inbox_conversation TEXT",
-        "ALTER TABLE sessions ADD COLUMN inbox_readiness TEXT",
-        "ALTER TABLE sessions ADD COLUMN inbox_generation TEXT",
-        "ALTER TABLE sessions ADD COLUMN inbox_revision INTEGER",
-        "CREATE UNIQUE INDEX IF NOT EXISTS sessions_inbox_incarnation"
-        " ON sessions(inbox_incarnation) WHERE inbox_incarnation IS NOT NULL",
-        # A wolt's pick, newest activity first; queries must order by these
-        # words and say `inbox_incarnation IS NOT NULL` to use it.
-        "CREATE INDEX IF NOT EXISTS sessions_inbox_pick ON sessions(wolt,"
-        " coalesce(last_activity, 0) DESC, created_at DESC, name) WHERE inbox_incarnation IS NOT NULL",
-        # What a bound request asked for, kept to match retries after the
-        # body is gone. NULL request_kind: a row of the direct Store API.
-        "ALTER TABLE inbox_messages ADD COLUMN request_kind TEXT",
-        "ALTER TABLE inbox_messages ADD COLUMN request_address TEXT",
-        "ALTER TABLE inbox_messages ADD COLUMN bound_harness TEXT",
-        # The binding's revision a bound attempt was claimed under.
-        "ALTER TABLE inbox_attempts ADD COLUMN revision INTEGER",
     )),
 ]
 _BREAKING: set[int] = set()

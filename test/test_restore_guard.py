@@ -1,4 +1,4 @@
-"""backup: a copy holding inbox state is refused before disarm touches it (RFC #615)."""
+"""backup: a copy holding inbox state is refused before disarm touches it."""
 
 import json
 import sys
@@ -6,10 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from inbox_support import authority, enroll, rows, session
+from inbox_support import limits, reader, rows, session
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import inbox  # noqa: E402
 import lodge_db  # noqa: E402
 from woltspace import backup  # noqa: E402
 
@@ -17,15 +18,15 @@ RUNTIME = ".space/platform/adoption.json"
 
 
 def lodge(root, mail=True):
-    """A lodge with an ordinary session, and with an enrolled one holding mail."""
+    """A lodge with an ordinary session, and with a reader whose mailbox holds mail."""
     (root / ".space" / "platform").mkdir(parents=True)
     (root / RUNTIME).write_text(json.dumps({"adopted": []}))
     (root / "pal" / "wolt").mkdir(parents=True)
     session(root, "plain", status="stopped")
     if mail:
-        auth = authority(root)
-        enroll(auth, "s1")
-        auth.admit("k1", "session-name", "s1", "hi")
+        store = inbox.Store(root, limits())
+        reader(store, "s1")
+        store.admit("ops", "k1", "pal", "hi")
     return root
 
 

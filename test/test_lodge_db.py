@@ -72,30 +72,6 @@ def test_a_migration_that_lands_late_still_runs(tmp_path, monkeypatch):
     conn.close()
 
 
-def test_migration_6_adds_empty_inbox_binding_columns_and_keeps_every_row(tmp_path, monkeypatch):
-    known = lodge_db._MIGRATIONS
-    six = dict(known)[6]
-    monkeypatch.setattr(lodge_db, "_MIGRATIONS", [m for m in known if m[0] != 6])
-    with lodge_db.write(tmp_path) as conn:
-        conn.execute("INSERT INTO sessions(name, wolt, status, created_at, record, updated_at)"
-                     " VALUES ('s1', 'pal', 'running', 1, '{}', 1)")
-        conn.execute("INSERT INTO inbox_messages(key, recipient, conversation, body, size, digest,"
-                     " state, created_at) VALUES ('k1', 'pal', 'c1', x'00', 1, x'00', 'queued', 1)")
-    monkeypatch.setattr(lodge_db, "_MIGRATIONS", [m for m in known if m[0] != 6] + [(6, six + ("nonsense",))])
-    with pytest.raises(sqlite3.OperationalError):
-        lodge_db.connect(tmp_path)  # a failing migration leaves nothing of itself
-    monkeypatch.setattr(lodge_db, "_MIGRATIONS", known)
-    for _ in range(2):
-        with closing(lodge_db.connect(tmp_path)) as conn:
-            assert 6 in lodge_db.applied_migrations(conn)
-            assert [tuple(r) for r in conn.execute(
-                "SELECT name, status, inbox_incarnation, inbox_revision FROM sessions")] == [
-                ("s1", "running", None, None)]
-            assert [tuple(r) for r in conn.execute("SELECT key, state, request_kind FROM inbox_messages")
-                    ] == [("k1", "queued", None)]
-            assert conn.execute("SELECT value FROM meta WHERE key='min_schema'").fetchone()[0] == "0"
-
-
 def _newer_build(monkeypatch, tmp_path, extra, breaking):
     """Migrate the file as a newer build would, then come back as this one."""
     known, known_breaking = lodge_db._MIGRATIONS, lodge_db._BREAKING

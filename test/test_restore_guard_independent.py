@@ -10,25 +10,25 @@ from pathlib import Path
 
 import pytest
 
-from inbox_support import limits, session
+from inbox_support import acked, limits, reader, session, wolt
 import inbox
 import lodge_db
 from woltspace import backup
 
 PRIVATE = "NEUTRAL_" + "PRIVATE_PATH"
 NATIVE = {
-    "attempt": "INSERT INTO inbox_attempts(id,seq,ordinal,generation) VALUES('a',999,1,'g')",
+    "mailbox": "INSERT INTO inbox_mailboxes(wolt,state,created_at) VALUES('pal','open',1)",
     "event": "INSERT INTO inbox_events(seq,state) VALUES(999,'queued')",
     "usage": "INSERT INTO inbox_usage VALUES('',0,0,0)",
     "counter": "INSERT INTO meta VALUES('inbox:enrollments','0')",
-    "partial-marker": "UPDATE sessions SET inbox_revision=1",
+    "binding-column": "ALTER TABLE sessions ADD COLUMN inbox_revision INTEGER",
     "sequence": "INSERT INTO sqlite_sequence VALUES('inbox_messages',7)",
     "extra-column": "ALTER TABLE inbox_messages ADD COLUMN future_field TEXT",
-    "partial-tables": "DROP TABLE inbox_attempts",
+    "partial-tables": "DROP TABLE inbox_readers",
     "missing-tables": ";".join(f"DROP TABLE {t}" for t in
-                              ("inbox_attempts", "inbox_events", "inbox_usage", "inbox_messages")),
+                              ("inbox_readers", "inbox_events", "inbox_usage", "inbox_messages", "inbox_mailboxes")),
     "dummy-tables": ";".join(f"DROP TABLE {t}; CREATE TABLE {t}(dummy TEXT)" for t in
-                            ("inbox_attempts", "inbox_events", "inbox_usage", "inbox_messages")),
+                            ("inbox_readers", "inbox_events", "inbox_usage", "inbox_messages", "inbox_mailboxes")),
     "future-version": "PRAGMA user_version=9",
     "future-floor": "UPDATE meta SET value='99' WHERE key='min_schema'",
     "missing-meta": "DROP TABLE meta",
@@ -63,7 +63,8 @@ def offline(root, kind, temporary):
         with closing(lodge_db.connect(seed)) as keeper:
             keeper.execute("PRAGMA wal_autocheckpoint=0")
             keeper.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            inbox.Store(seed, limits()).admit("k", "pal", "c", "dummy-body")
+            wolt(seed, "pal")
+            inbox.Store(seed, limits()).admit("ops", "k", "pal", "dummy-body")
             for source in lodge_db.path(seed).parent.glob("lodge.db*"):
                 shutil.copyfile(source, db.parent / source.name)
         probe = temporary / "main-only.db"
@@ -73,10 +74,11 @@ def offline(root, kind, temporary):
         probe.unlink()  # native custody is committed in the copied WAL, not this main DB
     else:
         session(root, "s1")
-        if kind == "accepted":
+        if kind == "acknowledged":
             store = inbox.Store(root, limits())
-            store.admit("k", "pal", "c", "dummy-body")
-            store.record(store.claim("pal", "c", "g"), inbox.Outcome.ACCEPTED)
+            token = reader(store, "s2")
+            store.admit("ops", "k", "pal", "dummy-body")
+            acked(store, token)
         elif kind in NATIVE:
             with closing(sqlite3.connect(db)) as conn:
                 conn.executescript(NATIVE[kind])
@@ -99,7 +101,7 @@ def scratch(monkeypatch):
 
 
 @pytest.mark.parametrize("entry", ["disarm", "helper"])
-@pytest.mark.parametrize("kind", [*NATIVE, "accepted", "wal-only", "invalid-db", "orphan-shm", "orphan-journal"])
+@pytest.mark.parametrize("kind", [*NATIVE, "acknowledged", "wal-only", "invalid-db", "orphan-shm", "orphan-journal"])
 def test_native_unknown_and_wal_custody_refuse_before_any_mutation(tmp_path, monkeypatch, request, scratch, entry, kind):
     target, root = tmp_path / "target", tmp_path / "target/copy"
     offline(root, kind, tmp_path)
@@ -111,7 +113,7 @@ def test_native_unknown_and_wal_custody_refuse_before_any_mutation(tmp_path, mon
         with pytest.raises(backup.RestoreRefused) as caught:
             call(entry, target, root, report)
         assert caught.value.code in ("safe_state_present", "safe_state_unknown")
-        if kind in ("accepted", "wal-only", "attempt", "event", "usage", "counter", "partial-marker"):
+        if kind in ("acknowledged", "wal-only", "mailbox", "event", "usage", "counter"):
             assert caught.value.code == "safe_state_present"
     finally:
         after = fingerprint(target)

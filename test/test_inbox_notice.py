@@ -72,14 +72,17 @@ def test_a_notice_that_cannot_be_sent_never_raises(lodge, failure):
 
 
 def test_each_human_message_to_a_wolt_that_cannot_wake_gets_its_own_notice(lodge):
-    lodge.store.admit("connector:telegram", "telegram:1", "pal", BODY, human=True)
-    lodge.store.set_wake("pal", {"inhibited": "no_progress"})  # held even for human mail, older than it
+    import lodge_db, sessions
+    with lodge_db.write(lodge.root) as conn:  # a launch of pal that never confirmed: the one lasting block
+        sessions.put_session(conn, dict(name="pal-a-b-c", wolt="pal", status="stopped", created_at=1,
+                                        launching={"attempt": "a1"}))
     for n in (1, 2):
-        if n == 2:
-            lodge.store.admit("connector:telegram", "telegram:2", "pal", BODY, human=True)
+        lodge.store.admit("connector:telegram", f"telegram:{n}", "pal", BODY, human=True)
         inbox_wake._wake(str(lodge.root), "pal")  # the wake each admission schedules
+        inbox_wake._wake(str(lodge.root), "pal")  # and a repeat, which adds nothing
         assert len(lodge.sent) == n
-    assert all(body["message"].endswith("its last wake didn't pick the mail up") for _, body in lodge.sent)
+    assert all(body["message"].endswith("an earlier start of it never confirmed and may still come up")
+               for _, body in lodge.sent)
 
 
 @pytest.fixture

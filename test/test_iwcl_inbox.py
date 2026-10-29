@@ -90,11 +90,11 @@ def test_a_wolt_with_no_session_gets_mail_and_its_wake(lodge):
 
 
 def test_a_session_target_is_mail_for_its_wolt_and_its_first_choice(lodge):
-    assert send(lodge, "nunu-gritty-log-840ad8").returncode == 0
+    assert send(lodge, "nunu-brave-oak-000001").returncode == 0
     assert [r[1] for r in mail(lodge["root"])] == ["nunu"]
     assert lodge["strays"] == []
     prefer = inbox.Store(lodge["root"], limits()).wake_facts("nunu")["wake"]["prefer"]
-    assert (prefer["session"], prefer["seq"]) == ("nunu-gritty-log-840ad8", mail(lodge["root"])[0][0])
+    assert (prefer["session"], prefer["seq"]) == ("nunu-brave-oak-000001", mail(lodge["root"])[0][0])
     assert send(lodge, "nunu").returncode == 0  # a wolt target names no session: the first choice stays
     assert inbox.Store(lodge["root"], limits()).wake_facts("nunu")["wake"]["prefer"] == prefer
 

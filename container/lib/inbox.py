@@ -247,6 +247,10 @@ class Store:
                 return None
             wake = json.loads(row["wake"] or "{}")
             session = (wake.get("reserved") or {}).get("session", "")
+            # human mail after the last one answered to the owner, in any state (before any
+            # answer: the queued only); a reader's session once one has taken it
+            since, args = (("m.seq > ?", (wake["answered"],)) if "answered" in wake
+                           else ("m.state = 'queued'", ()))
             return {"open": row["state"] == "open", "wake": wake,
                     "queued": conn.execute("SELECT count(*) FROM inbox_messages WHERE mailbox=?"
                                            " AND state='queued'", (row["id"],)).fetchone()[0],
@@ -255,7 +259,11 @@ class Store:
                     "human_seq": conn.execute("SELECT max(seq) FROM inbox_messages WHERE mailbox=?"
                                               " AND state='queued' AND priority=?", (row["id"], HUMAN)).fetchone()[0],
                     "acks": conn.execute("SELECT coalesce(sum(acks), 0) FROM inbox_readers"
-                                         " WHERE session=?", (session,)).fetchone()[0]}
+                                         " WHERE session=?", (session,)).fetchone()[0],
+                    "unanswered": [{"seq": seq, "session": taker} for seq, taker in conn.execute(
+                        "SELECT m.seq, CASE WHEN m.state != 'queued' THEN r.session END FROM inbox_messages m"
+                        " LEFT JOIN inbox_readers r ON r.hash = m.reader WHERE m.mailbox=? AND m.priority=?"
+                        f" AND {since} ORDER BY m.seq", (row["id"], HUMAN, *args))]}
 
     def reader_session(self, token: str) -> tuple[str, str] | None:
         """(session, wolt) of a valid reader, or None."""

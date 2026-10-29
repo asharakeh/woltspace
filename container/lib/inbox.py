@@ -498,3 +498,23 @@ class Store:
         cursor = conn.execute("INSERT INTO inbox_events(seq, state, reason) VALUES (?, ?, ?)",
                               (seq, state, reason)).lastrowid
         conn.execute("DELETE FROM inbox_events WHERE cursor <= ?", (cursor - self.limits.events,))
+
+    # -- the lodge's view, counts only -----------------------------------------
+
+    def summary(self) -> list[dict]:
+        """Each mailbox not closed, in one read snapshot: queued human and agent
+        mail, claimed and held, and when the oldest queued message came. Mail
+        for a human first, then the longest waiting. Reads no body, sender or key."""
+        held = ("CASE WHEN m.state = 'claimed' AND NOT EXISTS ("
+                + _VALID.replace("r.hash = ?", "r.hash = m.reader") + ") THEN 'held' ELSE m.state END")
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT b.wolt, b.state, coalesce(sum(s.st = 'queued' AND s.priority = ?), 0) human,"
+                " coalesce(sum(s.st = 'queued' AND s.priority = ?), 0) agent, coalesce(sum(s.st = 'claimed'), 0) claimed,"
+                " coalesce(sum(s.st = 'held'), 0) held, min(CASE WHEN s.st = 'queued' THEN s.created_at END) oldest"
+                " FROM inbox_mailboxes b LEFT JOIN (SELECT m.mailbox, m.priority, m.created_at, " + held + " st"
+                " FROM inbox_messages m WHERE m.state != 'acknowledged') s ON s.mailbox = b.id"
+                " WHERE b.state != 'closed' GROUP BY b.id ORDER BY human > 0 DESC, oldest IS NULL, oldest, b.wolt",
+                (HUMAN, AGENT)).fetchall()
+        return [{"wolt": r[0], "state": r[1], "queued_human": r[2], "queued_agent": r[3],
+                 "claimed": r[4], "held": r[5], "oldest_queued_at": r[6]} for r in rows]

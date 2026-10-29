@@ -3080,6 +3080,15 @@ async def connectors_page(request: Request):
     })
 
 
+@app.get("/inbox")
+async def inbox_page(request: Request):
+    """Each agent's mailbox by counts, read from /inbox/summary; never message text."""
+    return templates.TemplateResponse(request, "inbox.html", context={
+        "active_nav": "inbox",
+        "cache_bust": int(time.time()),
+    })
+
+
 @app.get("/wolves")
 async def wolves_page(request: Request):
     """The wolves: every scheduled wake-up in the lodge, editable in place.

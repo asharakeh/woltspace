@@ -8,6 +8,7 @@ refused. Errors are fixed codes; no body or token is ever logged or echoed.
 
 import dataclasses
 import json
+import time
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -29,6 +30,19 @@ _HTTP = {"inbox_disabled": 404, "unsupported": 404, "invalid": 400, "reader_inva
 
 def _error(code: str) -> JSONResponse:
     return JSONResponse({"error": code}, status_code=_HTTP.get(code, 409))
+
+
+@router.get("/summary")
+async def inbox_summary():
+    """Each agent's mailbox by counts only, for the lodge's Inbox page. Reads
+    nothing else: viewing never claims, acks, releases or purges."""
+    if not inbox.enabled(WOLTS_DIR):
+        return _error("inbox_disabled")
+    try:
+        wolts = await run_in_threadpool(inbox.Store(WOLTS_DIR, inbox.LIMITS).summary)
+    except inbox.InboxError as exc:
+        return _error(exc.code)
+    return {"ok": True, "now": time.time(), "wolts": wolts}
 
 
 @router.post("/rearm")

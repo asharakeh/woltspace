@@ -14,8 +14,8 @@ lifecycle lock, never the caller's seq or state:
   is retried here. Mail waits for the agent's own fetch and ack.
 - no live session: one fresh session, reserved by name first and started with
   the fixed fetch instruction (auto policy only). The owner's explicit stop or
-  archive of the agent's newest session, whoever started it, inhibits the wake
-  until rearm; so does a reserved session that ended without a first ack
+  archive of any of the agent's sessions, whoever started it, marks that record
+  (wake_inhibit) and inhibits the wake until rearm clears the marks it sees; so does a reserved session that ended without a first ack
   ("no_progress"). New mail never clears an inhibition. A reserved session
   whose launch is unresolved stays unknown.
 
@@ -72,7 +72,12 @@ def rearm(wolts_dir, wolt: str) -> dict:
         record = sessions.SessionRegistry(wolts_dir).get(
             reserved.get("session", ""), wolt=wolt, check_alive=False)
         sessions.refuse_unresolved(record)
-        store.set_wake(wolt, {"rearmed_at": int(time.time()) + 1})  # past any stop it clears
+        registry = sessions.SessionRegistry(wolts_dir)
+        for stopped in registry.records(wolt=wolt):  # exactly the stops seen now; a later one counts
+            if stopped.get("wake_inhibit"):
+                with registry.edit(stopped["name"], wolt=wolt) as current:
+                    current.pop("wake_inhibit", None)
+        store.set_wake(wolt, {})
     _schedule(str(wolts_dir), wolt)
     return {"wolt": wolt, "rearmed": True}
 
@@ -126,9 +131,7 @@ def _start(store, registry, wolt: str, facts: dict) -> None:
     """No live session: respect an explicit stop, judge the earlier reservation,
     then reserve and start one."""
     wake, reserved = facts["wake"], facts["wake"].get("reserved")
-    latest = max(registry.records(wolt=wolt), key=lambda r: r.get("created_at") or 0, default={})
-    if (latest.get("status") in ("stopped", "archived")  # the owner ended the agent's newest session
-            and (latest.get("finished_at") or 0) >= wake.get("rearmed_at", 0)):
+    if any(r.get("wake_inhibit") for r in registry.records(wolt=wolt)):  # an owner's stop
         store.set_wake(wolt, {**wake, "inhibited": "stopped"})
         return
     if reserved:
@@ -139,8 +142,7 @@ def _start(store, registry, wolt: str, facts: dict) -> None:
             store.set_wake(wolt, {**wake, "inhibited": "no_progress"})
             return
     name = sessions.session_name(wolt)
-    store.set_wake(wolt, {**{k: v for k, v in wake.items() if k == "rearmed_at"},
-                          "reserved": {"session": name, "acks": 0, "at": int(time.time())}})
+    store.set_wake(wolt, {"reserved": {"session": name, "acks": 0, "at": int(time.time())}})
     try:
         sessions.start_session(wolt=wolt, prompt=START, name=name, require_auto=True)
     except (PermissionError, ValueError, sessions.HarnessNotInstalled) as exc:

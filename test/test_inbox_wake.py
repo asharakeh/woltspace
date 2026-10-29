@@ -316,7 +316,7 @@ def test_an_explicit_stop_inhibits_and_an_unresolved_launch_waits(lodge, wake, e
     inbox_wake._wake(str(lodge.root), "pal")
     name = wake.starts[0][0]["name"]
     if ending == "stopped":
-        lodge.registry.update(name, status="stopped")
+        sessions.stop_session(name)  # the owner's explicit stop
     else:
         lodge.registry.update(name, status="running", launching={"attempt": "a2"})
     mail(lodge, "k2")

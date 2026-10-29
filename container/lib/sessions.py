@@ -2469,7 +2469,8 @@ def stop_session(name: str) -> dict:
     # persisted pane is long gone. Gating this on the pane would mark the
     # record stopped while the tmux session ran on, unreachable forever.
     with _ending(registry, data) as (wolt, tmux_alive):
-        registry.update(name, wolt=wolt, status="stopped", finished_at=int(time.time()))
+        # wake_inhibit: the owner ended it, so the inbox wake starts nothing until rearm
+        registry.update(name, wolt=wolt, status="stopped", finished_at=int(time.time()), wake_inhibit=True)
     return {"name": name, "status": "stopped", "was_alive": tmux_alive}
 
 
@@ -2485,7 +2486,7 @@ def archive_session(name: str) -> dict:
         raise ValueError(f"session '{name}' not found in registry")
 
     with _ending(registry, data) as (wolt, _):
-        registry.update(name, wolt=wolt, status="archived",
+        registry.update(name, wolt=wolt, status="archived", wake_inhibit=True,
                         finished_at=data.get("finished_at") or int(time.time()))
     return {"name": name, "status": "archived", "wolt": wolt}
 

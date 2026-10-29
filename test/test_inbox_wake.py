@@ -52,7 +52,7 @@ def lodge(tmp_path, monkeypatch):
     monkeypatch.setattr(sessions, "get_tunnel_url", lambda: "")
     native = types.SimpleNamespace(
         prepare=lambda root, name, harness, attempt: calls.prepared.append(attempt) or {
-            "kind": harness, "addr": str(lifecycle.attempt_dir(root, name, attempt)), "attempt": attempt},
+            "kind": harness, "addr": str(root / ".space" / name / attempt), "attempt": attempt},
         retire=lambda locator: calls.retired.append(locator["attempt"]),
         deliver=lambda record, hint: calls.delivered.append((record.get("name"), hint, held(tmp_path)))
         or ("submitted", "ok"))

@@ -42,11 +42,6 @@ def new_attempt() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def attempt_dir(wolts_dir, name: str, attempt: str) -> Path:
-    """The launch attempt's private directory: the native locator's addr."""
-    return Path(wolts_dir) / ".space" / "run" / "native" / name / attempt
-
-
 @contextmanager
 def agent_lock(wolts_dir, wolt: str, *, wait: float = 20.0):
     """Hold the agent's lifecycle lock. Sessions without a wolt take none."""

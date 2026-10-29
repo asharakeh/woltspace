@@ -8,6 +8,7 @@ import asyncio
 import json
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -18,7 +19,6 @@ from test_inbox_api import _cli, client, server, store  # noqa: F401 (fixtures)
 import inbox
 
 import inbox_wake
-import lifecycle
 import sessions
 from session_runtime import RuntimeHandle
 
@@ -51,7 +51,7 @@ def flow(tmp_path, monkeypatch, store, server):
     for module, name, value in [
         (sessions, "_tmux_spawn", spawn), (sessions, "harness_install_problem", lambda *a, **k: None),
         (sessions, "ensure_site", lambda wolt: None), (sessions, "get_tunnel_url", lambda: ""),
-        (sessions, "resolve_active_session", live),
+        (sessions, "resolve_active_session", live), (sessions, "_tmux_alive", lambda data: False),
         (inbox_wake, "_schedule", inbox_wake._wake),  # the wake inline, for a deterministic test
         (chat_lodge, "message_session", lambda *a, **k: pytest.fail("pasted into a session")),
         (chat_lodge, "start_claude_session", lambda **k: pytest.fail("started outside the wake")),
@@ -60,7 +60,7 @@ def flow(tmp_path, monkeypatch, store, server):
         monkeypatch.setattr(module, name, value)
     monkeypatch.setitem(sys.modules, "native_adapters", types.SimpleNamespace(
         prepare=lambda root, name, harness, attempt: {
-            "kind": harness, "addr": str(lifecycle.attempt_dir(root, name, attempt)), "attempt": attempt},
+            "kind": harness, "addr": str(root / ".space" / name / attempt), "attempt": attempt},
         retire=lambda locator: None, deliver=deliver))
     side = chat_lodge.ChatLodge(connector_registry.spec("telegram"), [OWNER])
     side._save_chat_state(CHAT, {"active_wolt": "pal", "active_session": ""})
@@ -100,3 +100,24 @@ def test_telegram_to_a_woken_session_to_its_own_fetch_and_ack(flow):
     assert _cli(flow.api, "ack", str(got["seq"]), str(got["claim"]), token=token).returncode == 0
     assert [s for s, in rows(flow.root, "SELECT state FROM inbox_messages ORDER BY seq")] == [
         "acknowledged", "queued"]
+
+
+def test_with_the_real_adapters_only_the_current_attempt_gets_the_hint(flow, monkeypatch):
+    monkeypatch.delitem(sys.modules, "native_adapters")
+    monkeypatch.setattr(inbox_wake, "log", types.SimpleNamespace(
+        info=lambda *a: flow.seen.hints.append(a[-2:]), exception=print, warning=print))
+    import native_adapters
+    say(flow, "e1", "first")
+    (name,) = flow.seen.spawned
+    old = sessions.SessionRegistry(flow.root).get(name, check_alive=False)["native"]
+    native_adapters.write_ready(old["addr"], {"attempt": old["attempt"], "kind": old["kind"],
+                                               "armed_at": __import__("time").time()})
+    say(flow, "e2", "second")  # the listener is armed but nobody claims: placed, still pending
+    assert flow.seen.hints[-1] == ("pending", "placed")
+    hint = (Path(old["addr"]) / native_adapters.HINT).read_text()
+    assert "woltspace inbox fetch" in hint and "second" not in hint
+    sessions.stop_session(name)  # retired before teardown: a late ready write is refused
+    assert not native_adapters.write_ready(old["addr"], {"attempt": old["attempt"], "kind": old["kind"]})
+    assert native_adapters.deliver({**old, "name": name, "status": "running", "attempt": old["attempt"],
+                                    "native": old}, "x") == ("unavailable", "retired")
+    assert [s for s, in rows(flow.root, "SELECT state FROM inbox_messages")] == ["queued", "queued"]

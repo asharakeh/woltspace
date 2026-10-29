@@ -59,7 +59,7 @@ def sender_notices(wolts_dir, wolt: str, reason: str) -> None:
             try:
                 status = store.admit("lodge", f"stuck:{mail['seq']}:{reason}", mail["sender"],
                                      f"[lodge] your message {mail['key']} to {wolt} is queued, but {wolt} "
-                                     f"can't wake now: {plain(reason)}")
+                                     f"can't wake now: {plain(reason)}", mailbox=mail["mailbox"])
             except inbox.InboxError as exc:  # the sender's mailbox is gone or full
                 log.warning("sender notice for %s not queued: %s", wolt, exc.code)
                 continue

@@ -129,3 +129,17 @@ def test_the_owner_and_the_lodge_s_own_notices_are_never_told_to_an_agent(agents
     assert agents.store.unnoticed_agent_mail("nunu", "no_progress") == []  # nor the lodge's own notice
     inbox_notice.notice(agents.root, "nunu", "no_progress", owner=False)  # nunu stuck with the notice queued
     assert lodge_mail(agents, "pal") == [] and len(agents.woken) == 1
+
+
+def test_a_sender_recreated_between_the_read_and_the_notice_is_not_told(agents, monkeypatch):
+    read = inbox.Store.unnoticed_agent_mail
+
+    def then_recreated(store, wolt, reason):
+        found = read(store, wolt, reason)
+        store.set_state("nunu", "closed")  # the sending mailbox retires right after the read...
+        reader(store, "s2", "nunu")  # ...and a new nunu gets a new one
+        return found
+    monkeypatch.setattr(inbox.Store, "unnoticed_agent_mail", then_recreated)
+    inbox_notice.notice(agents.root, "pal", "no_progress", owner=False)
+    assert lodge_mail(agents, "nunu") == [] and agents.woken == []
+

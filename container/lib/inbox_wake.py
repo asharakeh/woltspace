@@ -232,11 +232,26 @@ def _start(store, registry, wolt: str, facts: dict, prefer: str | None) -> tuple
         return "resume", name
     name = sessions.session_name(wolt)
     store.set_wake(wolt, {**keep, "reserved": {"session": name, "acks": 0, "at": int(time.time())}})
+    chats = wake.get("chats", {})  # owner mail from a chat: the session answers there, as before the inbox
+    owner = [chats[str(m["seq"])] for m in facts["unanswered"] if m["human"] and chats.get(str(m["seq"]))]
+    routing = _routing(store.root, owner[-1]) if owner else None
     try:  # any mail starts the wolt in its own recorded mode, as Telegram did before the inbox
-        sessions.start_session(wolt=wolt, prompt=START, name=name)
+        sessions.start_session(wolt=wolt, prompt=START, name=name, **({"routing": routing} if routing else {}))
     except (PermissionError, ValueError, sessions.HarnessNotInstalled) as exc:
         return "blocked", _inhibit(store, wolt, {**keep, "detail": str(exc)[:200]}, "not_startable")
     return "started", name
+
+
+def _routing(root, chat: dict) -> dict | None:
+    """The routing chat_lodge gave a session it started for a chat: the connector and the
+    chat's own route, so notify's exact binding keeps its reply footer."""
+    try:
+        import connector_registry
+        return {"adapter": chat["adapter"],
+                **connector_registry.spec(chat["adapter"], root).codec.canonical(str(chat["chat"]))}
+    except Exception:
+        log.exception("inbox wake: no routing for a %s chat", chat.get("adapter"))
+        return None
 
 
 def _judge_failed_resume(root, registry, wolt: str, name: str) -> None:

@@ -932,3 +932,31 @@ def test_a_true_duplicate_admission_keeps_the_route_and_accounting_it_was_accept
     inbox_wake._wake(str(lodge.root), "pal")
     (kw, _), = wake.starts
     assert wake_state(lodge) == answered and notices.lines == [("started", [status.seq], kw["name"], telegram)]
+
+
+@pytest.mark.parametrize("adapter, chat", [("telegram", "4242"), ("slack", "D1:1712345678.000100")])
+def test_a_session_the_wake_starts_for_owner_mail_is_routed_to_its_chat_as_chat_lodge_did(lodge, monkeypatch,
+                                                                                           adapter, chat):
+    import chat_lodge
+    import connector_registry
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda data: False)  # nothing live: a fresh start
+    started = []
+    real = sessions.start_session
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: started.append(kw) or real(**kw))
+    mail(lodge, route={"session": None, "chat": {"adapter": adapter, "chat": chat}})
+    inbox_wake._wake(str(lodge.root), "pal")
+    side = chat_lodge.ChatLodge(connector_registry.spec(adapter), [])
+    assert started[0]["routing"] == side._routing(chat)  # the routing its own spawn passed before the inbox
+    if adapter == "telegram":  # notify's exact binding keeps the reply footer
+        codec = connector_registry.spec(adapter).codec
+        assert codec.matches(codec.canonical(chat), record(lodge, started[0]["name"]))
+
+
+def test_a_session_the_wake_starts_for_agent_mail_only_is_unrouted(lodge, monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda data: False)
+    mail(lodge, human=False, route={"session": None, "chat": {"adapter": "telegram", "chat": "4242"}})
+    inbox_wake._wake(str(lodge.root), "pal")
+    (name, _, _), = lodge.calls.spawned
+    assert not record(lodge, name).get("routing")

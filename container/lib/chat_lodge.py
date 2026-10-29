@@ -72,10 +72,10 @@ REPLY_FOOTER_MARKER = "↩️ reply to this message to talk to this session dire
 _MEDIA_LABEL = {"image": "image received", "video": "video received", "file": "file received"}
 
 
-def notify_admitted(wolts_dir, status) -> None:
+def notify_admitted(wolts_dir, status, prefer=None) -> None:
     """The wake for a wolt with new mail (inbox_wake, the runtime's): quick, never raises."""
     import inbox_wake
-    inbox_wake.notify_admitted(wolts_dir, status)
+    inbox_wake.notify_admitted(wolts_dir, status, prefer)
 
 
 def wolts_dir() -> Path:
@@ -453,7 +453,8 @@ class ChatLodge:
                 "role": "assistant", "content": f"[delivered to session {name}]"}),
             deliver=(lambda name, wolt, text: self._route_to_session(route, out, name, wolt, text))
             if wrapped else None,
-            admit=(lambda wolt, text: self._admit(route, out, event_id, wolt, text)) if queue else None,
+            admit=(lambda wolt, text, session: self._admit(route, out, event_id, wolt, text, session))
+            if queue else None,
             log=lambda event, data: _bot_log(f"{self.name}_{event}", data),
             log_error=lambda message: logger.error(message),
         )
@@ -478,7 +479,8 @@ class ChatLodge:
         file_name = outbox.display_name(file_name) if file_name else None
         return session, quote_reply(body, file_name, text, bool(reply_to.get("voice")))
 
-    async def _admit(self, route: dict, out, event_id: str, wolt: str, text: str) -> None:
+    async def _admit(self, route: dict, out, event_id: str, wolt: str, text: str,
+                     session: str | None = None) -> None:
         """Queue an owner message in the wolt's inbox at human priority.
 
         Only handle reaches this, after its owner check: agent mail never says
@@ -486,7 +488,9 @@ class ChatLodge:
         delimiter comes from it, so a resent event builds the same body and
         gets the message already queued. Anything else under the key is a
         conflict. Custody starts when admit commits; a failure is told to the
-        owner, never pasted instead.
+        owner, never pasted instead. Otherwise the owner hears once, when the
+        wake has decided (inbox_notice.outcome); `session`, the one they meant,
+        is only the wake's first choice: any session of the wolt may fetch.
         """
         chat = self.chat(route)
         key = f"{self.name}:{event_id}"
@@ -506,14 +510,17 @@ class ChatLodge:
             return
         _bot_log(f"{self.name}_inbox_admitted", {"wolt": wolt, "seq": status.seq, "key": key})
         self._append_history(chat, "user", text)
-        # The next plain message goes to the wolt last written to; mail binds no session.
+        # The next plain message goes to the wolt last written to; its session is kept
+        # while it is that wolt's, as the conversation the owner is in.
         state = self._load_chat_state(chat)
+        if state.get("active_wolt") != wolt:
+            state.pop("active_session", None)
         state["active_wolt"] = wolt
-        state.pop("active_session", None)
         self._save_chat_state(chat, state)
-        await out.say(Reply(f"🪵 queued for {self._creature_emoji(wolt)} {self._shown(wolt)}"))
+        prefer = {"session": session if session and messages.wolt_from_session_name(session) == wolt else None,
+                  "chat": {"adapter": self.name, "chat": chat}}
         try:
-            await asyncio.to_thread(notify_admitted, self.wolts_dir, status)
+            await asyncio.to_thread(notify_admitted, self.wolts_dir, status, prefer)
         except Exception as e:
             # The mail is in custody either way; a lost wake leaves it pending.
             logger.error(f"{self.name}: wake for {wolt} failed: {type(e).__name__}")

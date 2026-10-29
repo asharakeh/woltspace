@@ -28,11 +28,72 @@ REASONS = {
     "stopped": "one of its sessions was stopped, so it stays asleep until rearmed",
     "no_progress": "its last wake didn't pick the mail up",
     "launch_unknown": "an earlier start of it never confirmed and may still come up",
+    "resume_failed": "its session could not be resumed",
+    "busy": "it was busy starting or stopping",
+    "error": "the lodge hit an error while waking it",
 }
+REACHED = ("hinted", "resumed", "started")
 
 
 def plain(reason: str) -> str:
+    if reason.startswith("hint_"):
+        return f"its session could not be told ({reason})"
     return REASONS.get(reason, f"its wake is held ({reason})")
+
+
+def outcome(wolts_dir, wolt: str, *, seqs, how: str, session: str | None = None,
+            reason: str | None = None, chat: dict | None = None) -> None:
+    """The waker's port for what one wake did with the owner's messages: exactly one line for each
+    message it answers (seqs), as before the inbox. A session hinted, resumed or started is named
+    with its link, and the chat the message came from follows it; anything else is the reason the
+    wolt cannot wake. "Notified" never claims the body was read. Never raises."""
+    try:
+        if how in REACHED:
+            line = f"🪵 {session} notified\n{_link(session)}"
+            if chat:
+                _follow(wolts_dir, wolt, chat, session)
+        else:
+            line = f"🪵 your mail for {wolt} is waiting, but {wolt} can't wake now: {plain(reason or how)}"
+        for _ in seqs:
+            _post(line, chat)
+    except Exception as exc:
+        log.warning("owner outcome for %s not sent: %s", wolt, type(exc).__name__)
+
+
+def _post(message: str, chat: dict | None) -> None:
+    """One line through the lodge's own /notify: to the chat when known, else the owner's default."""
+    body = {"session": "", "message": message}
+    if chat:
+        body["adapter"] = chat["adapter"]
+        body["chat_id" if chat["adapter"] == "telegram" else "route"] = chat["chat"]
+    _call("POST", NOTIFY, body)
+
+
+def _link(session: str) -> str:
+    try:
+        url = (_call("GET", "/tunnel") or {}).get("url") or ""
+    except Exception:
+        url = ""
+    return f"{url}/tui?session={session}" if url else session
+
+
+def _follow(wolts_dir, wolt: str, chat: dict, session: str) -> None:
+    """The chat's conversation is the session reached, while the chat is still on that wolt."""
+    import chat_state
+    state = chat_state.get(wolts_dir, chat["adapter"], chat["chat"])
+    if state.get("active_wolt") == wolt:
+        chat_state.put(wolts_dir, chat["adapter"], chat["chat"], {**state, "active_session": session})
+
+
+def _call(method: str, path: str, body: dict | None = None):
+    api = get_env("WOLTSPACE_API", "http://localhost:7777")
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(f"{api}{path}", data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    # The lodge's own API is local: never through a proxy from the environment.
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=10) as answer:
+        raw = answer.read()
+    return json.loads(raw) if raw else None
 
 
 def owner_notice(wolts_dir, wolt: str, reason: str) -> None:
@@ -40,14 +101,7 @@ def owner_notice(wolts_dir, wolt: str, reason: str) -> None:
         rows = inbox.Store(wolts_dir, inbox.LIMITS).summary()
         if not any(r["wolt"] == wolt and r["queued_human"] for r in rows):
             return
-        body = json.dumps({"session": "", "message": f"🪵 your mail for {wolt} is waiting, but {wolt} "
-                                                       f"can't wake now: {plain(reason)}"}).encode()
-        api = get_env("WOLTSPACE_API", "http://localhost:7777")
-        req = urllib.request.Request(f"{api}{NOTIFY}", data=body, method="POST",
-                                     headers={"Content-Type": "application/json"})
-        # The lodge's own API is local: never through a proxy from the environment.
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=10) as answer:
-            answer.read()
+        _post(f"🪵 your mail for {wolt} is waiting, but {wolt} can't wake now: {plain(reason)}", None)
     except Exception as exc:
         log.warning("owner notice for %s not sent: %s", wolt, type(exc).__name__)
 

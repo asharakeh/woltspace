@@ -146,3 +146,21 @@ def test_a_sender_recreated_between_the_read_and_the_notice_is_not_told(agents, 
     inbox_notice.notice(agents.root, "pal", "no_progress", owner=False)
     assert lodge_mail(agents, "nunu") == [] and agents.woken == []
 
+
+
+def test_every_wake_outcome_gives_the_owner_exactly_one_line_per_message(lodge):
+    import chat_state
+    chat, line = {"adapter": "chat", "chat": "4242"}, "🪵 your mail for pal is waiting, but pal can't wake now: "
+    chat_state.put(lodge.root, "chat", "4242", {"active_wolt": "pal", "active_session": "pal-old-den-000001"})
+    for how, kw in (("hinted", {"session": "pal-a-b-000002"}), ("resumed", {"session": "pal-c-d-000003"}),
+                    ("started", {"session": "pal-e-f-000004"}), ("blocked", {"reason": "launch_unknown"}),
+                    ("error", {"reason": "error"})):
+        inbox_notice.outcome(lodge.root, "pal", seqs=[7], how=how, chat=chat, **kw)
+    inbox_notice.outcome(lodge.root, "pal", seqs=[8, 9], how="hinted", session="pal-a-b-000002")  # one wake, 2 messages
+    assert [body["message"] for _, body in lodge.sent] == [
+        "🪵 pal-a-b-000002 notified\npal-a-b-000002", "🪵 pal-c-d-000003 notified\npal-c-d-000003",
+        "🪵 pal-e-f-000004 notified\npal-e-f-000004", line + "an earlier start of it never confirmed and may still come up",
+        line + "the lodge hit an error while waking it", "🪵 pal-a-b-000002 notified\npal-a-b-000002",
+        "🪵 pal-a-b-000002 notified\npal-a-b-000002"]
+    assert [(b.get("adapter"), b.get("route")) for _, b in lodge.sent] == [("chat", "4242")] * 5 + [(None, None)] * 2
+    assert chat_state.get(lodge.root, "chat", "4242")["active_session"] == "pal-e-f-000004"  # the last one reached

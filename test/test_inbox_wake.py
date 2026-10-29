@@ -1066,3 +1066,8 @@ def test_a_pickup_that_finds_its_new_session_busy_sends_the_owner_no_second_line
     sys.modules["native_adapters"].deliver = lambda record_, hint: ("pending", "busy")  # its START turn runs
     inbox_wake._wake(str(lodge.root), "pal", once=True)  # the post-publication pickup
     assert [line[0] for line in notices.lines] == ["started"]
+
+
+def test_the_wake_texts_say_an_ack_confirms_receipt_not_completion():
+    for text in (inbox_wake.START, inbox_wake.HINT):
+        assert "ACK confirms receipt, not task completion" in text and "woltspace inbox release" in text

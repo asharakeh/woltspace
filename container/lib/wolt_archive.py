@@ -179,7 +179,11 @@ def archive_wolt(name: str, *, wolts_dir: Path, now: int | None = None) -> dict:
         if held:
             raise ArchiveError(409, f"{name} has a session that holds", held=held)
         _mailbox(name, wolts_dir, "archived")  # no new mail or claims from here on
-        stopped = _end_live(registry, name, now)
+        try:
+            stopped = _end_live(registry, name, now)
+        except Exception:  # the wolt stays live: so does its mailbox
+            _mailbox(name, wolts_dir, "open")
+            raise
         target.parent.mkdir(exist_ok=True)
         try:
             os.rename(home, target)

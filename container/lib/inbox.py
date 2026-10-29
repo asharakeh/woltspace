@@ -238,15 +238,14 @@ class Store:
     # -- the waker's (inbox_wake.py), under the agent's lifecycle lock ------------
 
     def wake_facts(self, wolt: str) -> dict | None:
-        """The open mailbox's queued count, its wake state, and the first acks by
-        the reserved session's readers (its progress), in one snapshot."""
+        """The open mailbox's queued counts, its wake state and the mail no wake answered
+        yet, in one snapshot."""
         with self._read() as conn:
             row = conn.execute("SELECT id, state, wake FROM inbox_mailboxes WHERE wolt=?"
                                " AND state != 'closed'", (wolt,)).fetchone()
             if row is None:
                 return None
             wake = json.loads(row["wake"] or "{}")
-            session = (wake.get("reserved") or {}).get("session", "")
             # mail after the last one a wake answered, in any state (before any answer: the
             # queued only); a reader's session once one has taken it
             since, args = (("m.seq > ?", (wake["answered"],)) if "answered" in wake
@@ -258,8 +257,6 @@ class Store:
                                           " AND state='queued' AND priority=?", (row["id"], HUMAN)).fetchone()[0],
                     "human_seq": conn.execute("SELECT max(seq) FROM inbox_messages WHERE mailbox=?"
                                               " AND state='queued' AND priority=?", (row["id"], HUMAN)).fetchone()[0],
-                    "acks": conn.execute("SELECT coalesce(sum(acks), 0) FROM inbox_readers"
-                                         " WHERE session=?", (session,)).fetchone()[0],
                     "prefer_queued": conn.execute(  # the preference's own message, still for its session
                         "SELECT 1 FROM inbox_messages WHERE seq=? AND state='queued'",
                         ((wake.get("prefer") or {}).get("seq"),)).fetchone() is not None,

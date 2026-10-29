@@ -200,7 +200,7 @@ def deliver(record: dict, hint: str) -> tuple[str, str]:
     deadline = time.monotonic() + BUDGET
     try:
         status, code, ready = state(record)
-        if status == "unavailable" or ready is None:
+        if status != "ready":  # unavailable, launching, not ready or a listener gone: nothing placed
             return status, code
         native = record["native"]
         engine = engine_state(native["addr"]) if native["kind"] in (KINDS["claude"], KINDS["codex"]) else "idle"

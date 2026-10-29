@@ -121,11 +121,11 @@ def test_registry_facts_then_the_ready_file_decide_before_any_send(lodge, change
     assert not (directory / "hint").exists()  # nothing was handed over
 
 
-def test_an_expired_claude_listener_still_gets_the_hint_placed(lodge):
+def test_an_expired_claude_listener_gets_no_hint_placed(lodge):
     _, live = lodge
     record = live("claude", ready={"armed_at": time.time() - 86401})
-    assert na.deliver(record, HINT) == ("pending", "placed")
-    assert (Path(record["native"]["addr"]) / "hint").read_text() == HINT
+    assert na.deliver(record, HINT) == ("pending", "listener_expired")  # a wait, never "hinted"
+    assert not (Path(record["native"]["addr"]) / "hint").exists()
 
 
 def test_a_file_hint_is_submitted_once_claimed_and_pending_otherwise(lodge):

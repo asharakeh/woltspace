@@ -14,12 +14,14 @@ Phase 1 nouns:
   session spawn <wolt> [--from <wolt>]  # optional seed prompt on stdin
   session hold [<duration> <reason> | off]  # keep up for a background task
   inbox send <wolt> --key K | fetch | ack|release <seq> <claim> | status [--key K]
+                                     # ack = received into your context, not task done
 
 A wolt self-identifies as the sender via $WOLTSPACE_WOLT_NAME /
 $WOLTSPACE_WOLT_SESSION (exported
 into every wolt session). A human posts with --from (e.g. --from jerpint).
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -269,8 +271,9 @@ def cmd_session_send(args):
         # names its wolt's mailbox; the reader who reads it is the wolt's choice.
         wolt = target.rsplit("-", 3)[0] if _SESSION_RE.search(target) and target.count("-") >= 3 else target
         header = f"[message from {from_wolt}" + (f", session={from_session}" if from_session else "") + "]"
-        reply = f"\n{session_send_reply_instruction(from_session)}" if from_session else ""
-        key = f"iwcl-{uuid.uuid4().hex}"
+        key = args.key or f"iwcl-{uuid.uuid4().hex}"  # a re-run with --key is the same message:
+        delimiter = "WOLTSPACE_IWCL_" + hashlib.sha256(key.encode()).hexdigest()[:16].upper()  # same body
+        reply = f"\n{session_send_reply_instruction(from_session, delimiter)}" if from_session else ""
         body = {"to": wolt, "key": key, "text": f"{header}\n{message}{reply}",
                 **({"session": target} if wolt != target else {})}  # only the wake's first choice
         # The outcome can be unknown (no answer, a lost commit reply): the key
@@ -761,7 +764,8 @@ def main():
     bs.add_argument("--key", required=True, help="your id for this message: a retry with it is safe")
     bsub.add_parser("fetch", help="claim the next message, the same one again until ack or release")
     for verb in ("ack", "release"):
-        bp = bsub.add_parser(verb, help="received" if verb == "ack" else "give a claim back unhandled")
+        bp = bsub.add_parser(verb, help="confirm receipt: the message is in your context (not that the task "
+                             "is done)" if verb == "ack" else "give a claim back you cannot accept")
         bp.add_argument("seq", type=int)
         bp.add_argument("claim", type=int)
     bsub.add_parser("status", help="a sent message, or this mailbox's counts").add_argument("--key")

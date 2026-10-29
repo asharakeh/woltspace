@@ -155,6 +155,7 @@ def test_codex_hints_go_through_queue_on_the_sessions_own_socket(lodge, tmp_path
     fake = fake_bin(tmp_path, "codex", body + "\n")
     monkeypatch.setenv("PATH", f"{fake.parent}:{os.environ['PATH']}")
     record = live("codex", ready={"sock": "/x/app.sock", "thread": "t1"})
+    na.write_state(record["native"]["addr"], False)  # its watcher has seen it idle
     started = time.monotonic()
     assert na.deliver(record, HINT) == expected
     assert time.monotonic() - started < na.BUDGET + 0.5
@@ -426,8 +427,12 @@ def test_a_busy_engine_gets_nothing_now_and_a_dead_watcher_never_holds_hints(lod
     assert not (directory / "hint").exists()
     gone = subprocess.Popen(["true"])
     gone.wait()
-    na.write_state(directory, True, gone.pid)  # its keeper is gone: the state no longer counts
-    assert not na.is_busy(directory)
+    na.write_state(directory, True, gone.pid)  # its keeper is gone: unknown, never idle
+    assert na.engine_state(directory) == "unknown" and not na.is_busy(directory)
+    if harness == "codex":  # no observed state: a silent wait, never a blind `codex queue`
+        assert na.deliver(record, HINT) == ("pending", "not_ready")
+        na.clear_state(directory)
+        assert na.deliver(record, HINT) == ("pending", "not_ready")
     na.retire(record["native"])
     assert na.write_state(directory, True) is False
 
@@ -495,20 +500,23 @@ def test_the_codex_watcher_follows_its_own_thread_and_announces_each_turn_end(lo
 
     def app_server(conn):
         for raw in conn:
-            if json.loads(raw).get("id") == 2:
-                conn.send(json.dumps({"id": 2, "result": {"thread": {"id": "t1", "status": {"type": "idle"}}}}))
+            if json.loads(raw).get("id") == 2:  # the TUI's first turn is still running when the watch starts
+                conn.send(json.dumps({"id": 2, "result": {"thread": {"id": "t1", "status": {"type": "active"}}}}))
                 break
-        for frame in (status("t1", "active"), status("title", "idle"), status("t1", "idle"),
-                      status("t1", "active")):
+        time.sleep(0.2)
+        for frame in (status("title", "idle"), status("t1", "idle"), status("t1", "active"), status("t1", "idle")):
             conn.send(frame)
             time.sleep(0.2)
-            states.append(na.is_busy(directory))
+            states.append(na.engine_state(directory))
+    known = []
     with unix_serve(app_server, sock) as server:
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        try:
-            launch.watch_codex(sock, "t1", directory, "a1")  # returns when the stand-in closes
+        try:  # returns when the stand-in closes
+            launch.watch_codex(sock, "t1", directory, "a1", on_known=lambda: known.append(na.engine_state(directory)))
         finally:
             server.shutdown()
             stand_in.server.shutdown()
-    assert states == [True, True, False, True]  # the helper thread's idle changes nothing
-    assert [body.get("kind") for _, _, body in stand_in.seen] == ["turn_end"]  # one per active -> idle
+    assert known == ["busy"]  # readiness is exposed only after a first, real status
+    assert states == ["busy", "idle", "busy", "idle"]  # the helper thread's idle changes nothing
+    assert [body.get("kind") for _, _, body in stand_in.seen] == ["turn_end", "turn_end"]  # one per active -> idle
+    assert na.engine_state(directory) == "unknown"  # a lost watch is not idle

@@ -103,13 +103,24 @@ def write_state(directory: str | Path, busy: bool, pid: int | None = None) -> bo
     return True
 
 
-def is_busy(directory: str | Path) -> bool:
+def engine_state(directory: str | Path) -> str:
+    """busy | idle | unknown (no state yet, or its keeper is gone): unknown is never idle."""
     try:
         state_ = json.loads((Path(directory) / STATE).read_text())
     except (OSError, ValueError):
-        return False
+        return "unknown"
     pid = state_.get("pid")
-    return state_.get("busy") is True and (pid is None or _alive(pid))
+    if pid is not None and not _alive(pid):
+        return "unknown"
+    return "busy" if state_.get("busy") is True else "idle"
+
+
+def is_busy(directory: str | Path) -> bool:
+    return engine_state(directory) == "busy"
+
+
+def clear_state(directory: str | Path) -> None:
+    (Path(directory) / STATE).unlink(missing_ok=True)
 
 
 def _alive(pid: int) -> bool:
@@ -192,8 +203,11 @@ def deliver(record: dict, hint: str) -> tuple[str, str]:
         if status == "unavailable" or ready is None:
             return status, code
         native = record["native"]
-        if native["kind"] in (KINDS["claude"], KINDS["codex"]) and is_busy(native["addr"]):
+        engine = engine_state(native["addr"]) if native["kind"] in (KINDS["claude"], KINDS["codex"]) else "idle"
+        if engine == "busy":
             return "pending", "busy"  # nothing placed: the turn_end announce brings the wake back
+        if engine == "unknown" and native["kind"] == KINDS["codex"]:  # not yet (or no longer) observed
+            return "pending", "not_ready"
         if native["kind"] == KINDS["codex"]:
             return _codex(ready, hint, deadline)
         if native["kind"] == KINDS["opencode"]:

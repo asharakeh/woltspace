@@ -624,3 +624,17 @@ def test_an_owners_stop_still_blocks_a_resume_and_a_start(lodge, resting, monkey
     mail(lodge, human=False)
     inbox_wake._wake(str(lodge.root), "pal")
     assert resting.spawned == [] and wake_state(lodge)["inhibited"] == "stopped"
+
+
+@pytest.mark.parametrize("failure", [sessions.ResumeFailed("no agent came up"), subprocess.TimeoutExpired("tmux", 10)])
+def test_a_failed_or_unknown_resume_never_falls_back_to_a_new_session(lodge, resting, monkeypatch, failure):
+    def resume(name, prompt=""):
+        raise failure
+    monkeypatch.setattr(sessions, "resume_session", resume)
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: pytest.fail("a second worker after a failed resume"))
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # the resume fails: logged, the reservation holds
+    assert wake_state(lodge)["reserved"]["session"] == "pal-rest"
+    mail(lodge, "k2", human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # still no new session: no_progress per the existing rule
+    assert wake_state(lodge)["inhibited"] == "no_progress"

@@ -141,11 +141,13 @@ _MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
         # The lodge inbox (inbox.py): a mailbox per agent, pulled by its
         # sessions. Off unless woltspace.json enables it. Ids are never reused:
         # a recreated wolt gets a new mailbox, and a closed one stays closed.
+        # wake: the waker's JSON (inbox_wake.py): its reserved session, or why it is inhibited.
         """CREATE TABLE IF NOT EXISTS inbox_mailboxes (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             wolt       TEXT NOT NULL,
             state      TEXT NOT NULL,
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL,
+            wake       TEXT
         )""",
         "CREATE UNIQUE INDEX IF NOT EXISTS inbox_mailbox_wolt"
         " ON inbox_mailboxes(wolt) WHERE state != 'closed'",

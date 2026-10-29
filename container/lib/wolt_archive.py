@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 import inbox
+import lifecycle
 from execution_policy import AutoGrantStore
 from paths import space_wolf_dir
 from wolfcore import forget_last_run
@@ -124,6 +125,8 @@ def _end_session(registry: SessionRegistry, name: str, wolt: str, now: int, *,
         handle = RuntimeHandle.from_record(data or {})
         if data is None or not get_runtime().is_alive(handle):
             return False
+        if data.get("launching"):
+            raise ArchiveError(409, f"session {name} has an unresolved launch")
         # A hold may have come since the check before the move.
         if not sweep and hold_active(data, now):
             raise ArchiveError(409, f"{wolt} has a session that holds", held=[_held(data)])
@@ -162,7 +165,7 @@ def archive_wolt(name: str, *, wolts_dir: Path, now: int | None = None) -> dict:
     check_wolt_name(name)
     wolts_dir = Path(wolts_dir)
     home = wolts_dir / name
-    with _LOCK:
+    with _LOCK, lifecycle.agent_lock(wolts_dir, name):  # no start or wake meanwhile
         target = _archive_root(wolts_dir) / name
         _no_link(home, wolts_dir)  # a linked wolt folder would be archived as the link
         # Before any registry call: a lookup creates the wolt's sessions folder.
@@ -246,7 +249,7 @@ def unarchive_wolt(name: str, *, wolts_dir: Path) -> dict:
     check_wolt_name(name)
     wolts_dir = Path(wolts_dir)
     home = wolts_dir / name
-    with _LOCK:
+    with _LOCK, lifecycle.agent_lock(wolts_dir, name):  # no start or wake meanwhile
         source = _no_link(_archive_root(wolts_dir) / name, wolts_dir)
         if not is_archived(name, wolts_dir=wolts_dir):
             raise ArchiveError(404, f"no archived wolt named {name}")
@@ -298,7 +301,7 @@ _ON_ERROR = "onexc" if sys.version_info >= (3, 12) else "onerror"
 def delete_archived_wolt(name: str, *, wolts_dir: Path) -> dict:
     check_wolt_name(name)
     wolts_dir = Path(wolts_dir)
-    with _LOCK:
+    with _LOCK, lifecycle.agent_lock(wolts_dir, name):  # no start or wake meanwhile
         target = _archive_root(wolts_dir) / name
         # Only from the archive: a live wolt is archived first. No wolt.json
         # needed, so a delete that failed halfway can run again.

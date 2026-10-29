@@ -14,6 +14,8 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 import inbox
+import inbox_wake
+import lifecycle
 
 from .config import WOLTS_DIR
 
@@ -22,11 +24,28 @@ TOKEN_HEADER = "X-Woltspace-Inbox-Token"
 _FIELDS = {"send": {"to", "key", "text"}, "fetch": set(), "ack": {"seq", "claim"},
            "release": {"seq", "claim"}, "status": {"key"}}
 _HTTP = {"inbox_disabled": 404, "unsupported": 404, "invalid": 400, "reader_invalid": 401,
-         "store_busy": 503, "store_failed": 503}
+         "store_busy": 503, "store_failed": 503, "lifecycle_busy": 409, "launch_unknown": 409}
 
 
 def _error(code: str) -> JSONResponse:
     return JSONResponse({"error": code}, status_code=_HTTP.get(code, 409))
+
+
+@router.post("/rearm")
+async def inbox_rearm(request: Request):
+    """The owner's explicit rearm of an agent's inhibited wake (inbox_wake.rearm)."""
+    if not inbox.enabled(WOLTS_DIR):
+        return _error("inbox_disabled")
+    try:
+        body = json.loads(await request.body() or b"{}")
+        wolt = body["wolt"]
+        assert set(body) == {"wolt"} and isinstance(wolt, str)
+    except (ValueError, KeyError, TypeError, AssertionError):
+        return _error("invalid")
+    try:
+        return {"ok": True, "result": await run_in_threadpool(inbox_wake.rearm, WOLTS_DIR, wolt)}
+    except (inbox.InboxError, lifecycle.LifecycleBusy, lifecycle.LifecycleUnknown) as exc:
+        return _error(exc.code)
 
 
 @router.post("/{verb}")
@@ -53,4 +72,6 @@ async def inbox_call(verb: str, request: Request):
         result = await run_in_threadpool(call)
     except inbox.InboxError as exc:
         return _error(exc.code)
+    if verb == "send":  # committed: wake the recipient (never blocks or raises)
+        await run_in_threadpool(inbox_wake.notify_admitted, WOLTS_DIR, result)
     return {"ok": True, "result": dataclasses.asdict(result) if dataclasses.is_dataclass(result) else result}

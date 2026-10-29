@@ -246,6 +246,11 @@ async def lifespan(app: FastAPI):
     _start_file_watcher()
     _start_tool_gc()
     tunnel_mgr.start_tunnel()
+    try:  # mail admitted just before a crash still gets its wake
+        import inbox_wake
+        await asyncio.to_thread(inbox_wake.reconcile, WOLTS_DIR)
+    except Exception as exc:
+        print(f"[inbox] wake reconcile failed: {type(exc).__name__}: {exc}")
     try:
         import connector_host
         await connector_host.start(WOLTS_DIR)

@@ -1224,7 +1224,7 @@ _KNOWN_SCHEMA = 5  # lodge_db's newest migration this check understands
 # The inbox tables exactly as lodge_db's migration 5 makes them; any other
 # layout (a table or column more or less) is one this check cannot read.
 _INBOX_COLUMNS = {
-    "inbox_mailboxes": {"id", "wolt", "state", "created_at"},
+    "inbox_mailboxes": {"id", "wolt", "state", "created_at", "wake"},
     "inbox_readers": {"hash", "mailbox", "session", "created_at", "revoked", "acks"},
     "inbox_messages": {"seq", "sender", "sender_name", "key", "mailbox", "priority", "body", "size",
                        "digest", "state", "reader", "claim", "created_at", "acked_at"},

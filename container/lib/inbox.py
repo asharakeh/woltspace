@@ -235,6 +235,35 @@ class Store:
             if state == "closed":
                 conn.execute("UPDATE inbox_readers SET revoked=1 WHERE mailbox=?", (row[0],))
 
+    # -- the waker's (inbox_wake.py), under the agent's lifecycle lock ------------
+
+    def wake_facts(self, wolt: str) -> dict | None:
+        """The open mailbox's queued count, its wake state, and the first acks by
+        the reserved session's readers (its progress), in one snapshot."""
+        with self._read() as conn:
+            row = conn.execute("SELECT id, state, wake FROM inbox_mailboxes WHERE wolt=?"
+                               " AND state != 'closed'", (wolt,)).fetchone()
+            if row is None:
+                return None
+            wake = json.loads(row["wake"] or "{}")
+            session = (wake.get("reserved") or {}).get("session", "")
+            return {"open": row["state"] == "open", "wake": wake,
+                    "queued": conn.execute("SELECT count(*) FROM inbox_messages WHERE mailbox=?"
+                                           " AND state='queued'", (row["id"],)).fetchone()[0],
+                    "acks": conn.execute("SELECT coalesce(sum(acks), 0) FROM inbox_readers"
+                                         " WHERE session=?", (session,)).fetchone()[0]}
+
+    def queued_wolts(self) -> list[str]:
+        with self._read() as conn:
+            return [row[0] for row in conn.execute(
+                "SELECT DISTINCT b.wolt FROM inbox_mailboxes b JOIN inbox_messages m ON m.mailbox = b.id"
+                " WHERE b.state = 'open' AND m.state = 'queued'")]
+
+    def set_wake(self, wolt: str, wake: dict) -> None:
+        with self._write() as conn:
+            conn.execute("UPDATE inbox_mailboxes SET wake=? WHERE wolt=? AND state != 'closed'",
+                         (json.dumps(wake) if wake else None, wolt))
+
     # -- the reader's -----------------------------------------------------------
 
     def send(self, token: str, to: str, key: str, body: str) -> Status:

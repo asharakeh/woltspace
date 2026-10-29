@@ -226,6 +226,19 @@ def cmd_inbox(args):
     print(json.dumps(result["result"], indent=2))
 
 
+def cmd_inbox_rearm(args):
+    """The owner's explicit clear of an agent's inhibited inbox wake. Not from
+    inside an agent session: a cooperative guard, not authentication."""
+    if os.environ.get("WOLTSPACE_INBOX_TOKEN"):
+        print("woltspace: inbox rearm is for the lodge's owner, not an agent session", file=sys.stderr)
+        sys.exit(2)
+    status, result = _req("POST", "/inbox/rearm", {"wolt": args.wolt})
+    if not result.get("ok"):
+        print(f"woltspace inbox rearm: {result.get('error', status)}", file=sys.stderr)
+        sys.exit(1)
+    print(f"{args.wolt}: inbox wake rearmed")
+
+
 def cmd_session_send(args):
     try:
         command = session_send_argv(
@@ -712,6 +725,9 @@ def main():
     bsub.add_parser("status", help="a sent message, or this mailbox's counts").add_argument("--key")
     for verb_parser in bsub.choices.values():
         verb_parser.set_defaults(func=cmd_inbox)
+    rearm = bsub.add_parser("rearm", help="(operator) let the lodge wake an agent for its mail again")
+    rearm.add_argument("wolt")
+    rearm.set_defaults(func=cmd_inbox_rearm)
 
     argv = sys.argv[1:]
     # tui: exec the terminal cockpit (same app the host launcher runs; it

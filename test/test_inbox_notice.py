@@ -45,7 +45,8 @@ def test_queued_human_mail_gets_one_body_free_notice_on_the_default_channel(lodg
     lodge.store.admit("connector:telegram", "telegram:1", "pal", BODY, human=True)
     inbox_notice.owner_notice(lodge.root, "pal", "not_startable")
     [(path, body)] = lodge.sent
-    assert (path, body["session"]) == ("/notify", "")
+    # The lodge's endpoint never runs here: WOLTSPACE_API is this file's loopback stand-in.
+    assert (path, body["session"]) == (inbox_notice.NOTIFY, "")
     assert body["message"] == ("🪵 your mail for pal is waiting, but pal can't wake now: "
                                "it can't be started automatically")
     assert set(body) == {"session", "message"} and BODY not in json.dumps(body)
@@ -72,10 +73,10 @@ def test_a_notice_that_cannot_be_sent_never_raises(lodge, failure):
 
 def test_each_human_message_to_a_wolt_that_cannot_wake_gets_its_own_notice(lodge):
     lodge.store.admit("connector:telegram", "telegram:1", "pal", BODY, human=True)
-    lodge.store.set_wake("pal", {"inhibited": "not_startable"})  # an inhibition older than the mail
+    lodge.store.set_wake("pal", {"inhibited": "no_progress"})  # held even for human mail, older than it
     for n in (1, 2):
         if n == 2:
             lodge.store.admit("connector:telegram", "telegram:2", "pal", BODY, human=True)
         inbox_wake._wake(str(lodge.root), "pal")  # the wake each admission schedules
         assert len(lodge.sent) == n
-    assert all(body["message"].endswith("it can't be started automatically") for _, body in lodge.sent)
+    assert all(body["message"].endswith("its last wake didn't pick the mail up") for _, body in lodge.sent)

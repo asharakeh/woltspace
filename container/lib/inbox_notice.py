@@ -17,6 +17,7 @@ import inbox
 from env_compat import get_env
 
 log = logging.getLogger("inbox_notice")
+NOTIFY = "/notify"  # the lodge's own outbound path, on its API
 
 # Why a wake is inhibited, in the owner's words.
 REASONS = {
@@ -39,7 +40,7 @@ def owner_notice(wolts_dir, wolt: str, reason: str) -> None:
         body = json.dumps({"session": "", "message": f"🪵 your mail for {wolt} is waiting, but {wolt} "
                                                        f"can't wake now: {plain(reason)}"}).encode()
         api = get_env("WOLTSPACE_API", "http://localhost:7777")
-        req = urllib.request.Request(f"{api}/notify", data=body, method="POST",
+        req = urllib.request.Request(f"{api}{NOTIFY}", data=body, method="POST",
                                      headers={"Content-Type": "application/json"})
         # The lodge's own API is local: never through a proxy from the environment.
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=10) as answer:

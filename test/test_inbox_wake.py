@@ -463,13 +463,19 @@ def test_the_owner_is_told_whenever_mail_neither_hints_nor_starts(lodge, wake, n
     def refuse(**kw):
         raise PermissionError("prompt mode")
     monkeypatch.setattr(sessions, "start_session", refuse)
-    mail(lodge)
-    inbox_wake._wake(str(lodge.root), "pal")  # sets not_startable
-    inbox_wake._wake(str(lodge.root), "pal")  # finds it already set
+    mail(lodge, human=False)  # agent mail only: inbox_notice would stay silent, so none is reserved
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert notices == []
+    mail(lodge, "k2")
+    inbox_wake._wake(str(lodge.root), "pal")  # not_startable, retried for the owner's mail, refused again
+    inbox_wake._wake(str(lodge.root), "pal")  # a repeat wake, a resend, a ready call: no second notice
+    assert notices == [("pal", "not_startable")]
+    mail(lodge, "k3")  # new owner mail: its own notice
+    inbox_wake._wake(str(lodge.root), "pal")
     lodge.registry.create("pal-x", wolt="pal")
     lodge.registry.update("pal-x", launching={"attempt": "a9"})
-    lodge.store.set_wake("pal", {})
-    inbox_wake._wake(str(lodge.root), "pal")  # an unresolved launch
+    inbox_wake._wake(str(lodge.root), "pal")  # same mail, a changed reason: a fresh notice
+    inbox_wake._wake(str(lodge.root), "pal")
     assert notices == [("pal", "not_startable"), ("pal", "not_startable"), ("pal", "launch_unknown")]
 
 

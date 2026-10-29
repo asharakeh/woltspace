@@ -150,6 +150,8 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         if inhibited == "not_startable" and facts["human"]:
             inhibited = None
         why = None if live else (inhibited or _start(store, registry, wolt, facts))
+        if why:
+            why = _reserve_notice(store, wolt, why)
         if live:
             record = registry.get(live, wolt=wolt, check_alive=False) or {}
             hinted = {"session": live, "attempt": record.get("attempt")}
@@ -185,12 +187,25 @@ def _start(store, registry, wolt: str, facts: dict) -> None:
         if facts["acks"] <= reserved.get("acks", 0):
             return _inhibit(store, wolt, wake, "no_progress")
     name = sessions.session_name(wolt)
-    store.set_wake(wolt, {"reserved": {"session": name, "acks": 0, "at": int(time.time())}})
+    keep = {"noticed": wake["noticed"]} if "noticed" in wake else {}  # the owner was told about this mail
+    store.set_wake(wolt, {**keep, "reserved": {"session": name, "acks": 0, "at": int(time.time())}})
     try:  # the owner's own mail starts the wolt in its own mode, as Telegram did before the inbox
         sessions.start_session(wolt=wolt, prompt=START, name=name, require_auto=not facts["human"])
     except (PermissionError, ValueError, sessions.HarnessNotInstalled) as exc:
-        return _inhibit(store, wolt, {"detail": str(exc)[:200]}, "not_startable")
+        return _inhibit(store, wolt, {**keep, "detail": str(exc)[:200]}, "not_startable")
     return None
+
+
+def _reserve_notice(store, wolt: str, reason: str) -> str | None:
+    """One owner notice per newest queued human message and reason, reserved under the
+    lock before it is sent: a repeat wake, a resend or a ready call adds none; new human
+    mail or a changed reason gets one. Recorded as attempted, never retried. None: skip."""
+    facts = store.wake_facts(wolt)
+    noticed = {"seq": (facts or {}).get("human_seq"), "reason": reason}
+    if not facts or noticed["seq"] is None or facts["wake"].get("noticed") == noticed:
+        return None
+    store.set_wake(wolt, {**facts["wake"], "noticed": noticed})
+    return reason
 
 
 def _inhibit(store, wolt: str, wake: dict, reason: str) -> str:

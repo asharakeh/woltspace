@@ -90,7 +90,7 @@ def test_telegram_to_a_woken_session_to_its_own_fetch_and_ack(flow, monkeypatch)
     to_chat = {"adapter": "telegram", "chat_id": CHAT, "session": ""}
     assert lines == [{**to_chat, "message": f"🪵 {name} notified\n{name}"}]
     record = sessions.SessionRegistry(flow.root).get(name, check_alive=False)
-    assert record["prompt"] == inbox_wake.START[:500] and record["native"]["attempt"] == record["attempt"]
+    assert record["prompt"] == inbox_wake.START.format(sender=" from your human")[:500] and record["native"]["attempt"] == record["attempt"]
     assert "launching" not in record
 
     say(flow, "e2", "second")

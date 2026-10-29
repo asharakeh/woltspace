@@ -11,8 +11,11 @@
     const counts=[`${w.queued_human} from you`,`${w.queued_agent} from agents`,`${w.claimed} being read`];
     if(w.held)counts.push(`${w.held} held`);
     copy.append(make('div','connector-line',counts.join(' · ')));
-    const state=w.state!=='open'?w.state:waiting?`waiting · oldest ${age(Math.max(0,now-w.oldest_queued_at))}`:w.held?'held: its reader is gone':'nothing waiting';
-    copy.append(make('div','connector-state'+(w.held?' warn':''),state));
+    const state=make('div','connector-state');
+    if(w.state!=='open')state.append(make('span','',`${w.state} · `));
+    state.append(make('span','',waiting?`waiting · oldest ${age(Math.max(0,now-w.oldest_queued_at))}`:'nothing waiting'));
+    if(w.held)state.append(make('span','warn',` · ${w.held} held: its reader is gone`));
+    copy.append(state);
     el.append(copy);
     return el;
   }

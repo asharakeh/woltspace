@@ -157,6 +157,7 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
             sessions.resume_session(resume, "", only_resting=True)
         except Exception as exc:  # the reservation lets the next wake judge it
             log.warning("inbox wake could not resume %s: %s", resume, exc)
+            _judge_failed_resume(root, registry, wolt, resume)
     if not live:
         if why:  # neither a hint nor a start: outside the lock and any Store write
             _notice(root, wolt, why, owner)
@@ -185,7 +186,8 @@ def _start(store, registry, wolt: str, facts: dict) -> tuple[str | None, str | N
             return None, None  # still settling: kept as it is
     keep = {"noticed": wake["noticed"]} if "noticed" in wake else {}  # the owner was told about this mail
     resting = [r for r in records if r.get("status") == "resting" and sessions.stored_resume_id(r)
-               and not r.get("wake_inhibit")]  # a conversation the owner stopped is never auto-resumed
+               and not r.get("wake_inhibit")  # a conversation the owner stopped is never auto-resumed
+               and not r.get("resume_failed")]  # nor one whose resume failed for certain
     if resting:  # its own conversation, in its own mode: resumed after the lock, without a prompt
         name = max(resting, key=lambda r: r.get("last_activity") or 0)["name"]
         store.set_wake(wolt, {**keep, "reserved": {"session": name, "acks": 0, "at": int(time.time())}})
@@ -199,6 +201,19 @@ def _start(store, registry, wolt: str, facts: dict) -> tuple[str | None, str | N
     except (PermissionError, ValueError, sessions.HarnessNotInstalled) as exc:
         return _inhibit(store, wolt, {**keep, "detail": str(exc)[:200]}, "not_startable"), None
     return None, None
+
+
+def _judge_failed_resume(root, registry, wolt: str, name: str) -> None:
+    """A resume that failed DEFINITELY (nothing launched: the session is still resting,
+    or its new tmux was refused) marks that conversation not auto-resumable, so the next
+    wake resumes another or starts one. An UNKNOWN outcome (a launch still marked, or one
+    that started) is left alone: it holds, with no second worker."""
+    with lifecycle.agent_lock(root, wolt):
+        if any(r.get("launching") for r in registry.records(wolt=wolt)):
+            return
+        with registry.edit(name, wolt=wolt) as current:
+            if current and current.get("status") in ("resting", "stopped"):
+                current["resume_failed"] = True
 
 
 def _reserve_notice(store, wolt: str, reason: str) -> str | None:

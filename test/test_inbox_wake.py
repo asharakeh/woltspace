@@ -628,19 +628,34 @@ def test_mail_with_only_stopped_sessions_starts_one_and_rearm_keeps_the_mark(lod
     assert record(lodge, "pal-rest")["wake_inhibit"]  # still never auto-resumed
 
 
-@pytest.mark.parametrize("failure", [sessions.ResumeFailed("no agent came up"), subprocess.TimeoutExpired("tmux", 10)])
-def test_a_failed_or_unknown_resume_never_falls_back_to_a_new_session(lodge, resting, monkeypatch, failure):
-    def resume(name, prompt="", **kw):
-        raise failure
-    monkeypatch.setattr(sessions, "resume_session", resume)
-    monkeypatch.setattr(sessions, "start_session", lambda **kw: pytest.fail("a second worker after a failed resume"))
-    mail(lodge, human=False)
-    inbox_wake._wake(str(lodge.root), "pal")  # the resume fails: logged, the reservation holds
-    assert wake_state(lodge)["reserved"]["session"] == "pal-rest"
-    mail(lodge, "k2", human=False)
-    inbox_wake._wake(str(lodge.root), "pal")  # still no new session: the same conversation or nothing
-    assert wake_state(lodge)["reserved"]["session"] == "pal-rest"
+def test_a_definite_resume_failure_moves_on_and_an_unknown_one_holds(lodge, resting, monkeypatch):
+    started, calls = [], []
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: started.append(kw) or {})
 
+    def refused(name, prompt="", **kw):  # e.g. an expired conversation: nothing launched
+        calls.append(name)
+        raise sessions.ResumeFailed("the engine refused the conversation")
+    monkeypatch.setattr(sessions, "resume_session", refused)
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert calls == ["pal-rest"] and record(lodge, "pal-rest")["resume_failed"] and started == []
+    mail(lodge, "k2", human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # never that conversation again: a new session
+    assert calls == ["pal-rest"] and len(started) == 1
+
+
+def test_an_unknown_resume_outcome_never_starts_a_second_worker(lodge, resting, monkeypatch):
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: pytest.fail("a second worker after an unknown resume"))
+
+    def lost(name, prompt="", **kw):  # the relaunch was marked, then its tmux call timed out
+        lodge.registry.update(name, status="running", launching={"attempt": "r1"})
+        raise subprocess.TimeoutExpired("tmux", 10)
+    monkeypatch.setattr(sessions, "resume_session", lost)
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert "resume_failed" not in record(lodge, "pal-rest")
+    mail(lodge, "k2", human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # launch_unknown holds
 
 
 @pytest.mark.parametrize("gap", ["stopped", "archived", "other_launching"])

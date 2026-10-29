@@ -23,7 +23,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from native_adapters import ASSETS, KINDS, retire, write_ready  # noqa: E402
+from native_adapters import ASSETS, KINDS, announce_ready, retire, write_ready, write_state  # noqa: E402
 
 CODEX_BYPASS = "--dangerously-bypass-approvals-and-sandbox"
 
@@ -137,6 +137,31 @@ def codex_thread(plan: dict, cwd: str) -> str | None:
     return main[0] if len(main) == 1 else None
 
 
+def watch_codex(sock: str, thread: str, directory: Path, attempt: str) -> None:
+    """Busy/idle from the app-server's thread/status/changed for this thread; announce each turn's end."""
+    from websockets.sync.client import unix_connect
+    with unix_connect(sock, "ws://localhost/", open_timeout=5) as conn:
+        conn.send(json.dumps({"id": 1, "method": "initialize",
+                              "params": {"clientInfo": {"name": "woltspace-native", "version": "1"}}}))
+        conn.send(json.dumps({"method": "initialized"}))
+        conn.send(json.dumps({"id": 2, "method": "thread/read", "params": {"threadId": thread}}))
+        active = False
+        for raw in conn:
+            message = json.loads(raw)
+            if message.get("id") == 2:
+                status = ((message.get("result") or {}).get("thread") or {}).get("status") or {}
+            elif message.get("method") == "thread/status/changed" and message["params"].get("threadId") == thread:
+                status = message["params"].get("status") or {}
+            else:
+                continue
+            now = status.get("type") == "active"
+            if not write_state(directory, now, os.getpid()):
+                return  # retired
+            if active and not now:
+                announce_ready(attempt, "turn_end")
+            active = now
+
+
 def _opencode_api(plan: dict, method: str, path: str, body=None):
     import base64
     auth = base64.b64encode(f"opencode:{plan['password']}".encode()).decode()
@@ -226,6 +251,12 @@ def main(argv: list[str]) -> int:
                 if thread := _wait(lambda: codex_thread(plan, cwd), 120):
                     write_ready(directory, {"kind": native["kind"], "attempt": attempt, "sock": plan["sock"],
                                             "thread": thread, "session_id": thread})
+                    try:
+                        watch_codex(plan["sock"], thread, directory, attempt)
+                    except Exception:  # the app-server went away: the attempt ends with it
+                        pass
+                    finally:  # a stale "busy" must not hold hints back
+                        write_state(directory, False)
             threading.Thread(target=publish, daemon=True).start()
         elif harness == "opencode" and session:
             write_ready(directory, {"kind": native["kind"], "attempt": attempt, "port": plan["port"],

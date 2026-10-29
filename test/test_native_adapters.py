@@ -92,11 +92,13 @@ def test_claude_settings_arm_an_async_rewake_listener_at_start_and_every_turn_en
     wolts, _ = lodge
     native = na.prepare(wolts, "pal-x", "claude", "a1")
     hooks = json.loads((Path(native["addr"]) / "settings.json").read_text())["hooks"]
-    assert sorted(hooks) == ["SessionStart", "Stop"]
-    for event in hooks.values():
-        [hook] = event[0]["hooks"]
+    assert sorted(hooks) == ["SessionStart", "Stop", "UserPromptSubmit"]
+    for event in ("SessionStart", "Stop"):
+        [hook] = hooks[event][0]["hooks"]
         assert hook["asyncRewake"] is True and hook["timeout"] == 86400
         assert hook["command"].endswith(f"claude_rewake.py {native['addr']} a1")
+    [busy] = hooks["UserPromptSubmit"][0]["hooks"]  # synchronous: the turn waits for it
+    assert "asyncRewake" not in busy and busy["command"].endswith(f"claude_rewake.py {native['addr']} a1 --busy")
 
 
 @pytest.mark.parametrize("change, expected", [
@@ -389,3 +391,124 @@ exec sleep 60
     supervisor.kill()
     supervisor.wait(5)
     assert _ends(pid)
+
+
+class Lodge:
+    """A stand-in for POST /inbox/ready: records each announce body and its token header."""
+
+    def __init__(self):
+        self.seen, parent = [], self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                parent.seen.append((self.path, self.headers["X-Woltspace-Inbox-Token"],
+                                    json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.env = {"WOLTSPACE_API": f"http://127.0.0.1:{self.server.server_address[1]}",
+                    "WOLTSPACE_INBOX_TOKEN": "tok", "WOLTSPACE_WOLT_SESSION": "pal-x"}
+
+
+@pytest.mark.parametrize("harness, ready", [("claude", {"armed_at": time.time()}),
+                                            ("codex", {"sock": "/x/app.sock", "thread": "t1"})])
+def test_a_busy_engine_gets_nothing_now_and_a_dead_watcher_never_holds_hints(lodge, harness, ready):
+    _, live = lodge
+    record = live(harness, ready=ready)
+    directory = Path(record["native"]["addr"])
+    na.write_state(directory, True)
+    assert na.deliver(record, HINT) == ("pending", "busy")
+    assert not (directory / "hint").exists()
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    na.write_state(directory, True, gone.pid)  # its keeper is gone: the state no longer counts
+    assert not na.is_busy(directory)
+    na.retire(record["native"])
+    assert na.write_state(directory, True) is False
+
+
+def _hook(directory, event, *extra, env=None):
+    return subprocess.run([sys.executable, str(na.ASSETS / "claude_rewake.py"), str(directory), "a1", *extra],
+                          input=json.dumps({"session_id": "s1", "hook_event_name": event}), capture_output=True,
+                          text=True, timeout=10, env={**os.environ, **(env or {})})
+
+
+def test_claude_marks_a_human_turn_busy_and_never_claims_a_hint_mid_turn(lodge):
+    wolts, _ = lodge
+    native = na.prepare(wolts, "pal-x", "claude", "a1")
+    directory = Path(native["addr"])
+    proc = _listener(directory)  # armed at the previous turn's end
+    proc.stdin.write(json.dumps({"session_id": "s1", "hook_event_name": "Stop"}))
+    proc.stdin.close()
+    deadline = time.monotonic() + 5
+    while not (directory / "ready.json").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    busy = _hook(directory, "UserPromptSubmit", "--busy")  # the human submits a turn
+    assert busy.returncode == 0 and busy.stdout == ""  # stdout would become prompt context
+    assert na.is_busy(directory)
+    (directory / "hint").write_text(HINT)  # a hint that reached the attempt anyway
+    time.sleep(1)
+    assert proc.poll() is None and (directory / "hint").exists()  # held while the turn runs
+    na.write_state(directory, False)  # the turn ends
+    assert proc.wait(5) == 2 and proc.stderr.read().strip() == HINT
+    assert na.is_busy(directory)  # the woken turn is busy until its own Stop
+
+
+def test_claude_announces_the_turn_end_at_stop_and_plain_ready_at_session_start(lodge):
+    wolts, _ = lodge
+    directory = Path(na.prepare(wolts, "pal-x", "claude", "a1")["addr"])
+    stand_in = Lodge()
+    try:
+        for event in ("SessionStart", "Stop"):
+            proc = subprocess.Popen([sys.executable, str(na.ASSETS / "claude_rewake.py"), str(directory), "a1"],
+                                    stdin=subprocess.PIPE, text=True, env={**os.environ, **stand_in.env})
+            proc.stdin.write(json.dumps({"session_id": "s1", "hook_event_name": event}))
+            proc.stdin.close()
+            deadline = time.monotonic() + 5
+            while len(stand_in.seen) < (1 if event == "SessionStart" else 2) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not na.is_busy(directory)
+        (directory / "retired").touch()
+    finally:
+        stand_in.server.shutdown()
+    assert [body for _, _, body in stand_in.seen] == [{"session": "pal-x", "attempt": "a1"},
+                                                     {"session": "pal-x", "attempt": "a1", "kind": "turn_end"}]
+    assert {(path, token) for path, token, _ in stand_in.seen} == {("/inbox/ready", "tok")}
+
+
+def test_the_codex_watcher_follows_its_own_thread_and_announces_each_turn_end(lodge, tmp_path, monkeypatch):
+    from websockets.sync.server import unix_serve
+    wolts, _ = lodge
+    directory = Path(na.prepare(wolts, "pal-x", "codex", "a1")["addr"])
+    stand_in = Lodge()
+    for key, value in stand_in.env.items():
+        monkeypatch.setenv(key, value)
+    states, sock = [], str(directory / "app.sock")
+
+    def status(thread, kind):
+        return json.dumps({"method": "thread/status/changed", "params": {"threadId": thread, "status": {"type": kind}}})
+
+    def app_server(conn):
+        for raw in conn:
+            if json.loads(raw).get("id") == 2:
+                conn.send(json.dumps({"id": 2, "result": {"thread": {"id": "t1", "status": {"type": "idle"}}}}))
+                break
+        for frame in (status("t1", "active"), status("title", "idle"), status("t1", "idle"),
+                      status("t1", "active")):
+            conn.send(frame)
+            time.sleep(0.2)
+            states.append(na.is_busy(directory))
+    with unix_serve(app_server, sock) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            launch.watch_codex(sock, "t1", directory, "a1")  # returns when the stand-in closes
+        finally:
+            server.shutdown()
+            stand_in.server.shutdown()
+    assert states == [True, True, False, True]  # the helper thread's idle changes nothing
+    assert [body.get("kind") for _, _, body in stand_in.seen] == ["turn_end"]  # one per active -> idle

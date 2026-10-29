@@ -164,3 +164,10 @@ def test_every_wake_outcome_gives_the_owner_exactly_one_line_per_message(lodge):
         "🪵 pal-a-b-000002 notified\npal-a-b-000002"]
     assert [(b.get("adapter"), b.get("route")) for _, b in lodge.sent] == [("chat", "4242")] * 5 + [(None, None)] * 2
     assert chat_state.get(lodge.root, "chat", "4242")["active_session"] == "pal-e-f-000004"  # the last one reached
+
+
+def test_one_lost_line_does_not_silence_the_others(lodge):
+    lodge.answer["status"] = 503  # every send fails at the far end...
+    inbox_notice.outcome(lodge.root, "pal", seqs=[1, 2, 3], how="blocked", reason="error")
+    assert len(lodge.sent) == 3  # ...and each message still got its own attempt
+

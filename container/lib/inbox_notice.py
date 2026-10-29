@@ -54,10 +54,14 @@ def outcome(wolts_dir, wolt: str, *, seqs, how: str, session: str | None = None,
                 _follow(wolts_dir, wolt, chat, session)
         else:
             line = f"🪵 your mail for {wolt} is waiting, but {wolt} can't wake now: {plain(reason or how)}"
-        for _ in seqs:
-            _post(line, chat)
     except Exception as exc:
-        log.warning("owner outcome for %s not sent: %s", wolt, type(exc).__name__)
+        log.warning("owner outcome for %s not built: %s", wolt, type(exc).__name__)
+        return
+    for _ in seqs:  # each message its own line: one lost send never silences the others
+        try:
+            _post(line, chat)
+        except Exception as exc:
+            log.warning("owner outcome for %s not sent: %s", wolt, type(exc).__name__)
 
 
 def _post(message: str, chat: dict | None) -> None:

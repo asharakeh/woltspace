@@ -215,7 +215,10 @@ def wake(lodge, monkeypatch):
 
 
 def mail(lodge, key="k1", to="pal", human=True):
-    return lodge.store.admit("telegram", key, to, "hello", human=human)
+    """An admission, recorded for its wake as notify_admitted does (no wake scheduled)."""
+    status = lodge.store.admit("telegram", key, to, "hello", human=human)
+    inbox_wake._admitted(str(lodge.root), status, {})
+    return status
 
 
 def wake_state(lodge):
@@ -419,7 +422,7 @@ def seqs(lodge):
 
 def test_an_inhibited_wolt_with_a_live_session_still_gets_its_hint(lodge, wake, notices):
     mail(lodge)
-    lodge.store.set_wake("pal", {"inhibited": "not_startable"})
+    lodge.store.set_wake("pal", {**wake_state(lodge), "inhibited": "not_startable"})
     lodge.registry.create("pal-live", wolt="pal")
     wake.live = "pal-live"
     inbox_wake._wake(str(lodge.root), "pal")
@@ -729,13 +732,14 @@ def test_mail_handled_before_the_accounting_began_is_never_answered(lodge, wake,
     monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
     lodge.registry.create("pal-live", wolt="pal")
     token = lodge.store.grant("pal-live", "pal")
-    mail(lodge, "old")
+    lodge.store.admit("telegram", "old", "pal", "hello", human=True)
     got = lodge.store.fetch(token)
     lodge.store.ack(token, got.seq, got.claim)  # handled by an earlier lodge, no "answered" yet
-    queued = mail(lodge, "queued")  # queued before the upgrade, its notify never ran
-    inbox_wake.notify_admitted(lodge.root, new := mail(lodge, "new"))
+    queued = lodge.store.admit("telegram", "queued", "pal", "hello", human=True)  # its notify never ran
+    inbox_wake.reconcile(lodge.root)  # the boot after it: a wake, and the default route for it
+    new = mail(lodge, "new")
     assert wake_state(lodge)["answered"] == queued.seq - 1  # below this message and any still queued
-    inbox_wake.notify_admitted(lodge.root, mail(lodge, "next"))
+    mail(lodge, "next")
     assert wake_state(lodge)["answered"] == queued.seq - 1  # set once
     wake.live = "pal-live"
     inbox_wake._wake(str(lodge.root), "pal")
@@ -877,3 +881,18 @@ def test_every_message_an_agents_too_gets_its_outcome_recorded_in_a_bounded_ring
     assert ring[-1] == {"seq": k1 + 2, "how": "blocked", "reason": "hint_failed"} and len(notices.lines) == 1
     inbox_wake.rearm(lodge.root, "pal")
     assert wake_state(lodge)["outcomes"] == ring
+
+
+def test_a_wake_between_an_admission_and_its_route_never_answers_it_elsewhere(lodge, wake, notices, monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    telegram = {"adapter": "telegram", "chat": "42"}
+    status = lodge.store.admit("telegram", "k1", "pal", "hello", human=True)  # committed; its notify not yet run
+    lodge.store.admit("telegram", "a1", "pal", "hello")
+    inbox_wake._wake(str(lodge.root), "pal")  # another wake in the gap
+    (kw, _), = wake.starts
+    assert notices.lines == [] and "outcomes" not in wake_state(lodge)  # it waits for its route, the agent's too
+    inbox_wake.notify_admitted(lodge.root, status, prefer={"session": None, "chat": telegram})
+    wake.live = kw["name"]
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert notices.lines == [("hinted", [status.seq], kw["name"], telegram)]
+    assert [e["seq"] for e in wake_state(lodge)["outcomes"]] == [status.seq, status.seq + 1]

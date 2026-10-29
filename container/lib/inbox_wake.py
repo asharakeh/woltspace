@@ -67,13 +67,16 @@ def notify_admitted(wolts_dir, status, prefer: dict | None = None) -> None:
 
 
 def _admitted(root: str, status, prefer: dict) -> None:
-    """The wake state learns of an admission: the preferred session, this message's chat, and,
-    on a mailbox's first admission since accounting began, the answered baseline (just below
-    this message and any still queued: older mail is never answered again)."""
+    """The wake state learns of an admission: the preferred session; for human mail its route,
+    the chat it came from or None, the default (a human message is answered only once its
+    route is recorded, so a wake in between never sends it elsewhere); and, on a mailbox's
+    first admission since accounting began, the answered baseline (just below this message
+    and any still queued: older mail is never answered again)."""
     try:
         store = inbox.Store(root, inbox.LIMITS)
+        human = status.priority == inbox.HUMAN
         facts = store.wake_facts(status.to)
-        if not facts or (not prefer and "answered" in facts["wake"]):
+        if not facts or (not prefer and not human and "answered" in facts["wake"]):
             return
         with lifecycle.agent_lock(root, status.to):
             facts = store.wake_facts(status.to)
@@ -84,8 +87,8 @@ def _admitted(root: str, status, prefer: dict) -> None:
                 wake["answered"] = min([status.seq] + [m["seq"] for m in facts["unanswered"]]) - 1
             if prefer.get("session"):
                 wake["prefer"] = {"session": prefer["session"], "at": int(time.time())}
-            if prefer.get("chat"):
-                wake["chats"] = {**wake.get("chats", {}), str(status.seq): prefer["chat"]}
+            if human and status.seq > wake["answered"]:
+                wake["chats"] = {**wake.get("chats", {}), str(status.seq): prefer.get("chat")}
             store.set_wake(status.to, wake)
     except Exception:  # the wake still runs, on the usual rule and the default channel
         log.exception("inbox admission of %s not recorded for its wake", status.seq)
@@ -114,9 +117,17 @@ def schedule_pickup(wolts_dir, wolt: str) -> None:
 
 
 def reconcile(wolts_dir) -> None:
-    """At boot: mail admitted just before a crash never got its wake."""
+    """At boot: mail admitted just before a crash never got its wake, nor its route: the
+    owner's line goes to the default channel."""
     if inbox.enabled(wolts_dir):
-        for wolt in inbox.Store(wolts_dir, inbox.LIMITS).queued_wolts():
+        store = inbox.Store(wolts_dir, inbox.LIMITS)
+        for wolt in store.queued_wolts():
+            with lifecycle.agent_lock(wolts_dir, wolt):
+                facts = store.wake_facts(wolt)
+                if facts:
+                    chats = facts["wake"].get("chats", {})
+                    store.set_wake(wolt, {**facts["wake"], "chats": {
+                        **{str(m["seq"]): None for m in facts["unanswered"] if m["human"]}, **chats}})
             _schedule(str(wolts_dir), wolt)
 
 
@@ -283,12 +294,14 @@ def _kept(wake: dict) -> dict:
     return {k: wake[k] for k in ("answered", "outcomes", "prefer", "chats") if k in wake}
 
 
-def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=None, hinted=None) -> None:
+def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=None, hinted=None,
+            routed=True) -> None:
     """Every message no wake answered yet is answered now (one a reader already took: "hinted"
     to that reader's session) and recorded in the wake state's outcomes, under the lock; then
     the owner gets exactly one line per human message (inbox_notice.outcome), never retried,
     each on the chat it came from. how None: only those a reader
-    already took. hinted: also record the hint this attempt had. Never raises."""
+    already took. hinted: also record the hint this attempt had. routed: a human message waits
+    for its route (its admission's); a failed wake answers without one. Never raises."""
     try:
         store = inbox.Store(root, inbox.LIMITS)
         with lifecycle.agent_lock(root, wolt):
@@ -296,8 +309,9 @@ def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=Non
             if not facts:
                 return
             wake = {**facts["wake"], **({"hinted": hinted} if hinted else {})}
-            mail = facts["unanswered"] if how else list(itertools.takewhile(lambda m: m["session"], facts["unanswered"]))
             chats = dict(wake.get("chats", {}))
+            mail = list(itertools.takewhile(lambda m: (how or m["session"]) and (
+                not routed or not m["human"] or str(m["seq"]) in chats), facts["unanswered"]))
             done = [("hinted", m["session"], None) if m["session"] else (how, session, reason) for m in mail]
             if mail:
                 wake["answered"] = mail[-1]["seq"]
@@ -321,7 +335,7 @@ def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=Non
 def _failed(root, wolt: str, reason: str) -> None:
     """A wake that ended in an exception still answers: the senders and the owner are told."""
     _notice(root, wolt, reason)
-    _answer(root, wolt, "error", reason=reason)
+    _answer(root, wolt, "error", reason=reason, routed=False)
 
 
 def _inhibit(store, wolt: str, wake: dict, reason: str) -> str:

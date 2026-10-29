@@ -99,6 +99,13 @@ def test_a_session_target_is_mail_for_its_wolt_and_its_first_choice(lodge):
     assert inbox.Store(lodge["root"], limits()).wake_facts("nunu")["wake"]["prefer"] == prefer
 
 
+def test_an_enrolled_send_with_a_key_is_the_same_message_when_re_run(lodge):
+    for _ in range(2):
+        assert cli(lodge, "session", "send", "nunu", "--key", "k-once").returncode == 0
+    [(seq, to, *_)] = mail(lodge["root"])  # one message, under the sender's own key
+    assert to == "nunu" and rows(lodge["root"], "SELECT key FROM inbox_messages") == [("k-once",)]
+
+
 def test_a_refusal_is_not_queued_and_falls_back_to_nothing(lodge):
     done = send(lodge, "ghost")
     assert (done.returncode, done.stderr) == (1, "not queued (no_mailbox)\n")

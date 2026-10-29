@@ -47,10 +47,14 @@ import lifecycle
 import sessions
 
 log = logging.getLogger("inbox_wake")
-START = ("You have lodge inbox mail. Run `woltspace inbox fetch`, handle the message, then "
-         "`woltspace inbox ack <seq> <claim>`; repeat until fetch returns nothing.")
-HINT = ("New inbox mail: run `woltspace inbox fetch`, then `woltspace inbox ack <seq> <claim>` "
-        "when handled (nonce {nonce}).")
+START = ("You have lodge inbox mail. Fetch your inbox (`woltspace inbox fetch`). ACK each message once "
+         "received into your context (`woltspace inbox ack <seq> <claim>`); ACK confirms receipt, not task "
+         "completion. Release a claim if you cannot accept it (`woltspace inbox release <seq> <claim>`). "
+         "Fetch again for the next message, until fetch returns nothing.")
+HINT = ("New inbox mail. Fetch your inbox (`woltspace inbox fetch`). ACK each message once received into "
+        "your context (`woltspace inbox ack <seq> <claim>`); ACK confirms receipt, not task completion. "
+        "Release a claim if you cannot accept it (`woltspace inbox release <seq> <claim>`). Fetch again "
+        "for the next message (nonce {nonce}).")
 BUSY_RETRIES, BUSY_PAUSE = 5, 2.0
 OUTCOMES = 50  # per-message outcomes kept in the wake state
 _GUARD = threading.Lock()
@@ -235,12 +239,10 @@ def _start(store, registry, wolt: str, facts: dict, prefer: str | None) -> tuple
     if resting:  # its own conversation, in its own mode: resumed after the lock, without a prompt
         name = (prefer if prefer in {r["name"] for r in resting}
                 else max(resting, key=lambda r: r.get("last_activity") or 0)["name"])
-        store.set_wake(wolt, {**keep, "reserved": {"session": name, "acks": 0, "at": int(time.time())}})
-        acks = store.wake_facts(wolt)["acks"]  # what it acked before: progress means a new ack
-        store.set_wake(wolt, {**keep, "reserved": {"session": name, "acks": acks, "at": int(time.time())}})
+        store.set_wake(wolt, {**keep, "reserved": {"session": name, "at": int(time.time())}})
         return "resume", name
     name = sessions.session_name(wolt)
-    store.set_wake(wolt, {**keep, "reserved": {"session": name, "acks": 0, "at": int(time.time())}})
+    store.set_wake(wolt, {**keep, "reserved": {"session": name, "at": int(time.time())}})
     chats = wake.get("chats", {})  # owner mail from a chat: the session answers there, as before the inbox
     owner = [chats[str(m["seq"])] for m in facts["unanswered"] if m["human"] and chats.get(str(m["seq"]))]
     routing = _routing(store.root, owner[-1]) if owner else None

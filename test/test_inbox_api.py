@@ -209,6 +209,18 @@ def test_archive_blocks_the_mailbox_and_delete_waits_for_custody(tmp_path, store
         store.fetch(token)
 
 
+def test_an_archive_that_cannot_end_a_session_leaves_the_mailbox_open(tmp_path, store, live_runtime, monkeypatch):
+    store.admit("ops", "k", "pal", BODY)
+
+    def refuse(*a, **k):
+        raise wolt_archive.ArchiveError(500, "session pal-s could not be stopped")
+    monkeypatch.setattr(wolt_archive, "_end_live", refuse)
+    with pytest.raises(wolt_archive.ArchiveError):
+        wolt_archive.archive_wolt("pal", wolts_dir=tmp_path)
+    assert rows(tmp_path, "SELECT state FROM inbox_mailboxes") == [("open",)]  # the wolt is still live
+    store.admit("ops", "k2", "pal", BODY)
+
+
 def test_archive_and_delete_without_a_mailbox_change_nothing_of_the_inbox(tmp_path, store, live_runtime):
     wolt_archive.archive_wolt("pal", wolts_dir=tmp_path)
     wolt_archive.delete_archived_wolt("pal", wolts_dir=tmp_path)

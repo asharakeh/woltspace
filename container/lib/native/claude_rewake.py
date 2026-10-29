@@ -15,29 +15,36 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from native_adapters import HINT, HOOK_TIMEOUT, KINDS, LISTENER, RETIRED, is_busy, write_ready, write_state  # noqa: E402
+from native_adapters import (CLAUDE_BUSY_TTL, HINT, HOOK_TIMEOUT, KINDS, LISTENER, RETIRED,  # noqa: E402
+                             announce_ready, is_busy, write_ready, write_state)
 
 directory, attempt = Path(sys.argv[1]), sys.argv[2]
 event = json.load(sys.stdin)
 if sys.argv[3:] == ["--busy"]:  # a human turn starts
-    write_state(directory, True)
+    write_state(directory, True, ttl=CLAUDE_BUSY_TTL)
     sys.exit(0)
 me, parent, armed = str(os.getpid()), os.getppid(), time.time()
 (directory / f".{LISTENER}.{me}").write_text(me)
 os.replace(directory / f".{LISTENER}.{me}", directory / LISTENER)  # supersede first: the old one stays gated
-if event.get("hook_event_name") == "Stop":  # a hint from before this turn (none is placed while busy): the
+ended = event.get("hook_event_name") in ("Stop", "StopFailure")  # StopFailure: a turn ended on an API error
+if ended:  # a hint from before this turn (none is placed while busy): the
     (directory / HINT).unlink(missing_ok=True)  # turn_end wake below hints again if mail is still queued
     write_state(directory, False)  # only a turn's end says idle: a start may already run its opening prompt
 if not write_ready(directory, {"kind": KINDS["claude"], "attempt": attempt, "pid": int(me), "armed_at": armed,
                                "session_id": event.get("session_id")},
-                   announce="turn_end" if event.get("hook_event_name") == "Stop" else "ready"):
+                   announce="turn_end" if ended else "ready"):
     sys.exit(0)
+waited = False
 while time.time() < armed + HOOK_TIMEOUT - 60:  # leave before Claude's own timeout ends us
     if (directory / RETIRED).exists() or os.getppid() != parent or (directory / LISTENER).read_text() != me:
         sys.exit(0)
     if is_busy(directory):
+        waited = True
         time.sleep(0.2)
         continue
+    if waited:  # the busy ended with no Stop superseding us (Esc, aged out): a turn ended all the same
+        waited = False
+        announce_ready(attempt, "turn_end")
     try:
         os.rename(directory / HINT, directory / f".claimed.{me}")
     except FileNotFoundError:
@@ -45,6 +52,6 @@ while time.time() < armed + HOOK_TIMEOUT - 60:  # leave before Claude's own time
         continue
     text = (directory / f".claimed.{me}").read_text().strip()
     os.unlink(directory / f".claimed.{me}")
-    write_state(directory, True)  # this wake is a turn; its Stop clears it
+    write_state(directory, True, ttl=CLAUDE_BUSY_TTL)  # this wake is a turn; its Stop clears it
     print(text, file=sys.stderr)
     sys.exit(2)

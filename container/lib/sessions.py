@@ -2038,7 +2038,6 @@ def start_session(
     workdir: str | Path | None = None,
     execution_policy: str | None = None,
     name: str = "",
-    require_auto: bool = False,
 ) -> dict:
     """Start an agent session for a specific wolt.
 
@@ -2050,7 +2049,6 @@ def start_session(
     harness: optional harness override (per-session). Falls back to the wolt's
         wolt.json "harness" field, then the platform default (claude).
     name: a session name reserved by the caller (the inbox wake); default a new one.
-    require_auto: refuse (PermissionError) unless the resolved policy is auto.
 
     Returns dict with session info: name, url, wolt, and optionally app/creature/model.
     Raises ValueError if the wolt directory doesn't exist.
@@ -2101,8 +2099,6 @@ def start_session(
         grants=AutoGrantStore(WOLTS_DIR),
     )
 
-    if require_auto and policy.mode != "auto":
-        raise PermissionError(f"wolt '{wolt}' does not run in auto mode")
     name = name or session_name(wolt)
     # pin wins if valid for the resolved harness, else the tier default (see resolve_model)
     model = resolve_model(harness, creature, pinned_model)

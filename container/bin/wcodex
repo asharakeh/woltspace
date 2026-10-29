@@ -52,4 +52,9 @@ if [ -n "$WOLTSPACE_HOME_DIR" ] && [ -d "$WOLTSPACE_HOME_DIR" ]; then
     fi
 fi
 
+# A launch with a native inbox attempt runs codex against the session's own backend.
+if [ -n "${WOLTSPACE_NATIVE_DIR:-}" ]; then
+    BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+    exec "$BIN_DIR/woltspace-python" "$BIN_DIR/../lib/native/launch.py" codex "$@"
+fi
 exec codex "$@"

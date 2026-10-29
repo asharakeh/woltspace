@@ -59,4 +59,9 @@ EOF
     fi
 fi
 
+# A launch with a native inbox attempt runs hermes against the session's own backend.
+if [ -n "${WOLTSPACE_NATIVE_DIR:-}" ]; then
+    BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+    exec "$BIN_DIR/woltspace-python" "$BIN_DIR/../lib/native/launch.py" hermes "$@"
+fi
 exec hermes "$@"

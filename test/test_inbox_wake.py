@@ -324,6 +324,11 @@ def test_an_explicit_stop_inhibits_and_an_unresolved_launch_waits(lodge, wake, e
     assert len(wake.starts) == 1
     if ending == "stopped":
         assert wake_state(lodge)["inhibited"] == "stopped"
+        inbox_wake.rearm(lodge.root, "pal")  # the owner's rearm outranks the stop it follows
+        deadline = time.monotonic() + 5
+        while len(wake.starts) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(wake.starts) == 2
     else:
         assert "inhibited" not in wake_state(lodge)
         with pytest.raises(lifecycle.LifecycleUnknown):

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import random
@@ -481,28 +482,29 @@ class ChatLodge:
         """Queue an owner message in the wolt's inbox at human priority.
 
         Only handle reaches this, after its owner check: agent mail never says
-        human. The key is the connector's event id, so a resent event is the
-        message already queued. Custody starts when admit commits; a failure
-        is told to the owner, never pasted instead.
+        human. The key is the connector's event id, and the reply instruction's
+        delimiter comes from it, so a resent event builds the same body and
+        gets the message already queued. Anything else under the key is a
+        conflict. Custody starts when admit commits; a failure is told to the
+        owner, never pasted instead.
         """
         chat = self.chat(route)
         key = f"{self.name}:{event_id}"
-        body = f"{self._session_message(text, chat)}\n{self._reply_instruction(chat)}"
+        delimiter = "WOLTSPACE_NOTIFY_" + hashlib.sha256(key.encode()).hexdigest()[:16].upper()
         store = inbox.Store(self.wolts_dir, inbox.LIMITS)
         try:
+            if delimiter in text.splitlines():
+                raise inbox.Invalid("delimiter")
+            reply = notify_reply_instruction(*self.spec.reply_args(self.route_of(chat)), delimiter=delimiter)
+            body = f"{self._session_message(text, chat)}\n{reply}"
             status = await asyncio.to_thread(
                 store.admit, f"connector:{self.name}", key, wolt, body, human=True)
-        except inbox.Conflict:
-            # The reply instruction's delimiter is fresh each time, so a resend
-            # never matches the queued body: our key means it is already queued.
-            status = inbox.Status(seq=0, sender=f"connector:{self.name}", key=key, to=wolt,
-                                  priority=inbox.HUMAN, state="queued")
         except inbox.InboxError as e:
             code = getattr(e, "code", "invalid")
-            _bot_log(f"{self.name}_inbox_refused", {"wolt": wolt, "code": code})
+            _bot_log(f"{self.name}_inbox_refused", {"wolt": wolt, "key": key, "code": code})
             await out.say(Reply(f"🪵 not queued for {self._shown(wolt)}: {code}"))
             return
-        _bot_log(f"{self.name}_inbox_admitted", {"wolt": wolt, "seq": status.seq, "text": text[:200]})
+        _bot_log(f"{self.name}_inbox_admitted", {"wolt": wolt, "seq": status.seq, "key": key})
         self._append_history(chat, "user", text)
         await out.say(Reply(f"🪵 queued for {self._creature_emoji(wolt)} {self._shown(wolt)}"))
         try:

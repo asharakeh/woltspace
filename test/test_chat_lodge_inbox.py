@@ -100,13 +100,23 @@ def test_a_non_owner_queues_nothing_and_wakes_nobody(lodge):
     assert lodge.calls["woken"] == lodge.calls["pasted"] == []
 
 
-def test_a_resent_event_is_queued_once_and_still_wakes(lodge):
-    # Each frame carries a fresh heredoc delimiter, so the resend's body differs.
+def test_a_resent_event_is_the_message_already_queued(lodge):
     assert handle(lodge) == handle(lodge) == ["🪵 queued for 🐾 pal"]
-    assert [r[1] for r in queued(lodge)] == ["telegram:e1"]
-    assert [s.key for s, _ in lodge.calls["woken"]] == ["telegram:e1", "telegram:e1"]
+    [(seq, key)] = rows(lodge.root, "SELECT seq, key FROM inbox_messages")
+    first, again = (s for s, _ in lodge.calls["woken"])
+    assert first == again and (first.seq, first.key) == (seq, "telegram:e1")
     handle(lodge, event_id="e2")
     assert [r[1] for r in queued(lodge)] == ["telegram:e1", "telegram:e2"]
+
+
+def test_a_resent_event_for_another_wolt_is_a_conflict_not_a_wake(lodge):
+    handle(lodge)
+    wolt(lodge.root, "nunu")
+    lodge._save_chat_state(CHAT, {"active_wolt": "nunu", "active_session": "nunu-live-grove-000002"})
+    assert handle(lodge) == ["🪵 not queued for nunu: conflict"]
+    assert [r[1] for r in queued(lodge)] == ["telegram:e1"]
+    assert len(lodge.calls["woken"]) == 1
+    assert lodge.calls["pasted"] == lodge.calls["spawned"] == []
 
 
 def test_a_voice_transcript_is_queued(lodge):

@@ -22,10 +22,12 @@ event = json.load(sys.stdin)
 if sys.argv[3:] == ["--busy"]:  # a human turn starts
     write_state(directory, True)
     sys.exit(0)
-write_state(directory, False)
 me, parent, armed = str(os.getpid()), os.getppid(), time.time()
 (directory / f".{LISTENER}.{me}").write_text(me)
-os.replace(directory / f".{LISTENER}.{me}", directory / LISTENER)
+os.replace(directory / f".{LISTENER}.{me}", directory / LISTENER)  # supersede first: the old one stays gated
+if event.get("hook_event_name") == "Stop":  # a hint from before this turn (none is placed while busy): the
+    (directory / HINT).unlink(missing_ok=True)  # turn_end wake below hints again if mail is still queued
+write_state(directory, False)
 if not write_ready(directory, {"kind": KINDS["claude"], "attempt": attempt, "pid": int(me), "armed_at": armed,
                                "session_id": event.get("session_id")},
                    announce="turn_end" if event.get("hook_event_name") == "Stop" else "ready"):

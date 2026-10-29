@@ -552,3 +552,20 @@ def test_a_rewatch_wakes_once_on_a_known_idle_and_never_takes_a_bad_status_for_i
             stand_in.server.shutdown()
     assert seen == [after]
     assert [body.get("kind") for _, _, body in stand_in.seen] == announced
+
+
+def test_a_hint_from_before_the_turn_is_dropped_at_its_end_and_the_next_one_is_claimed(lodge):
+    wolts, _ = lodge
+    directory = Path(na.prepare(wolts, "pal-x", "claude", "a1")["addr"])
+    na.write_state(directory, True)  # a turn started before the listener took the hint placed just before it
+    (directory / "hint").write_text("New inbox mail (stale)")
+    proc = _listener(directory)
+    proc.stdin.write(json.dumps({"session_id": "s1", "hook_event_name": "Stop"}))
+    proc.stdin.close()
+    deadline = time.monotonic() + 5
+    while not (directory / "ready.json").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.5)
+    assert proc.poll() is None and not (directory / "hint").exists()  # dropped, not claimed
+    (directory / "hint").write_text(HINT)  # what the turn_end wake places if mail is still queued
+    assert proc.wait(5) == 2 and proc.stderr.read().strip() == HINT

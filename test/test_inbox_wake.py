@@ -473,7 +473,7 @@ def test_the_owner_is_told_whenever_mail_neither_hints_nor_starts(lodge, wake, n
     assert notices == [("pal", "not_startable"), ("pal", "not_startable"), ("pal", "launch_unknown")]
 
 
-# -- readiness pickup (Rony's decision): announce, validate, schedule once ---------------------
+# -- readiness pickup: announce, validate, schedule once ---------------------------------
 
 def test_only_the_sessions_own_reader_for_its_current_attempt_schedules_a_pickup(lodge, monkeypatch):
     scheduled = []

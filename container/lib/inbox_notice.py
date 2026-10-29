@@ -1,10 +1,13 @@
-"""Tell the owner when mail of theirs is waiting for an agent that cannot wake.
+"""Tell whoever sent mail to an agent that cannot wake.
 
-owner_notice(wolts_dir, wolt, reason) is the waker's port: it is called where a
-wake inhibition is set, once per inhibition. It speaks only while the agent has
-queued mail from a human, and only through the lodge's own outbound path (POST
-/notify with no session: the owner's default channel). One fixed line, never a
-message body or a sender. It keeps no state, never retries and never raises.
+notice(wolts_dir, wolt, reason, owner=...) is the waker's port, called when a wake
+ends with neither a hint nor a start. The owner hears through the lodge's own
+outbound path (POST /notify with no session: their default channel) while human
+mail is queued, when the waker's reservation says so. Each agent that sent queued
+mail gets one notice per message and reason in its own inbox, from the lodge at
+agent priority, and its normal hint: the notice's key is the dedup, so a repeat
+wake adds nothing. Fixed lines, never a message body. No state of its own, no
+retry, never raises.
 """
 
 from __future__ import annotations
@@ -47,3 +50,26 @@ def owner_notice(wolts_dir, wolt: str, reason: str) -> None:
             answer.read()
     except Exception as exc:
         log.warning("owner notice for %s not sent: %s", wolt, type(exc).__name__)
+
+
+def sender_notices(wolts_dir, wolt: str, reason: str) -> None:
+    try:
+        store = inbox.Store(wolts_dir, inbox.LIMITS)
+        for mail in store.unnoticed_agent_mail(wolt, reason):
+            try:
+                status = store.admit("lodge", f"stuck:{mail['seq']}:{reason}", mail["sender"],
+                                     f"[lodge] your message {mail['key']} to {wolt} is queued, but {wolt} "
+                                     f"can't wake now: {plain(reason)}", mailbox=mail["mailbox"])
+            except inbox.InboxError as exc:  # the sender's mailbox is gone or full
+                log.warning("sender notice for %s not queued: %s", wolt, exc.code)
+                continue
+            import inbox_wake
+            inbox_wake.notify_admitted(wolts_dir, status)
+    except Exception as exc:
+        log.warning("sender notices for %s not sent: %s", wolt, type(exc).__name__)
+
+
+def notice(wolts_dir, wolt: str, reason: str, *, owner: bool) -> None:
+    if owner:
+        owner_notice(wolts_dir, wolt, reason)
+    sender_notices(wolts_dir, wolt, reason)

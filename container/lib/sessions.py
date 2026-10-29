@@ -2238,18 +2238,25 @@ def _paste_into_live_agent(registry: "SessionRegistry", wolt: str, name: str,
 
 
 @contextmanager
-def _relaunch(registry: "SessionRegistry", name: str, wolt: str, harness: str):
+def _relaunch(registry: "SessionRegistry", name: str, wolt: str, harness: str, only_resting: bool = False):
     """One resume relaunch segment, under the agent's lock: a new attempt marked
-    before the external effect; the caller publishes it. Waits come after."""
+    before the external effect; the caller publishes it. Waits come after.
+    only_resting (the inbox wake's resume): refuse unless the session is still
+    resting and none of the agent's sessions carries an owner's stop mark or an
+    unresolved launch, the wake's own admission checks, since the wake chose it."""
     with lifecycle.agent_lock(WOLTS_DIR, wolt):
         current = registry.get(name, wolt=wolt, check_alive=False)
         if current is None or current.get("launching"):
             raise ResumeFailed(f"session '{name}' has an unresolved launch; nothing was relaunched")
+        if only_resting and (current.get("status") != "resting" or any(  # the wake's own admission, re-checked
+                r.get("wake_inhibit") or r.get("launching") for r in registry.records(wolt=wolt))):
+            raise ResumeFailed(f"session '{name}' is no longer resting, or the agent is stopped or launching;"
+                               " the wake does not revive it")
         invalidate_native(registry, name, wolt, current)
         yield mark_launching(registry, name, wolt, harness)
 
 
-def resume_session(name: str, prompt: str = "") -> dict:
+def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -> dict:
     """Resume an existing Claude Code session.
 
     Logic:
@@ -2391,7 +2398,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
         if _runtime().handle_is_alive(target):
             # The exact dedicated pane survived; reuse it rather than creating
             # a new window on every ordinary agent exit.
-            with _relaunch(registry, name, wolt, harness) as attempt:
+            with _relaunch(registry, name, wolt, harness, only_resting) as attempt:
                 try:
                     with _paste_lock(name, registry.db_dir):
                         _tmux_paste(target, resume_cmd)
@@ -2405,7 +2412,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
             # The session survived only because unrelated user panes/windows
             # remain. Never commandeer one: add a detached dedicated window and
             # persist the exact pane tmux returns.
-            with _relaunch(registry, name, wolt, harness) as attempt:
+            with _relaunch(registry, name, wolt, harness, only_resting) as attempt:
                 try:
                     target = _tmux_spawn_in_session(target, work_dir or "/workspace", resume_cmd)
                 except subprocess.CalledProcessError as exc:
@@ -2447,7 +2454,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
 
     # Tmux is dead (or was just cleared out from under a stale, agentless
     # session) — create a fresh tmux session running the wrapper.
-    with _relaunch(registry, name, wolt, harness) as attempt:
+    with _relaunch(registry, name, wolt, harness, only_resting) as attempt:
         try:
             handle = _tmux_spawn(name, work_dir or "/workspace", resume_cmd)
         except subprocess.CalledProcessError:

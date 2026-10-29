@@ -286,11 +286,13 @@ class Store:
             return f"mailbox:{mailbox}", wolt
         return self._admit(sender, key, to, body, AGENT)
 
-    def admit(self, sender: str, key: str, to: str, body: str, *, human: bool = False) -> Status:
+    def admit(self, sender: str, key: str, to: str, body: str, *, human: bool = False,
+              mailbox: int | None = None) -> Status:
         """Library admission for a trusted provider that has verified its
         sender itself; only it may say human. Nothing in the lodge calls it yet."""
         _text(sender, self.limits.name_chars, "sender")
-        return self._admit(lambda conn: (f"provider:{sender}", sender), key, to, body, HUMAN if human else AGENT)
+        return self._admit(lambda conn: (f"provider:{sender}", sender), key, to, body, HUMAN if human else AGENT,
+                           mailbox)
 
     def fetch(self, token: str) -> Delivery | None:
         """The reader's open claim again, or a claim on the next queued
@@ -372,7 +374,7 @@ class Store:
 
     # -- inside a write ---------------------------------------------------------
 
-    def _admit(self, sender_of, key, to, body, priority) -> Status:
+    def _admit(self, sender_of, key, to, body, priority, expected=None) -> Status:
         _text(key, self.limits.key_chars, "key")
         _text(to, self.limits.name_chars, "to")
         payload = _text(body, MAX_PAYLOAD_BYTES, "body", 0).encode("utf-8")
@@ -391,6 +393,8 @@ class Store:
                     raise Conflict("conflict")  # fixed: the key is the caller's text
                 return self._status(conn, "m.seq=?", (row["seq"],))
             mailbox = self._mailbox(conn, to, create=True)
+            if expected is not None and mailbox != expected:  # bound to that very mailbox: its wolt was recreated
+                raise Refused("no_mailbox")
             lodge, mine = self._usage(conn, ""), self._usage(conn, str(mailbox))
             limits = self.limits
             for code, over in (
@@ -529,3 +533,19 @@ class Store:
                 (HUMAN, AGENT)).fetchall()
         return [{"wolt": r[0], "state": r[1], "queued_human": r[2], "queued_agent": r[3],
                  "claimed": r[4], "held": r[5], "oldest_queued_at": r[6]} for r in rows]
+
+    def unnoticed_agent_mail(self, wolt: str, reason: str) -> list[dict]:
+        """Queued mail for the wolt from other agents (never a provider: a lodge
+        notice is never noticed) without a lodge notice for this reason yet:
+        its seq, the sending mailbox's wolt (only while that very mailbox is
+        not closed: a recreated wolt is someone else) and the sender's own key.
+        Reads no body."""
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT m.seq, s.wolt, m.key, s.id FROM inbox_messages m JOIN inbox_mailboxes b ON b.id = m.mailbox"
+                " JOIN inbox_mailboxes s ON m.sender = 'mailbox:' || s.id AND s.state != 'closed'"
+                " WHERE b.wolt = ? AND b.state != 'closed' AND m.state = 'queued'"
+                " AND NOT EXISTS (SELECT 1 FROM inbox_messages n"
+                " WHERE n.sender = 'provider:lodge' AND n.key = 'stuck:' || m.seq || ':' || ?) ORDER BY m.seq",
+                (wolt, reason)).fetchall()
+        return [{"seq": r[0], "sender": r[1], "key": r[2], "mailbox": r[3]} for r in rows]

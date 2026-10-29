@@ -419,8 +419,8 @@ def test_a_failed_resume_paste_keeps_the_prior_runtime_and_raises(lodge, monkeyp
 @pytest.fixture
 def notices(monkeypatch):
     told = []
-    monkeypatch.setitem(sys.modules, "inbox_notice", types.SimpleNamespace(
-        owner_notice=lambda root, wolt, reason: told.append((wolt, reason))))
+    monkeypatch.setitem(sys.modules, "inbox_notice", types.SimpleNamespace(  # the owner's notices only
+        notice=lambda root, wolt, reason, owner: owner and told.append((wolt, reason))))
     return told
 
 
@@ -452,11 +452,11 @@ def test_once_hints_each_attempt_once_and_retries_while_nothing_was_placed(lodge
 
 
 @pytest.mark.parametrize("human", [True, False])
-def test_human_mail_starts_the_wolt_in_its_own_mode(lodge, wake, human):
+def test_any_mail_starts_the_wolt_in_its_own_mode_when_nothing_is_resumable(lodge, wake, human):
     mail(lodge, human=human)
     inbox_wake._wake(str(lodge.root), "pal")
     (kw, _), = wake.starts
-    assert kw["require_auto"] is (not human)
+    assert not kw.get("require_auto")  # its own recorded mode: never refused for not being auto
 
 
 def test_the_owner_is_told_whenever_mail_neither_hints_nor_starts(lodge, wake, notices, monkeypatch):
@@ -541,7 +541,7 @@ def test_owner_mail_retries_only_a_policy_refusal(lodge, wake, notices, inhibite
     mail(lodge)
     lodge.store.set_wake("pal", {"inhibited": inhibited})
     inbox_wake._wake(str(lodge.root), "pal")
-    assert len(wake.starts) == starts and all(kw["require_auto"] is False for kw, _ in wake.starts)
+    assert len(wake.starts) == starts and not any(kw.get("require_auto") for kw, _ in wake.starts)
 
 
 
@@ -581,3 +581,81 @@ def test_only_a_hint_that_reached_the_engine_counts_once(lodge, wake, result):
     inbox_wake._wake(str(lodge.root), "pal", once=True)
     inbox_wake._wake(str(lodge.root), "pal", once=True)
     assert len(lodge.calls.delivered) == 2 and "hinted" not in wake_state(lodge)
+
+
+
+# -- resume first (owner, 29 Oct): mail resumes a resting wolt in its own mode, no paste --------
+
+@pytest.fixture
+def resting(lodge, monkeypatch):
+    """A resting prompt-mode session of pal with a conversation to resume; tmux gone."""
+    sessions.start_session(wolt="pal", name="pal-rest", execution_policy="prompt")
+    lodge.registry.update("pal-rest", status="resting", harness_session_id="conv-1")
+    sent = types.SimpleNamespace(spawned=[], input=[])
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda data: False)
+    monkeypatch.setattr(sessions, "_await_agent", lambda *a, **k: True)
+    monkeypatch.setattr(sessions, "_tmux_spawn", lambda name, cwd, command: sent.spawned.append(command)
+                        or RuntimeHandle(name, name, "%2"))
+    for typing in ("_tmux_paste", "_tmux_send_keys", "deliver_message"):
+        if hasattr(sessions, typing):
+            monkeypatch.setattr(sessions, typing, lambda *a, **k: sent.input.append(a))
+    monkeypatch.setattr(sessions, "resolve_active_session", lambda wolt, registry=None: None)
+    return sent
+
+
+def test_agent_mail_resumes_a_resting_prompt_mode_wolt_with_no_input_and_a_pickup(lodge, resting, monkeypatch):
+    picked = []
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda root, wolt, once=False: picked.append((wolt, once)))
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: pytest.fail("a new session instead of a resume"))
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")
+    (command,) = resting.spawned
+    assert "--resume" in command and "pal-rest" in command and resting.input == []  # nothing typed or pasted
+    assert command.endswith("pal-rest --resume")  # no prompt rides along either
+    row = record(lodge, "pal-rest")
+    assert row["status"] == "running" and row["execution_policy"]["mode"] == "prompt"  # its own mode
+    assert wake_state(lodge)["reserved"]["session"] == "pal-rest"
+    assert picked == [("pal", True)]  # the post-publication pickup hints once the backend is ready
+
+
+def test_an_owners_stop_still_blocks_a_resume_and_a_start(lodge, resting, monkeypatch, notices):
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: pytest.fail("started after a stop"))
+    lodge.registry.update("pal-rest", wake_inhibit=True)  # what stop_session leaves on the record
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert resting.spawned == [] and wake_state(lodge)["inhibited"] == "stopped"
+
+
+@pytest.mark.parametrize("failure", [sessions.ResumeFailed("no agent came up"), subprocess.TimeoutExpired("tmux", 10)])
+def test_a_failed_or_unknown_resume_never_falls_back_to_a_new_session(lodge, resting, monkeypatch, failure):
+    def resume(name, prompt="", **kw):
+        raise failure
+    monkeypatch.setattr(sessions, "resume_session", resume)
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: pytest.fail("a second worker after a failed resume"))
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # the resume fails: logged, the reservation holds
+    assert wake_state(lodge)["reserved"]["session"] == "pal-rest"
+    mail(lodge, "k2", human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # still no new session: no_progress per the existing rule
+    assert wake_state(lodge)["inhibited"] == "no_progress"
+
+
+
+@pytest.mark.parametrize("gap", ["stopped", "archived", "other_stopped", "other_launching"])
+def test_an_owners_stop_in_the_gap_before_the_relaunch_is_never_revived(lodge, resting, monkeypatch, gap):
+    real = sessions.resume_session
+    lodge.registry.create("pal-other", wolt="pal")
+
+    def stop_first(name, prompt="", **kw):  # lands after the wake chose the session, before the relaunch
+        if gap in ("stopped", "archived"):
+            lodge.registry.update(name, status=gap, wake_inhibit=True)
+        elif gap == "other_stopped":  # another session of the agent, stopped by the owner
+            lodge.registry.update("pal-other", status="stopped", wake_inhibit=True)
+        else:  # a manual launch of the agent elsewhere
+            lodge.registry.update("pal-other", launching={"attempt": "m1"})
+        return real(name, prompt, **kw)
+    monkeypatch.setattr(sessions, "resume_session", stop_first)
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert resting.spawned == [] and "launching" not in record(lodge, "pal-rest")
+    assert record(lodge, "pal-rest")["status"] == (gap if gap in ("stopped", "archived") else "resting")

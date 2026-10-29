@@ -237,7 +237,6 @@ def test_a_live_session_gets_one_hint_after_the_lock_and_custody_is_unchanged(lo
     lodge.registry.create("pal-live", wolt="pal")
     for result in ("submitted", "unknown", "failed", "unavailable", "pending"):
         lodge.calls.delivered.clear()
-        lodge.store.set_wake("pal", {k: v for k, v in wake_state(lodge).items() if k != "hinted"})  # each afresh
         sys.modules["native_adapters"].deliver = (
             lambda record, hint, r=result: lodge.calls.delivered.append((record["name"], hint, held(lodge.root)))
             or (r, "x"))
@@ -442,16 +441,7 @@ def test_once_hints_each_attempt_once_and_retries_while_nothing_was_placed(lodge
     lodge.registry.update("pal-live", attempt="a2")  # a resume: a new attempt
     inbox_wake._wake(str(lodge.root), "pal", once=True)
     assert lodge.calls.delivered == ["a1", "a1", "a2"]
-    mail(lodge, "k2")
-    inbox_wake._wake(str(lodge.root), "pal")  # a new arrival: a2's hint, not drained yet, covers it
-    assert len(lodge.calls.delivered) == 3
-    token = lodge.store.grant("pal-live", "pal")
-    for _ in range(2):
-        got = lodge.store.fetch(token)
-        lodge.store.ack(token, got.seq, got.claim)
-    assert lodge.store.fetch(token) is None  # drained
-    mail(lodge, "k3")
-    inbox_wake._wake(str(lodge.root), "pal")  # the next arrival hints again
+    inbox_wake._wake(str(lodge.root), "pal")  # a new arrival hints regardless
     assert len(lodge.calls.delivered) == 4
 
 
@@ -500,6 +490,11 @@ def test_only_the_sessions_own_reader_for_its_current_attempt_schedules_a_pickup
     lodge.registry.update("pal-a", launching={"attempt": "pal-a-2"})
     assert not inbox_wake.ready(lodge.root, token, "pal-a", "pal-a-1")  # a relaunch in flight
     assert scheduled == [("pal", True)]
+    lodge.registry.update("pal-a", launching=None)
+    assert inbox_wake.ready(lodge.root, token, "pal-a", "pal-a-1", "turn_end")  # a plain wake
+    assert not inbox_wake.ready(lodge.root, token, "pal-a", "pal-a-1", "other")
+    assert not inbox_wake.ready(lodge.root, token, "pal-b", "pal-b-1", "turn_end")  # not its own
+    assert scheduled == [("pal", True), ("pal", False)]
 
 
 def test_a_published_ready_file_announces_itself_once_and_a_failure_is_ignored(tmp_path, monkeypatch):
@@ -984,7 +979,7 @@ def test_while_the_preferred_live_session_has_not_fetched_only_it_is_hinted(lodg
     mail(lodge, route={"session": "pal-s1", "chat": None})
     inbox_wake._wake(str(lodge.root), "pal")
     inbox_wake._wake(str(lodge.root), "pal", once=again)
-    assert [d[0] for d in lodge.calls.delivered] == ["pal-s1"]  # once, or covered by its open hint
+    assert [d[0] for d in lodge.calls.delivered] == ["pal-s1"] * (1 if again else 2)
     lodge.store.fetch(lodge.store.grant("pal-s1", "pal"))  # it took the message: the preference is spent
     mail(lodge, "k2")
     inbox_wake._wake(str(lodge.root), "pal")
@@ -1024,84 +1019,50 @@ def test_an_enrolled_send_naming_a_session_nudges_only_that_one(lodge, wake, not
     assert [d[0] for d in lodge.calls.delivered] == (["pal-s1"] if named == "pal-s1" else ["pal-s2"])
 
 
-# -- one outstanding hint per attempt (bug note 4: codex queues every hint) ------------------
+# -- a busy engine gets no hint; the end of its turn does (bug note 5) -------------------------
 
-@pytest.fixture
-def busy(lodge, wake, monkeypatch):
-    """pal-s1 live (attempt a1) with its reader; timers recorded, never run."""
+def test_mail_for_a_busy_session_is_told_to_the_owner_at_once_and_hinted_at_its_turn_end(lodge, wake, notices,
+                                                                                        monkeypatch):
     monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
-    timers = []
-    monkeypatch.setattr(inbox_wake.threading, "Timer", lambda delay, fn, args=(): types.SimpleNamespace(
-        start=lambda: timers.append((delay, fn, args)), daemon=False))
-    for name in ("pal-s1", "pal-s2"):
-        lodge.registry.create(name, wolt="pal")
-        lodge.registry.update(name, attempt=f"{name}-a1")
+    lodge.registry.create("pal-s1", wolt="pal")
+    lodge.registry.update("pal-s1", attempt="a1")
     wake.live = "pal-s1"
-    return types.SimpleNamespace(token=lodge.store.grant("pal-s1", "pal"), timers=timers)
-
-
-def admit(lodge, key):
-    mail(lodge, key)
+    engine = types.SimpleNamespace(busy=True, placed=[])
+    sys.modules["native_adapters"].deliver = lambda record_, hint: (
+        ("pending", "busy") if engine.busy else engine.placed.append(hint) or ("submitted", "queued"))
+    for key in ("k1", "k2", "k3"):  # a burst while its turn runs
+        mail(lodge, key)
+        inbox_wake._wake(str(lodge.root), "pal")
+    assert engine.placed == [] and "hinted" not in wake_state(lodge)  # nothing to go stale
+    assert notices.lines == [("busy", [seq], "pal-s1", None) for seq in seqs(lodge)]  # each its one line
+    engine.busy = False  # the turn ends: its wake hints once, and adds no second line
     inbox_wake._wake(str(lodge.root), "pal")
+    assert len(engine.placed) == 1 and len(notices.lines) == 3
 
 
-def take(lodge, token):
-    got = lodge.store.fetch(token)
+def test_a_turn_end_after_the_session_took_its_mail_hints_nothing(lodge, wake, notices, monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    lodge.registry.create("pal-s1", wolt="pal")
+    wake.live = "pal-s1"
+    placed = []
+    sys.modules["native_adapters"].deliver = lambda record_, hint: ("pending", "busy")
+    mail(lodge)
+    inbox_wake._wake(str(lodge.root), "pal")
+    token = lodge.store.grant("pal-s1", "pal")
+    got = lodge.store.fetch(token)  # during its turn, the agent takes the mail itself
     lodge.store.ack(token, got.seq, got.claim)
+    sys.modules["native_adapters"].deliver = lambda record_, hint: placed.append(hint) or ("submitted", "queued")
+    inbox_wake._wake(str(lodge.root), "pal")  # its turn end
+    assert placed == [] and [line[0] for line in notices.lines] == ["busy"]
 
 
-def test_a_burst_to_a_busy_session_is_one_hint_until_it_drains(lodge, busy, notices):
-    admit(lodge, "k1")
-    take(lodge, busy.token)  # mid-turn, the agent takes mail itself: not a drain
-    admit(lodge, "k2")
-    take(lodge, busy.token)
-    admit(lodge, "k3")
-    assert [d[0] for d in lodge.calls.delivered] == ["pal-s1"]  # one hint for the whole burst
-    assert [line[:3:2] for line in notices.lines] == [("hinted", "pal-s1")] * 3  # each its owner line
-    assert [round(delay) for delay, _, _ in busy.timers] == [inbox_wake.HINT_OPEN + 1] * 2  # held, not lost
-    take(lodge, busy.token)
-    assert lodge.store.fetch(busy.token) is None  # the drain: the hint is spent
-    admit(lodge, "k4")
-    assert [d[0] for d in lodge.calls.delivered] == ["pal-s1", "pal-s1"]
-
-
-def test_another_sessions_drain_does_not_spend_this_ones_hint(lodge, busy):
-    admit(lodge, "k1")
-    take(lodge, busy.token)
-    assert lodge.store.fetch(lodge.store.grant("pal-s2", "pal")) is None  # pal-s2 finds nothing
-    admit(lodge, "k2")
-    assert len(lodge.calls.delivered) == 1
-
-
-def test_a_session_that_took_mail_and_stopped_draining_is_hinted_once_the_hint_runs_out(lodge, busy,
-                                                                                       monkeypatch):
-    admit(lodge, "k1")
-    take(lodge, busy.token)  # read the hint, took its mail, never fetched to nothing
-    admit(lodge, "k2")
-    assert len(lodge.calls.delivered) == 1
-    (delay, fn, args), = busy.timers  # the held mail's own wake when the hint runs out
-    assert (fn, args) == (inbox_wake._schedule, (str(lodge.root), "pal"))
-    monkeypatch.setattr(inbox_wake, "HINT_OPEN", 0)  # ...and it has
-    inbox_wake._wake(str(lodge.root), "pal")
-    assert len(lodge.calls.delivered) == 2
-
-
-def test_a_new_attempt_is_hinted_whatever_the_last_one_left_open(lodge, busy):
-    admit(lodge, "k1")
-    lodge.registry.update("pal-s1", attempt="pal-s1-a2")  # resumed
-    admit(lodge, "k2")
-    assert len(lodge.calls.delivered) == 2
-
-
-def test_a_drain_during_the_first_hints_delivery_spends_it(lodge, busy):
-    def deliver_then_drained(record_, hint):  # the agent drains before the hint is recorded
-        lodge.calls.delivered.append(record_["name"])
-        take(lodge, busy.token)
-        assert lodge.store.fetch(busy.token) is None
-        return "submitted", "ok"
-    sys.modules["native_adapters"].deliver = deliver_then_drained
-    mail(lodge, "k1")
-    inbox_wake._wake(str(lodge.root), "pal")
-    sys.modules["native_adapters"].deliver = lambda record_, hint: lodge.calls.delivered.append(1) or ("submitted", "ok")
-    admit(lodge, "k2")
-    assert len(lodge.calls.delivered) == 2
+def test_a_pickup_that_finds_its_new_session_busy_sends_the_owner_no_second_line(lodge, wake, notices,
+                                                                                  monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    mail(lodge)
+    inbox_wake._wake(str(lodge.root), "pal")  # started: the message's one line
+    (kw, _), = wake.starts
+    wake.live = kw["name"]
+    sys.modules["native_adapters"].deliver = lambda record_, hint: ("pending", "busy")  # its START turn runs
+    inbox_wake._wake(str(lodge.root), "pal", once=True)  # the post-publication pickup
+    assert [line[0] for line in notices.lines] == ["started"]

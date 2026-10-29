@@ -193,6 +193,8 @@ def test_the_cli_prints_the_outcome_and_on_no_answer_the_key(tmp_path):
 
 @pytest.mark.parametrize("outcome, rc, line", [
     ({"how": "resumed", "session": "pal-a-b-a1b2c3"}, 0, "notified pal-a-b-a1b2c3\n"),
+    ({"how": "busy", "session": "pal-a-b-a1b2c3"}, 0,
+     "pal-a-b-a1b2c3 is busy; it gets your message when its current turn ends\n"),
     ({"how": "blocked", "reason": "launch_unknown"}, 1, "pal can't wake: launch_unknown\n"),
     (None, 0, "queued for pal; outcome pending: re-run with --key k7 to see it\n")])
 def test_a_terminal_send_prints_this_message_s_own_outcome(terminal, outcome, rc, line):

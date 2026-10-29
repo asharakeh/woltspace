@@ -299,6 +299,8 @@ def cmd_session_send(args):
         print(json.dumps(result, indent=2))
     elif result.get("status") == "notified":
         print(f"notified {result.get('session')}")
+    elif result.get("status") == "busy":
+        print(f"{result.get('session')} is busy; it gets your message when its current turn ends")
     elif result.get("status") == "pending":
         print(f"queued for {result.get('wolt')}; outcome pending: re-run with --key {key} to see it")
     elif result.get("status") == "cant_wake":

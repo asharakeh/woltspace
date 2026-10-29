@@ -34,7 +34,7 @@ KINDS = {
     "hermes": "hermes-gateway",
 }
 ASSETS = Path(__file__).resolve().parent / "native"
-READY, HINT, RETIRED, LISTENER = "ready.json", "hint", "retired", "listener.json"
+READY, HINT, RETIRED, LISTENER, STATE = "ready.json", "hint", "retired", "listener.json", "state.json"
 BUDGET = 3.0          # deliver() never takes longer than this
 CLAIM_WAIT = 1.0      # how long a file hint waits to be taken before it counts as pending
 HOOK_TIMEOUT = 86400  # Claude's asyncRewake listener lifetime, in seconds
@@ -67,10 +67,12 @@ def prepare(wolts_dir: str | Path, session: str, harness: str | None, attempt: s
     directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     directory.mkdir(mode=0o700)
     if harness == "claude":
-        hook = {"type": "command", "asyncRewake": True, "timeout": HOOK_TIMEOUT,
-                "command": shlex.join([sys.executable, str(ASSETS / "claude_rewake.py"), str(directory), attempt])}
-        _write_private(directory / "settings.json",
-                       {"hooks": {event: [{"hooks": [hook]}] for event in ("SessionStart", "Stop")}})
+        command = [sys.executable, str(ASSETS / "claude_rewake.py"), str(directory), attempt]
+        hook = {"type": "command", "asyncRewake": True, "timeout": HOOK_TIMEOUT, "command": shlex.join(command)}
+        busy = {"type": "command", "timeout": 10, "command": shlex.join([*command, "--busy"])}
+        _write_private(directory / "settings.json", {"hooks": {
+            "SessionStart": [{"hooks": [hook]}], "Stop": [{"hooks": [hook]}],
+            "UserPromptSubmit": [{"hooks": [busy]}]}})
     return {"kind": kind, "addr": str(directory), "attempt": attempt}
 
 
@@ -82,26 +84,64 @@ def launch_env(native: dict | None) -> dict:
             "WOLTSPACE_NATIVE_KIND": native["kind"]}
 
 
-def write_ready(directory: str | Path, data: dict) -> bool:
-    """Atomically publish an attempt's ready data (owner-only). Refused once retired."""
+def write_ready(directory: str | Path, data: dict, announce: str = "ready") -> bool:
+    """Atomically publish an attempt's ready data (owner-only) and tell the lodge. Refused once retired."""
     directory = Path(directory)
     if (directory / RETIRED).exists():
         return False
     _write_private(directory / READY, data)
-    announce_ready(data.get("attempt", ""))
+    announce_ready(data.get("attempt", ""), announce)
     return True
 
 
-def announce_ready(attempt: str) -> None:
+def write_state(directory: str | Path, busy: bool, pid: int | None = None) -> bool:
+    """The engine's own busy/idle; with `pid`, it only counts while that keeper lives."""
+    directory = Path(directory)
+    if (directory / RETIRED).exists():
+        return False
+    _write_private(directory / STATE, {"busy": busy, "since": time.time(), "pid": pid})
+    return True
+
+
+def engine_state(directory: str | Path) -> str:
+    """busy | idle | unknown (no state yet, or its keeper is gone): unknown is never idle."""
+    try:
+        state_ = json.loads((Path(directory) / STATE).read_text())
+    except (OSError, ValueError):
+        return "unknown"
+    pid = state_.get("pid")
+    if pid is not None and not _alive(pid):
+        return "unknown"
+    return "busy" if state_.get("busy") is True else "idle"
+
+
+def is_busy(directory: str | Path) -> bool:
+    return engine_state(directory) == "busy"
+
+
+def clear_state(directory: str | Path) -> None:
+    (Path(directory) / STATE).unlink(missing_ok=True)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{int(pid)}/stat").read_text().split()[2] != "Z"
+    except (OSError, ValueError, IndexError):
+        return False if Path("/proc/self").exists() else True  # no procfs (macOS): trust the record
+
+
+def announce_ready(attempt: str, kind: str = "ready") -> None:
     """Tell the lodge, once ready data is published, that this attempt takes input now, so
     mail that waited (a rest, a resume) gets its hint. Authenticated as the session's own
-    inbox reader. Bounded and custody-neutral: a failure is ignored, never a launch failure."""
+    inbox reader. Bounded and custody-neutral: a failure is ignored, never a launch failure.
+    kind "turn_end": a turn just ended, so mail that waited while busy can get its hint."""
     token, session = os.environ.get("WOLTSPACE_INBOX_TOKEN"), os.environ.get("WOLTSPACE_WOLT_SESSION")
     if not (token and session and attempt):
         return
     api = os.environ.get("WOLTSPACE_API", "http://localhost:7777")
     request = urllib.request.Request(
-        f"{api}/inbox/ready", data=json.dumps({"session": session, "attempt": attempt}).encode(), method="POST",
+        f"{api}/inbox/ready", method="POST",
+        data=json.dumps({"session": session, "attempt": attempt, **({"kind": kind} if kind != "ready" else {})}).encode(),
         headers={"Content-Type": "application/json", "X-Woltspace-Inbox-Token": token})
     try:  # the lodge's own API: never through a proxy
         urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=2).close()
@@ -163,6 +203,11 @@ def deliver(record: dict, hint: str) -> tuple[str, str]:
         if status == "unavailable" or ready is None:
             return status, code
         native = record["native"]
+        engine = engine_state(native["addr"]) if native["kind"] in (KINDS["claude"], KINDS["codex"]) else "idle"
+        if engine == "busy":
+            return "pending", "busy"  # nothing placed: the turn_end announce brings the wake back
+        if engine == "unknown" and native["kind"] == KINDS["codex"]:  # not yet (or no longer) observed
+            return "pending", "not_ready"
         if native["kind"] == KINDS["codex"]:
             return _codex(ready, hint, deadline)
         if native["kind"] == KINDS["opencode"]:

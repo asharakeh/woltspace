@@ -14,9 +14,9 @@ lifecycle lock, never the caller's seq or state:
   the lock is released (native_adapters.deliver), even while the wake is
   inhibited: an inhibition only ever stops a start. submitted, pending, unknown,
   unavailable and failed are transport facts; none changes custody, and none
-  is retried here. Mail waits for the agent's own fetch and ack. A hint covers the
-  mail that comes after it until that session fetches to nothing (or HINT_OPEN
-  passes, or a new attempt starts): no second hint piles up behind it.
+  is retried here. Mail waits for the agent's own fetch and ack. A busy engine (its
+  deliver says pending/busy) gets no hint: the owner hears it is busy, and the end of
+  its turn (ready kind=turn_end) is a wake that hints once if mail is still queued.
 - no live session: all mail brings the wolt up (the owner's rule). The wolt's
   newest resting session is resumed without a prompt (the post-publication pickup
   and its backend's ready call hint it); with none, one fresh session, reserved
@@ -52,7 +52,6 @@ START = ("You have lodge inbox mail. Run `woltspace inbox fetch`, handle the mes
 HINT = ("New inbox mail: run `woltspace inbox fetch`, then `woltspace inbox ack <seq> <claim>` "
         "when handled (nonce {nonce}).")
 BUSY_RETRIES, BUSY_PAUSE = 5, 2.0
-HINT_OPEN = 120  # seconds a hint covers new mail while its session has not drained its inbox
 OUTCOMES = 50  # per-message outcomes kept in the wake state
 _GUARD = threading.Lock()
 _PENDING: dict[tuple[str, str], bool] = {}  # (root, wolt) -> another wake was asked for meanwhile
@@ -67,18 +66,21 @@ def notify_admitted(wolts_dir, status) -> None:
         log.exception("inbox wake not scheduled")
 
 
-def ready(wolts_dir, token: str, session: str, attempt: str) -> bool:
-    """A native backend announced its attempt ready (native_adapters.announce_ready). Only the
-    session's own reader, for its current, published, running attempt, schedules a pickup:
-    one hint if this attempt never had one. False for anything stale or not its own."""
-    if not inbox.enabled(wolts_dir):
+def ready(wolts_dir, token: str, session: str, attempt: str, kind: str = "ready") -> bool:
+    """A native backend announced its attempt ready, or the end of a turn
+    (native_adapters.announce_ready). Only the session's own reader, for its current,
+    published, running attempt, schedules: on ready a pickup (one hint if this attempt never
+    had one); on turn_end a plain wake, which hints once if mail is still queued (mail a busy
+    session was not hinted for, and none for mail it took during the turn). False for
+    anything stale or not its own."""
+    if not inbox.enabled(wolts_dir) or kind not in ("ready", "turn_end"):
         return False
     owner = inbox.Store(wolts_dir, inbox.LIMITS).reader_session(token)
     record = sessions.SessionRegistry(wolts_dir).get(session, check_alive=False) or {}
     if (owner is None or owner[0] != session or record.get("wolt") != owner[1]
             or record.get("status") != "running" or record.get("launching") or record.get("attempt") != attempt):
         return False
-    _schedule(str(wolts_dir), owner[1], once=True)
+    _schedule(str(wolts_dir), owner[1], once=kind == "ready")
     return True
 
 
@@ -169,14 +171,8 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
             if live:
                 record = registry.get(live, wolt=wolt, check_alive=False) or {}
                 hinted = {"session": live, "attempt": record.get("attempt")}
-                last, drained = facts["wake"].get("hinted") or {}, facts["wake"].get("drained") or {}
-                same = {"session": last.get("session"), "attempt": last.get("attempt")} == hinted
-                if once and same:
+                if once and facts["wake"].get("hinted") == hinted:
                     return
-                # A hint this attempt has not drained (fetched to nothing) covers new mail: an
-                # engine that queues input (codex) would get them all after the mail is gone.
-                left = HINT_OPEN - (time.time() - last.get("at", 0))
-                covered = same and left > 0 and drained.get(live, 0) < last.get("at", 0)
     if taken or not facts or not facts["open"] or not facts["queued"]:
         if taken:
             _answer(root, wolt)
@@ -198,17 +194,12 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         elif how:
             _answer(root, wolt, how, session=what)
         return
-    if covered:  # the owner's line all the same; a hint once it runs out, should nothing drain it
-        _answer(root, wolt, "hinted", session=live)
-        timer = threading.Timer(left + 1, _schedule, args=(root, wolt))
-        timer.daemon = True
-        timer.start()
-        return
-    at = time.time()  # before the delivery: a drain right after it closes this hint
     status, code = _deliver(record, HINT.format(nonce=uuid.uuid4().hex[:8]))
     log.info("inbox hint for %s via %s: %s (%s)", wolt, live, status, code)
     if status == "submitted" or (status, code) == ("pending", "placed"):  # only a hint that reached the engine
-        _answer(root, wolt, "hinted", session=live, hinted={**hinted, "at": at})
+        _answer(root, wolt, "hinted", session=live, hinted=hinted)
+    elif (status, code) == ("pending", "busy"):  # its turn end's wake hints, if mail is still queued
+        _answer(root, wolt, "busy", session=live)
     elif status != "pending":
         _answer(root, wolt, "blocked", reason=f"hint_{status}")
     # pending, not placed: a wait, unanswered; the hint of its ready pickup answers it

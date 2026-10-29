@@ -3,7 +3,6 @@ import json
 import sys
 
 import inbox
-import inbox_wake
 from inbox_support import limits, rows
 from test_inbox_api import _cli
 from test_inbox_flow import client, flow, say, server, store  # noqa: F401
@@ -33,8 +32,6 @@ def test_human_priority_and_target_survive_real_cli_pickup(flow):
 
 def test_unknown_native_submission_keeps_custody_until_cli_receipt(flow, monkeypatch):
     say(flow, "first", "first mail")
-    previous_hint = flow.store.wake_facts("pal")["wake"]["hinted"]
-    monkeypatch.setattr(inbox_wake, "HINT_OPEN", 0)  # expire the successful pickup before testing UNKNOWN
     seen = []
 
     def unknown(record, hint):
@@ -43,7 +40,6 @@ def test_unknown_native_submission_keeps_custody_until_cli_receipt(flow, monkeyp
 
     monkeypatch.setattr(sys.modules["native_adapters"], "deliver", unknown)
     say(flow, "second", "second mail")
-    assert flow.store.wake_facts("pal")["wake"]["hinted"] == previous_hint  # UNKNOWN opens no cover
     assert len(flow.seen.spawned) == 1 and len(seen) == 1
     assert seen[0][0] == seen[0][1] and "second mail" not in seen[0][2]
     assert rows(flow.root, "SELECT state FROM inbox_messages ORDER BY seq") == [("queued",), ("queued",)]

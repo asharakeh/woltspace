@@ -23,7 +23,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from native_adapters import ASSETS, KINDS, retire, write_ready  # noqa: E402
+from native_adapters import ASSETS, KINDS, RETIRED, announce_ready, clear_state, retire, write_ready, write_state  # noqa: E402
 
 CODEX_BYPASS = "--dangerously-bypass-approvals-and-sandbox"
 
@@ -137,6 +137,44 @@ def codex_thread(plan: dict, cwd: str) -> str | None:
     return main[0] if len(main) == 1 else None
 
 
+def watch_codex(sock: str, thread: str, directory: Path, attempt: str, on_known=None) -> None:
+    """Busy/idle from the app-server's thread/status/changed for this thread; announce each turn's end.
+    on_known runs once the first status is written; when the watch ends the state is unknown again."""
+    from websockets.sync.client import unix_connect
+    try:
+        _watch_codex(unix_connect(sock, "ws://localhost/", open_timeout=5), thread, directory, attempt, on_known)
+    finally:
+        clear_state(directory)
+
+
+def _watch_codex(conn, thread, directory, attempt, on_known):
+    with conn:
+        conn.send(json.dumps({"id": 1, "method": "initialize",
+                              "params": {"clientInfo": {"name": "woltspace-native", "version": "1"}}}))
+        conn.send(json.dumps({"method": "initialized"}))
+        conn.send(json.dumps({"id": 2, "method": "thread/read", "params": {"threadId": thread}}))
+        first, active = True, False
+        for raw in conn:
+            message = json.loads(raw)
+            if message.get("id") == 2:
+                status = ((message.get("result") or {}).get("thread") or {}).get("status") or {}
+            elif message.get("method") == "thread/status/changed" and message["params"].get("threadId") == thread:
+                status = message["params"].get("status") or {}
+            else:
+                continue
+            if status.get("type") not in ("active", "idle"):
+                continue  # an error or an unknown status leaves it unknown
+            now = status.get("type") == "active"
+            if not write_state(directory, now, os.getpid()):
+                return  # retired
+            if on_known:
+                on_known()
+                on_known = None
+            elif (first or active) and not now:  # a turn ended, possibly while the watch was down
+                announce_ready(attempt, "turn_end")
+            first, active = False, now
+
+
 def _opencode_api(plan: dict, method: str, path: str, body=None):
     import base64
     auth = base64.b64encode(f"opencode:{plan['password']}".encode()).decode()
@@ -223,9 +261,16 @@ def main(argv: list[str]) -> int:
                                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
         if harness == "codex":
             def publish():
-                if thread := _wait(lambda: codex_thread(plan, cwd), 120):
-                    write_ready(directory, {"kind": native["kind"], "attempt": attempt, "sock": plan["sock"],
-                                            "thread": thread, "session_id": thread})
+                thread = _wait(lambda: codex_thread(plan, cwd), 120)
+                ready = {"kind": native["kind"], "attempt": attempt, "sock": plan["sock"], "thread": thread,
+                         "session_id": thread}
+                published = []  # ready only once a first busy/idle is known; then watch again after a drop
+                while thread and not (directory / RETIRED).exists():
+                    try:
+                        watch_codex(plan["sock"], thread, directory, attempt,
+                                    None if published else lambda: published.append(write_ready(directory, ready)))
+                    except Exception:  # unknown until it is seen again
+                        time.sleep(1)
             threading.Thread(target=publish, daemon=True).start()
         elif harness == "opencode" and session:
             write_ready(directory, {"kind": native["kind"], "attempt": attempt, "port": plan["port"],

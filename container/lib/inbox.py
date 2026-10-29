@@ -285,7 +285,7 @@ class Store:
     def set_wake(self, wolt: str, wake: dict) -> None:
         """The waker's write. What admission records in the same field (_note) is kept from
         the stored state, never from the waker's copy: the baseline once set, the preferred
-        session, and the routes of the mail not answered yet; so is a reader's drain."""
+        session, and the routes of the mail not answered yet."""
         with self._write() as conn:
             row = conn.execute("SELECT wake FROM inbox_mailboxes WHERE wolt=? AND state != 'closed'",
                                (wolt,)).fetchone()
@@ -295,9 +295,8 @@ class Store:
                                                           if k not in ("prefer", "chats")}
             if "answered" in stored:
                 wake["answered"] = max(wake.get("answered", stored["answered"]), stored["answered"])
-            for field in ("prefer", "drained"):  # admission's, and a reader's drain (_drained)
-                if field in stored:
-                    wake[field] = stored[field]
+            if "prefer" in stored:
+                wake["prefer"] = stored["prefer"]
             chats = {k: v for k, v in stored.get("chats", {}).items() if int(k) > wake.get("answered", -1)}
             if chats:
                 wake["chats"] = chats
@@ -341,7 +340,6 @@ class Store:
                 row = conn.execute("SELECT * FROM inbox_messages WHERE mailbox=? AND state='queued'"
                                    " ORDER BY priority, seq LIMIT 1", (mailbox,)).fetchone()
                 if row is None:
-                    self._drained(conn, mailbox, reader)
                     return None
                 conn.execute("UPDATE inbox_messages SET state='claimed', reader=?, claim=claim+1"
                              " WHERE seq=?", (reader, row["seq"]))
@@ -449,18 +447,6 @@ class Store:
             self._event(conn, seq, "queued", None)
             self._note(conn, mailbox, seq, priority, route or {}, now)
             return self._status(conn, "m.seq=?", (seq,))
-
-    @staticmethod
-    def _drained(conn, mailbox: int, reader: bytes) -> None:
-        """A reader found nothing left: its session has taken all the mail a hint was for, so
-        the waker may hint it again (inbox_wake: a hint covers new mail until then). Kept per
-        session, the newest few, whether or not a hint is recorded yet: one may be on its way."""
-        session = conn.execute("SELECT session FROM inbox_readers WHERE hash=?", (reader,)).fetchone()[0]
-        wake = json.loads(conn.execute("SELECT wake FROM inbox_mailboxes WHERE id=?", (mailbox,)).fetchone()[0]
-                          or "{}")
-        drained = {**wake.get("drained", {}), session: time.time()}
-        wake["drained"] = dict(sorted(drained.items(), key=lambda item: item[1])[-8:])
-        conn.execute("UPDATE inbox_mailboxes SET wake=? WHERE id=?", (json.dumps(wake), mailbox))
 
     @staticmethod
     def _note(conn, mailbox: int, seq: int, priority: int, route: dict, now: float) -> None:

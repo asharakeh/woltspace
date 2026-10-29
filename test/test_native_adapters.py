@@ -673,3 +673,13 @@ def test_with_no_live_claude_listener_nothing_is_placed(lodge):
     record = live("claude", ready={"armed_at": time.time(), "pid": gone.pid})  # it claimed and exited
     assert na.deliver(record, HINT) == ("pending", "listener_gone")
     assert not (Path(record["native"]["addr"]) / "hint").exists()
+
+
+def test_a_busy_hint_turn_with_an_exited_listener_stays_busy(lodge):
+    _, live = lodge
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    record = live("claude", ready={"armed_at": time.time(), "pid": gone.pid})
+    na.write_state(record["native"]["addr"], True, ttl=na.CLAUDE_BUSY_TTL)
+    assert na.deliver(record, HINT) == ("pending", "busy")
+    assert not (Path(record["native"]["addr"]) / "hint").exists()

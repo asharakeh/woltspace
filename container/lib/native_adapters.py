@@ -190,8 +190,9 @@ def state(record: dict) -> tuple[str, str, dict | None]:
         return "unavailable", "other_conversation", None
     if native["kind"] == KINDS["claude"] and time.time() > ready.get("armed_at", 0) + HOOK_TIMEOUT:
         return "pending", "listener_expired", ready
-    if native["kind"] == KINDS["claude"] and ready.get("pid") and not _alive(ready["pid"]):
-        return "pending", "listener_gone", None  # it claimed a hint, and no turn end armed another: wait, place nothing
+    if native["kind"] == KINDS["claude"] and ready.get("pid") and not _alive(ready["pid"]) and not is_busy(directory):
+        # it claimed a hint and no turn end armed another; while that turn is busy it's just busy (deliver says so)
+        return "pending", "listener_gone", None
     return "ready", "ready", ready
 
 

@@ -226,7 +226,7 @@ def test_no_session_reserves_and_starts_one_with_the_fixed_fetch_instruction(lod
     mail(lodge)
     inbox_wake._wake(str(lodge.root), "pal")
     (kw, locked), = wake.starts
-    assert locked and kw["prompt"] == inbox_wake.START and "hello" not in kw["prompt"]
+    assert locked and kw["prompt"] == inbox_wake.START.format(sender=" from your human") and "hello" not in kw["prompt"]
     assert wake_state(lodge)["reserved"]["session"] == kw["name"]
     assert rows(lodge.root, "SELECT state FROM inbox_messages") == [("queued",)]  # no claim, no ack
 
@@ -1066,6 +1066,20 @@ def test_a_pickup_that_finds_its_new_session_busy_sends_the_owner_no_second_line
     sys.modules["native_adapters"].deliver = lambda record_, hint: ("pending", "busy")  # its START turn runs
     inbox_wake._wake(str(lodge.root), "pal", once=True)  # the post-publication pickup
     assert [line[0] for line in notices.lines] == ["started"]
+
+
+def test_a_hint_names_who_the_queued_mail_is_from_never_what_it_says(lodge, wake):
+    for key, sender, human in (("k1", "pal-a", False), ("k2", "telegram", True), ("k3", "pal-a", False),
+                               ("k4", "pal-b", False), ("k5", "pal-c", False)):
+        lodge.store.admit(sender, key, "pal", "secret body", human=human)
+    assert lodge.store.wake_facts("pal")["senders"] == ["pal-a", "your human", "pal-b", "pal-c"]  # oldest first, once each
+    hints = []
+    sys.modules["native_adapters"].deliver = lambda record, hint: hints.append(hint) or ("submitted", "queued")
+    wake.live = "pal-live"
+    lodge.registry.create("pal-live", wolt="pal")
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert hints[0].startswith("New inbox mail from pal-a, your human, pal-b and 1 more. Fetch your inbox")
+    assert "secret body" not in hints[0]
 
 
 def test_the_wake_texts_say_an_ack_confirms_receipt_not_completion():

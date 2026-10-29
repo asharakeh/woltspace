@@ -214,8 +214,8 @@ def wake(lodge, monkeypatch):
     return state
 
 
-def mail(lodge, key="k1", to="pal", human=True):
-    return lodge.store.admit("telegram", key, to, "hello", human=human)
+def mail(lodge, key="k1", to="pal", human=True, route=None):
+    return lodge.store.admit("telegram", key, to, "hello", human=human, route=route)
 
 
 def wake_state(lodge):
@@ -279,22 +279,14 @@ def test_a_burst_coalesces_into_one_wake_and_never_raises(lodge, monkeypatch):
     inbox_wake.notify_admitted(lodge.root, statuses[0])  # logged, never raised
 
 
-def test_a_reserved_session_without_an_ack_inhibits_until_rearm(lodge, wake):
-    mail(lodge)
+def test_a_session_that_ended_without_an_ack_does_not_hold_later_mail(lodge, wake):
+    mail(lodge, human=False)
     inbox_wake._wake(str(lodge.root), "pal")
     name = wake.starts[0][0]["name"]
     lodge.registry.update(name, status="completed")
-    mail(lodge, "k2")
-    inbox_wake._wake(str(lodge.root), "pal")
-    assert len(wake.starts) == 1 and wake_state(lodge)["inhibited"] == "no_progress"
-    mail(lodge, "k3")  # new mail never clears it
-    inbox_wake._wake(str(lodge.root), "pal")
-    assert len(wake.starts) == 1
-    inbox_wake.rearm(lodge.root, "pal")
-    deadline = time.monotonic() + 5
-    while len(wake.starts) < 2 and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert len(wake.starts) == 2
+    mail(lodge, "k2", human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # all mail brings the wolt up
+    assert len(wake.starts) == 2 and "inhibited" not in wake_state(lodge)
 
 
 def test_progress_lets_the_next_mail_start_a_fresh_session(lodge, wake):
@@ -311,26 +303,20 @@ def test_progress_lets_the_next_mail_start_a_fresh_session(lodge, wake):
 
 
 @pytest.mark.parametrize("ending", ["stopped", "unresolved"])
-def test_an_explicit_stop_inhibits_and_an_unresolved_launch_waits(lodge, wake, ending):
-    mail(lodge)
+def test_a_stop_does_not_hold_the_wolt_but_an_unresolved_launch_waits(lodge, wake, ending):
+    mail(lodge, human=False)
     inbox_wake._wake(str(lodge.root), "pal")
     name = wake.starts[0][0]["name"]
     if ending == "stopped":
-        sessions.stop_session(name)  # the owner's explicit stop
+        sessions.stop_session(name)  # the owner's explicit stop: that conversation only
     else:
         lodge.registry.update(name, status="running", launching={"attempt": "a2"})
-    mail(lodge, "k2")
+    mail(lodge, "k2", human=False)
     inbox_wake._wake(str(lodge.root), "pal")
-    assert len(wake.starts) == 1
     if ending == "stopped":
-        assert wake_state(lodge)["inhibited"] == "stopped"
-        inbox_wake.rearm(lodge.root, "pal")  # the owner's rearm outranks the stop it follows
-        deadline = time.monotonic() + 5
-        while len(wake.starts) < 2 and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert len(wake.starts) == 2
+        assert len(wake.starts) == 2 and wake.starts[1][0]["name"] != name
     else:
-        assert "inhibited" not in wake_state(lodge)
+        assert len(wake.starts) == 1 and "inhibited" not in wake_state(lodge)
         with pytest.raises(lifecycle.LifecycleUnknown):
             inbox_wake.rearm(lodge.root, "pal")
 
@@ -418,19 +404,27 @@ def test_a_failed_resume_paste_keeps_the_prior_runtime_and_raises(lodge, monkeyp
 
 @pytest.fixture
 def notices(monkeypatch):
-    told = []
-    monkeypatch.setitem(sys.modules, "inbox_notice", types.SimpleNamespace(  # the owner's notices only
-        notice=lambda root, wolt, reason, owner: owner and told.append((wolt, reason))))
+    """The owner's lines (outcome: how, seqs, session or reason, chat) and the senders' notices."""
+    told = types.SimpleNamespace(lines=[], senders=[])
+    monkeypatch.setitem(sys.modules, "inbox_notice", types.SimpleNamespace(
+        notice=lambda root, wolt, reason, owner: told.senders.append((wolt, reason, owner)),
+        outcome=lambda root, wolt, *, seqs, how, session=None, reason=None, chat=None:
+        told.lines.append((how, seqs, session or reason, chat))))
     return told
+
+
+def seqs(lodge):
+    return [seq for seq, in rows(lodge.root, "SELECT seq FROM inbox_messages WHERE priority=0 ORDER BY seq")]
 
 
 def test_an_inhibited_wolt_with_a_live_session_still_gets_its_hint(lodge, wake, notices):
     mail(lodge)
-    lodge.store.set_wake("pal", {"inhibited": "not_startable"})
+    lodge.store.set_wake("pal", {**wake_state(lodge), "inhibited": "not_startable"})
     lodge.registry.create("pal-live", wolt="pal")
     wake.live = "pal-live"
     inbox_wake._wake(str(lodge.root), "pal")
-    assert [d[0] for d in lodge.calls.delivered] == ["pal-live"] and not wake.starts and not notices
+    assert [d[0] for d in lodge.calls.delivered] == ["pal-live"] and not wake.starts
+    assert notices.lines == [("hinted", seqs(lodge), "pal-live", None)] and not notices.senders
 
 
 def test_once_hints_each_attempt_once_and_retries_while_nothing_was_placed(lodge, wake):
@@ -463,20 +457,20 @@ def test_the_owner_is_told_whenever_mail_neither_hints_nor_starts(lodge, wake, n
     def refuse(**kw):
         raise PermissionError("prompt mode")
     monkeypatch.setattr(sessions, "start_session", refuse)
-    mail(lodge, human=False)  # agent mail only: inbox_notice would stay silent, so none is reserved
+    mail(lodge, human=False)  # agent mail only: no owner line, its sender's notice
     inbox_wake._wake(str(lodge.root), "pal")
-    assert notices == []
+    assert notices.lines == [] and notices.senders == [("pal", "not_startable", False)]
     mail(lodge, "k2")
     inbox_wake._wake(str(lodge.root), "pal")  # not_startable, retried for the owner's mail, refused again
-    inbox_wake._wake(str(lodge.root), "pal")  # a repeat wake, a resend, a ready call: no second notice
-    assert notices == [("pal", "not_startable")]
-    mail(lodge, "k3")  # new owner mail: its own notice
-    inbox_wake._wake(str(lodge.root), "pal")
+    inbox_wake._wake(str(lodge.root), "pal")  # a repeat wake, a resend, a ready call: no second line
+    k2, = seqs(lodge)
+    assert notices.lines == [("blocked", [k2], "not_startable", None)]
+    mail(lodge, "k3")  # new owner mail: its own line
     lodge.registry.create("pal-x", wolt="pal")
     lodge.registry.update("pal-x", launching={"attempt": "a9"})
-    inbox_wake._wake(str(lodge.root), "pal")  # same mail, a changed reason: a fresh notice
     inbox_wake._wake(str(lodge.root), "pal")
-    assert notices == [("pal", "not_startable"), ("pal", "not_startable"), ("pal", "launch_unknown")]
+    inbox_wake._wake(str(lodge.root), "pal")  # same mail, a changed reason: still its one line
+    assert notices.lines[1:] == [("blocked", [k2 + 1], "launch_unknown", None)]
 
 
 # -- readiness pickup: announce, validate, schedule once ---------------------------------
@@ -536,13 +530,13 @@ def test_a_resume_that_finds_the_agent_running_schedules_a_pickup(lodge, monkeyp
     assert picked == ["pal"]
 
 
-@pytest.mark.parametrize("inhibited, starts", [("not_startable", 1), ("stopped", 0), ("no_progress", 0)])
-def test_owner_mail_retries_only_a_policy_refusal(lodge, wake, notices, inhibited, starts):
-    mail(lodge)
+@pytest.mark.parametrize("human", [True, False])
+@pytest.mark.parametrize("inhibited", ["not_startable", "stopped", "no_progress"])
+def test_no_earlier_inhibition_holds_new_mail(lodge, wake, notices, inhibited, human):
+    mail(lodge, human=human)
     lodge.store.set_wake("pal", {"inhibited": inhibited})
     inbox_wake._wake(str(lodge.root), "pal")
-    assert len(wake.starts) == starts and not any(kw.get("require_auto") for kw, _ in wake.starts)
-
+    assert len(wake.starts) == 1 and not any(kw.get("require_auto") for kw, _ in wake.starts)
 
 
 def test_whichever_comes_later_of_publication_and_readiness_hints_once(lodge, monkeypatch):
@@ -589,6 +583,7 @@ def test_only_a_hint_that_reached_the_engine_counts_once(lodge, wake, result):
 @pytest.fixture
 def resting(lodge, monkeypatch):
     """A resting prompt-mode session of pal with a conversation to resume; tmux gone."""
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)  # no pickup thread racing the test
     sessions.start_session(wolt="pal", name="pal-rest", execution_policy="prompt")
     lodge.registry.update("pal-rest", status="resting", harness_session_id="conv-1")
     sent = types.SimpleNamespace(spawned=[], input=[])
@@ -618,30 +613,61 @@ def test_agent_mail_resumes_a_resting_prompt_mode_wolt_with_no_input_and_a_picku
     assert picked == [("pal", True)]  # the post-publication pickup hints once the backend is ready
 
 
-def test_an_owners_stop_still_blocks_a_resume_and_a_start(lodge, resting, monkeypatch, notices):
-    monkeypatch.setattr(sessions, "start_session", lambda **kw: pytest.fail("started after a stop"))
-    lodge.registry.update("pal-rest", wake_inhibit=True)  # what stop_session leaves on the record
+@pytest.mark.parametrize("human", [True, False])
+def test_mail_resumes_another_resting_session_never_the_stopped_one(lodge, resting, monkeypatch, human):
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: pytest.fail("a new session while one can resume"))
+    lodge.registry.create("pal-old", wolt="pal")  # newer and resumable, but the owner stopped it
+    lodge.registry.update("pal-old", status="resting", harness_session_id="conv-old", wake_inhibit=True,
+                          last_activity=int(time.time()) + 100)
+    mail(lodge, human=human)
+    inbox_wake._wake(str(lodge.root), "pal")
+    (command,) = resting.spawned
+    assert command.endswith("pal-rest --resume") and resting.input == []
+    assert record(lodge, "pal-old")["status"] == "resting"
+
+
+def test_mail_with_only_stopped_sessions_starts_one_and_rearm_keeps_the_mark(lodge, resting, monkeypatch):
+    started = []
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: started.append(kw) or {})
+    sessions.stop_session("pal-rest")
     mail(lodge, human=False)
     inbox_wake._wake(str(lodge.root), "pal")
-    assert resting.spawned == [] and wake_state(lodge)["inhibited"] == "stopped"
+    assert resting.spawned == [] and len(started) == 1  # a new one, never the stopped conversation
+    inbox_wake.rearm(lodge.root, "pal")
+    assert record(lodge, "pal-rest")["wake_inhibit"]  # still never auto-resumed
 
 
-@pytest.mark.parametrize("failure", [sessions.ResumeFailed("no agent came up"), subprocess.TimeoutExpired("tmux", 10)])
-def test_a_failed_or_unknown_resume_never_falls_back_to_a_new_session(lodge, resting, monkeypatch, failure):
-    def resume(name, prompt="", **kw):
-        raise failure
-    monkeypatch.setattr(sessions, "resume_session", resume)
-    monkeypatch.setattr(sessions, "start_session", lambda **kw: pytest.fail("a second worker after a failed resume"))
+def test_a_definite_resume_failure_moves_on_and_an_unknown_one_holds(lodge, resting, monkeypatch):
+    started, calls = [], []
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: started.append(kw) or {})
+
+    def refused(name, prompt="", **kw):  # e.g. an expired conversation: nothing launched
+        calls.append(name)
+        raise sessions.ResumeFailed("the engine refused the conversation")
+    monkeypatch.setattr(sessions, "resume_session", refused)
     mail(lodge, human=False)
-    inbox_wake._wake(str(lodge.root), "pal")  # the resume fails: logged, the reservation holds
-    assert wake_state(lodge)["reserved"]["session"] == "pal-rest"
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert calls == ["pal-rest"] and record(lodge, "pal-rest")["resume_failed"] and started == []
     mail(lodge, "k2", human=False)
-    inbox_wake._wake(str(lodge.root), "pal")  # still no new session: no_progress per the existing rule
-    assert wake_state(lodge)["inhibited"] == "no_progress"
+    inbox_wake._wake(str(lodge.root), "pal")  # never that conversation again: a new session
+    assert calls == ["pal-rest"] and len(started) == 1
 
 
+def test_an_unknown_resume_outcome_never_starts_a_second_worker(lodge, resting, monkeypatch):
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: pytest.fail("a second worker after an unknown resume"))
 
-@pytest.mark.parametrize("gap", ["stopped", "archived", "other_stopped", "other_launching"])
+    def lost(name, prompt="", **kw):  # the relaunch was marked, then its tmux call timed out
+        lodge.registry.update(name, status="running", launching={"attempt": "r1"})
+        raise subprocess.TimeoutExpired("tmux", 10)
+    monkeypatch.setattr(sessions, "resume_session", lost)
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert "resume_failed" not in record(lodge, "pal-rest")
+    mail(lodge, "k2", human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # launch_unknown holds
+
+
+@pytest.mark.parametrize("gap", ["stopped", "archived", "other_launching"])
 def test_an_owners_stop_in_the_gap_before_the_relaunch_is_never_revived(lodge, resting, monkeypatch, gap):
     real = sessions.resume_session
     lodge.registry.create("pal-other", wolt="pal")
@@ -649,8 +675,6 @@ def test_an_owners_stop_in_the_gap_before_the_relaunch_is_never_revived(lodge, r
     def stop_first(name, prompt="", **kw):  # lands after the wake chose the session, before the relaunch
         if gap in ("stopped", "archived"):
             lodge.registry.update(name, status=gap, wake_inhibit=True)
-        elif gap == "other_stopped":  # another session of the agent, stopped by the owner
-            lodge.registry.update("pal-other", status="stopped", wake_inhibit=True)
         else:  # a manual launch of the agent elsewhere
             lodge.registry.update("pal-other", launching={"attempt": "m1"})
         return real(name, prompt, **kw)
@@ -659,3 +683,332 @@ def test_an_owners_stop_in_the_gap_before_the_relaunch_is_never_revived(lodge, r
     inbox_wake._wake(str(lodge.root), "pal")
     assert resting.spawned == [] and "launching" not in record(lodge, "pal-rest")
     assert record(lodge, "pal-rest")["status"] == (gap if gap in ("stopped", "archived") else "resting")
+
+
+def test_another_sessions_stop_in_the_gap_does_not_hold_the_resume(lodge, resting, monkeypatch):
+    real = sessions.resume_session
+    lodge.registry.create("pal-other", wolt="pal")
+
+    def stop_other_first(name, prompt="", **kw):
+        lodge.registry.update("pal-other", status="stopped", wake_inhibit=True)
+        return real(name, prompt, **kw)
+    monkeypatch.setattr(sessions, "resume_session", stop_other_first)
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert [c for c in resting.spawned if c.endswith("pal-rest --resume")]
+
+
+# -- one owner line per human message, and the preferred session (P2, 29 Oct) -----------------
+
+def test_a_coalesced_burst_answers_each_human_message_once(lodge, wake, notices):
+    mail(lodge, "k1")
+    mail(lodge, "k2")
+    mail(lodge, "a1", human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # one wake for the whole burst
+    inbox_wake._wake(str(lodge.root), "pal")  # a repeat answers nothing again
+    (kw, _), = wake.starts
+    assert notices.lines == [("started", seqs(lodge), kw["name"], None)] and len(seqs(lodge)) == 2
+    mail(lodge, "k3")
+    wake.live = kw["name"]
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert notices.lines[1:] == [("hinted", seqs(lodge)[2:], kw["name"], None)]
+
+
+def test_a_first_message_a_reader_took_before_the_wake_is_answered_as_hinted_to_it(lodge, wake, notices,
+                                                                                    monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    mail(lodge)  # the mailbox's first message sets the baseline
+    lodge.registry.create("pal-live", wolt="pal")
+    lodge.store.fetch(lodge.store.grant("pal-live", "pal"))  # the live session fetched it first
+    inbox_wake._wake(str(lodge.root), "pal")
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert notices.lines == [("hinted", seqs(lodge), "pal-live", None)] and not wake.starts
+
+
+def test_mail_handled_before_the_accounting_began_is_never_answered(lodge, wake, notices, monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    lodge.registry.create("pal-live", wolt="pal")
+    token = lodge.store.grant("pal-live", "pal")
+    lodge.store.admit("telegram", "old", "pal", "hello", human=True)
+    got = lodge.store.fetch(token)
+    lodge.store.ack(token, got.seq, got.claim)  # handled by an earlier lodge
+    queued = lodge.store.admit("telegram", "queued", "pal", "hello", human=True)
+    import lodge_db
+    with lodge_db.write(lodge.root) as conn:  # as an earlier lodge left it: no accounting yet
+        conn.execute("UPDATE inbox_mailboxes SET wake=NULL")
+    new = mail(lodge, "new")
+    assert wake_state(lodge)["answered"] == queued.seq - 1  # below this message and any still queued
+    mail(lodge, "next")
+    assert wake_state(lodge)["answered"] == queued.seq - 1  # set once
+    wake.live = "pal-live"
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert notices.lines == [("hinted", [queued.seq, new.seq, new.seq + 1], "pal-live", None)]
+
+
+def test_a_preferred_resting_session_is_resumed_before_another_live_one_is_hinted(lodge, resting, notices,
+                                                                                    monkeypatch):
+    lodge.registry.create("pal-live", wolt="pal")
+    monkeypatch.setattr(sessions, "resolve_active_session", lambda wolt, registry=None: "pal-live")
+    mail(lodge, route={"session": "pal-rest", "chat": None})
+    inbox_wake._wake(str(lodge.root), "pal")
+    (command,) = resting.spawned
+    assert command.endswith("pal-rest --resume") and lodge.calls.delivered == []
+    assert notices.lines == [("resumed", seqs(lodge), "pal-rest", None)]
+
+
+def test_a_hint_not_placed_yet_is_answered_by_the_pickup_that_places_it(lodge, wake, notices):
+    mail(lodge)
+    lodge.registry.create("pal-live", wolt="pal")
+    lodge.registry.update("pal-live", attempt="a1")
+    wake.live = "pal-live"
+    results = iter([("pending", "not_ready"), ("pending", "placed")])
+    sys.modules["native_adapters"].deliver = lambda record_, hint: next(results)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert notices.lines == []  # not "notified": nothing reached the session yet
+    inbox_wake._wake(str(lodge.root), "pal", once=True)  # the ready call's pickup
+    assert notices.lines == [("hinted", seqs(lodge), "pal-live", None)]
+
+
+def test_coalesced_mail_from_two_chats_is_answered_on_each_its_own(lodge, wake, notices, monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    telegram, slack = {"adapter": "telegram", "chat": "42"}, {"adapter": "slack", "chat": "D1"}
+    mail(lodge, "k1", route={"session": None, "chat": telegram})
+    mail(lodge, "k2", route={"session": None, "chat": slack})
+    mail(lodge, "k3", route={"session": None, "chat": slack})
+    inbox_wake._wake(str(lodge.root), "pal")
+    (kw, _), = wake.starts
+    k1, k2, k3 = seqs(lodge)
+    assert notices.lines == [("started", [k1], kw["name"], telegram), ("started", [k2, k3], kw["name"], slack)]
+    assert wake_state(lodge).get("chats", {}) == {}
+
+
+@pytest.mark.parametrize("result", [("failed", "OSError"), ("unavailable", "no_adapters")])
+def test_a_hint_that_cannot_be_delivered_is_the_owners_blocked_line(lodge, wake, notices, result):
+    mail(lodge)
+    lodge.registry.create("pal-live", wolt="pal")
+    wake.live = "pal-live"
+    sys.modules["native_adapters"].deliver = lambda record_, hint: result
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert notices.lines == [("blocked", seqs(lodge), f"hint_{result[0]}", None)]
+
+
+@pytest.mark.parametrize("crash", [RuntimeError("boom"), lifecycle.LifecycleBusy("pal")])
+def test_a_wake_that_raises_still_answers_the_owner_with_an_error(lodge, notices, monkeypatch, crash):
+    monkeypatch.setattr(inbox_wake, "BUSY_RETRIES", 1)
+
+    def broken(root, wolt, once=False):
+        raise crash
+    monkeypatch.setattr(inbox_wake, "_wake", broken)
+    mail(lodge)
+    inbox_wake._PENDING[(str(lodge.root), "pal")] = None  # as _schedule leaves it for its worker
+    inbox_wake._worker(str(lodge.root), "pal")
+    reason = "busy" if isinstance(crash, lifecycle.LifecycleBusy) else "error"
+    assert notices.lines == [("error", seqs(lodge), reason, None)] and notices.senders == [("pal", reason, False)]
+    inbox_wake._PENDING[(str(lodge.root), "pal")] = None
+    inbox_wake._worker(str(lodge.root), "pal")
+    assert len(notices.lines) == 1
+
+
+def test_the_preferred_live_session_is_hinted_and_answered_on_its_chat(lodge, wake, notices, monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    for name in ("pal-s1", "pal-s2"):
+        lodge.registry.create(name, wolt="pal")
+    wake.live = "pal-s2"  # the newest live session
+    chat = {"adapter": "telegram", "chat_id": "42"}
+    mail(lodge, route={"session": "pal-s1", "chat": chat})
+    assert wake_state(lodge)["prefer"]["session"] == "pal-s1"
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert [d[0] for d in lodge.calls.delivered] == ["pal-s1"]
+    assert notices.lines == [("hinted", seqs(lodge), "pal-s1", chat)] and _stale_prefer(lodge)
+
+
+def test_the_preferred_resting_session_is_resumed_over_a_newer_one(lodge, resting, notices, monkeypatch):
+    lodge.registry.create("pal-new", wolt="pal")
+    lodge.registry.update("pal-new", status="resting", harness_session_id="conv-new",
+                          last_activity=int(time.time()) + 100)
+    mail(lodge, route={"session": "pal-rest", "chat": None})
+    inbox_wake._wake(str(lodge.root), "pal")
+    (command,) = resting.spawned
+    assert command.endswith("pal-rest --resume") and resting.input == []
+    assert notices.lines == [("resumed", seqs(lodge), "pal-rest", None)]
+
+
+@pytest.mark.parametrize("stale", ["gone", "stopped"])
+def test_a_stale_preference_falls_back_keeps_its_chat_and_is_cleared(lodge, resting, notices, monkeypatch, stale):
+    if stale == "stopped":
+        sessions.stop_session("pal-rest")
+    lodge.registry.create("pal-new", wolt="pal")
+    lodge.registry.update("pal-new", status="resting", harness_session_id="conv-new")
+    with lodge.registry.edit("pal-new", wolt="pal") as data:  # the newest (update stamps now)
+        data["last_activity"] = int(time.time()) + 100
+    chat = {"adapter": "slack", "chat_id": "D1"}
+    mail(lodge, route={
+        "session": "pal-gone" if stale == "gone" else "pal-rest", "chat": chat})
+    inbox_wake._wake(str(lodge.root), "pal")
+    (command,) = resting.spawned
+    assert command.endswith("pal-new --resume")
+    assert notices.lines == [("resumed", seqs(lodge), "pal-new", chat)] and _stale_prefer(lodge)
+
+
+def test_a_resume_that_fails_is_the_owners_error_line(lodge, resting, notices, monkeypatch):
+    def refused(name, prompt="", **kw):
+        raise sessions.ResumeFailed("the engine refused the conversation")
+    monkeypatch.setattr(sessions, "resume_session", refused)
+    mail(lodge)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert notices.lines == [("error", seqs(lodge), "resume_failed", None)]
+
+
+def test_every_message_an_agents_too_gets_its_outcome_recorded_in_a_bounded_ring(lodge, wake, notices, monkeypatch):
+    monkeypatch.setattr(inbox_wake, "OUTCOMES", 3)
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)  # rearm's wake: not raced here
+    mail(lodge, "a1", human=False)
+    mail(lodge, "k1")
+    inbox_wake._wake(str(lodge.root), "pal")
+    (kw, _), = wake.starts
+    a1, k1 = [seq for seq, in rows(lodge.root, "SELECT seq FROM inbox_messages ORDER BY seq")]
+    assert wake_state(lodge)["outcomes"] == [{"seq": a1, "how": "started", "session": kw["name"]},
+                                             {"seq": k1, "how": "started", "session": kw["name"]}]
+    assert notices.lines == [("started", [k1], kw["name"], None)]  # the owner's line: human mail only
+    mail(lodge, "a2", human=False)
+    mail(lodge, "a3", human=False)
+    sys.modules["native_adapters"].deliver = lambda record_, hint: ("failed", "OSError")
+    wake.live = kw["name"]
+    inbox_wake._wake(str(lodge.root), "pal")
+    ring = wake_state(lodge)["outcomes"]
+    assert [e["seq"] for e in ring] == [k1, k1 + 1, k1 + 2]  # the oldest dropped
+    assert ring[-1] == {"seq": k1 + 2, "how": "blocked", "reason": "hint_failed"} and len(notices.lines) == 1
+    inbox_wake.rearm(lodge.root, "pal")
+    assert wake_state(lodge)["outcomes"] == ring
+
+
+def _stale_prefer(lodge):
+    wake = wake_state(lodge)
+    return wake["prefer"]["seq"] <= wake["answered"]  # its message answered: never a first choice again
+
+
+def test_a_wake_right_after_the_commit_answers_on_the_route_admitted_with_it(lodge, wake, notices, monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    telegram = {"adapter": "telegram", "chat": "42"}
+    status = mail(lodge, route={"session": None, "chat": telegram})  # committed; its own notify paused
+    inbox_wake._wake(str(lodge.root), "pal")  # another wake runs first
+    (kw, _), = wake.starts
+    assert notices.lines == [("started", [status.seq], kw["name"], telegram)]
+
+
+def test_an_admission_between_a_wakes_read_and_its_write_keeps_its_route_and_preference(lodge, wake, notices,
+                                                                                       monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    slack = {"adapter": "slack", "chat": "D1"}
+    first = mail(lodge)
+    late = []
+    write = inbox.Store.set_wake
+
+    def admission_lands_first(self, wolt, state):  # paused: the answer has read, not written yet
+        if not late and "outcomes" in state:
+            late.append(mail(lodge, "k2", route={"session": "pal-meant", "chat": slack}))
+        write(self, wolt, state)
+    monkeypatch.setattr(inbox.Store, "set_wake", admission_lands_first)
+    inbox_wake._wake(str(lodge.root), "pal")
+    monkeypatch.setattr(inbox.Store, "set_wake", write)
+    (kw, _), = wake.starts
+    stored = wake_state(lodge)
+    assert stored["chats"] == {str(late[0].seq): slack}  # the wake's stale copy never dropped it
+    assert stored["prefer"]["session"] == "pal-meant" and stored["prefer"]["seq"] == late[0].seq
+    wake.live = kw["name"]
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert notices.lines == [("started", [first.seq], kw["name"], None), ("hinted", [late[0].seq], kw["name"], slack)]
+
+
+def test_a_true_duplicate_admission_keeps_the_route_and_accounting_it_was_accepted_with(lodge, wake, notices):
+    telegram, slack = {"adapter": "telegram", "chat": "42"}, {"adapter": "slack", "chat": "D1"}
+    status = mail(lodge, route={"session": "pal-meant", "chat": telegram})
+    before = wake_state(lodge)
+    again = mail(lodge, route={"session": "pal-other", "chat": slack})  # a resend of the same event
+    assert again.seq == status.seq and wake_state(lodge) == before
+    inbox_wake._wake(str(lodge.root), "pal")
+    answered = wake_state(lodge)
+    mail(lodge, route={"session": "pal-other", "chat": slack})  # and after its answer: nothing reopens
+    inbox_wake._wake(str(lodge.root), "pal")
+    (kw, _), = wake.starts
+    assert wake_state(lodge) == answered and notices.lines == [("started", [status.seq], kw["name"], telegram)]
+
+
+@pytest.mark.parametrize("adapter, chat", [("telegram", "4242"), ("slack", "D1:1712345678.000100")])
+def test_a_session_the_wake_starts_for_owner_mail_is_routed_to_its_chat_as_chat_lodge_did(lodge, monkeypatch,
+                                                                                           adapter, chat):
+    from test_chat_lodge_inbox import ROOT  # noqa: F401 (puts container/ on the path for chat_lodge)
+    import chat_lodge
+    import connector_registry
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda data: False)  # nothing live: a fresh start
+    started = []
+    real = sessions.start_session
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: started.append(kw) or real(**kw))
+    mail(lodge, route={"session": None, "chat": {"adapter": adapter, "chat": chat}})
+    inbox_wake._wake(str(lodge.root), "pal")
+    side = chat_lodge.ChatLodge(connector_registry.spec(adapter), [])
+    assert started[0]["routing"] == side._routing(chat)  # the routing its own spawn passed before the inbox
+    if adapter == "telegram":  # notify's exact binding keeps the reply footer
+        codec = connector_registry.spec(adapter).codec
+        assert codec.matches(codec.canonical(chat), record(lodge, started[0]["name"]))
+
+
+def test_a_session_the_wake_starts_for_agent_mail_only_is_unrouted(lodge, monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda data: False)
+    mail(lodge, human=False, route={"session": None, "chat": {"adapter": "telegram", "chat": "4242"}})
+    inbox_wake._wake(str(lodge.root), "pal")
+    (name, _, _), = lodge.calls.spawned
+    assert not record(lodge, name).get("routing")
+
+
+@pytest.mark.parametrize("again", [True, False])  # a later pickup (another session's ready) or a coalesced pass
+def test_while_the_preferred_live_session_has_not_fetched_only_it_is_hinted(lodge, wake, notices, monkeypatch,
+                                                                             again):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    for name in ("pal-s1", "pal-s2"):
+        lodge.registry.create(name, wolt="pal")
+        lodge.registry.update(name, attempt=f"{name}-a1")
+    wake.live = "pal-s2"  # the newest live session
+    mail(lodge, route={"session": "pal-s1", "chat": None})
+    inbox_wake._wake(str(lodge.root), "pal")
+    inbox_wake._wake(str(lodge.root), "pal", once=again)
+    assert [d[0] for d in lodge.calls.delivered] == ["pal-s1"] * (1 if again else 2)
+    lodge.store.fetch(lodge.store.grant("pal-s1", "pal"))  # it took the message: the preference is spent
+    mail(lodge, "k2")
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert lodge.calls.delivered[-1][0] == "pal-s2"
+
+
+@pytest.mark.parametrize("end", ["stopped", "died"])
+def test_a_preferred_session_that_ends_with_its_message_queued_hands_it_on(lodge, wake, notices, monkeypatch, end):
+    scheduled = []
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda root, wolt, once=False: scheduled.append((wolt, once)))
+    for name in ("pal-s1", "pal-s2"):
+        lodge.registry.create(name, wolt="pal")
+        lodge.registry.update(name, attempt=f"{name}-a1")
+    wake.live = "pal-s2"
+    mail(lodge, route={"session": "pal-s1", "chat": None})
+    inbox_wake._wake(str(lodge.root), "pal")
+    if end == "stopped":
+        sessions.stop_session("pal-s1")  # the owner's stop schedules a pickup
+        assert scheduled == [("pal", True)]
+    else:  # its tmux is gone: not live, not resumable (the vulture's settle schedules a pickup)
+        monkeypatch.setattr(sessions, "_tmux_alive", lambda data: data.get("name") != "pal-s1")
+    inbox_wake._wake(str(lodge.root), "pal", once=True)
+    assert [d[0] for d in lodge.calls.delivered] == ["pal-s1", "pal-s2"]
+    assert len(notices.lines) == 1  # the message's one line was already sent
+
+
+@pytest.mark.parametrize("named", ["pal-s1", "nunu-s9"])  # its own session, or another wolt's: ignored
+def test_an_enrolled_send_naming_a_session_nudges_only_that_one(lodge, wake, notices, monkeypatch, named):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    wolt(lodge.root, "nunu")
+    for name, owner in (("pal-s1", "pal"), ("pal-s2", "pal"), ("nunu-s9", "nunu")):
+        lodge.registry.create(name, wolt=owner)
+    wake.live = "pal-s2"  # the newest live session
+    lodge.store.send(lodge.store.grant("nunu-s9", "nunu"), "pal", "k1", "hello", session=named)
+    inbox_wake._wake(str(lodge.root), "pal")
+    inbox_wake._wake(str(lodge.root), "pal", once=True)
+    assert [d[0] for d in lodge.calls.delivered] == (["pal-s1"] if named == "pal-s1" else ["pal-s2"])

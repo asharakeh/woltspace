@@ -78,7 +78,7 @@ def test_an_owner_message_is_queued_at_human_priority_instead_of_pasted(lodge):
     assert (sender, key, priority, state) == ("provider:connector:telegram", "telegram:e1", inbox.HUMAN, "queued")
     assert body.decode().startswith(f"[telegram message from human, chat_id={CHAT}]: hello pal\n")
     assert "WOLTSPACE_NOTIFY_" in body.decode()  # the session replies on today's path
-    assert said == ["🪵 queued for 🐾 pal"]
+    assert said == []  # the owner hears once, when the wake has decided
     assert lodge.calls["pasted"] == lodge.calls["spawned"] == []
 
 
@@ -113,7 +113,7 @@ def test_a_non_owner_queues_nothing_and_wakes_nobody(lodge):
 
 
 def test_a_resent_event_is_the_message_already_queued(lodge):
-    assert handle(lodge) == handle(lodge) == ["🪵 queued for 🐾 pal"]
+    assert handle(lodge) == handle(lodge) == []
     [(seq, key)] = rows(lodge.root, "SELECT seq, key FROM inbox_messages")
     first, again = (s for s, _ in lodge.calls["woken"])
     assert first == again and (first.seq, first.key) == (seq, "telegram:e1")
@@ -158,3 +158,17 @@ def test_the_wake_comes_after_the_commit_and_never_for_refused_mail(lodge):
     assert handle(lodge, event_id="e2") == ["🪵 not queued for pal: mailbox_archived"]
     assert len(lodge.calls["woken"]) == 1 and len(queued(lodge)) == 1
     assert lodge.calls["pasted"] == lodge.calls["spawned"] == []
+
+
+def test_the_session_the_owner_meant_is_the_wake_s_first_choice_and_the_chat_keeps_it(lodge):
+    handle(lodge)  # a plain message: the chat's own session
+    notification = ("🦫 pal: done?\n\n---\n↩️ reply to this message to talk to this session directly\n"
+                    "https://lodge.invalid/tui?session=pal-other-marsh-abc123")
+    handle(lodge, event_id="e2", body={"text": "yes", "reply_to": {"from_bot": True, "text": notification}})
+    chat = {"adapter": "telegram", "chat": CHAT}
+    (first, _), (second, _) = lodge.calls["woken"]
+    wake = inbox.Store(lodge.root, inbox.LIMITS).wake_facts("pal")["wake"]  # recorded with each message
+    assert wake["prefer"]["session"] == "pal-other-marsh-abc123" and wake["prefer"]["seq"] == second.seq
+    assert wake["chats"] == {str(first.seq): chat, str(second.seq): chat}
+    assert lodge._load_chat_state(CHAT) == {"active_wolt": "pal", "active_session": LIVE}  # same wolt: kept
+

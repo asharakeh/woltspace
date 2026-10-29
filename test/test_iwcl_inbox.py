@@ -15,7 +15,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from starlette.testclient import TestClient
 
-from inbox_support import limits, lose_confirmation, reader, rows, wolt
+from inbox_support import limits, lose_confirmation, reader, rows, session, wolt
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -89,10 +89,14 @@ def test_a_wolt_with_no_session_gets_mail_and_its_wake(lodge):
     assert lodge["strays"] == []
 
 
-def test_a_session_target_is_mail_for_its_wolt(lodge):
-    assert send(lodge, "nunu-gritty-log-840ad8").returncode == 0
+def test_a_session_target_is_mail_for_its_wolt_and_its_first_choice(lodge):
+    assert send(lodge, "nunu-brave-oak-000001").returncode == 0
     assert [r[1] for r in mail(lodge["root"])] == ["nunu"]
     assert lodge["strays"] == []
+    prefer = inbox.Store(lodge["root"], limits()).wake_facts("nunu")["wake"]["prefer"]
+    assert (prefer["session"], prefer["seq"]) == ("nunu-brave-oak-000001", mail(lodge["root"])[0][0])
+    assert send(lodge, "nunu").returncode == 0  # a wolt target names no session: the first choice stays
+    assert inbox.Store(lodge["root"], limits()).wake_facts("nunu")["wake"]["prefer"] == prefer
 
 
 def test_a_refusal_is_not_queued_and_falls_back_to_nothing(lodge):
@@ -112,27 +116,99 @@ def test_an_unknown_outcome_names_its_key_and_is_never_resent(lodge, monkeypatch
 
 
 @pytest.fixture
-def paste(tmp_path, monkeypatch):
-    """The real app's paste routes, delivery recorded; a live session for pal."""
+def terminal(tmp_path, monkeypatch):
+    """The real app's legacy send routes with the inbox on; the waker records what it is
+    asked and answers with the outcome the test sets."""
     monkeypatch.setattr(server_app, "WOLTS_DIR", tmp_path)
-    pasted = []
-    monkeypatch.setattr(server_app, "deliver_message",
-                        lambda name, text, **kw: pasted.append(name) or {"status": "delivered", "session": name})
-    monkeypatch.setattr(server_app, "resolve_active_session", lambda wolt, registry=None: "pal-a-b-a1b2c3")
-    monkeypatch.setattr(server_app, "_touch_origin", lambda sender: None)
-    return TestClient(server_app.app, base_url="http://localhost:7777"), tmp_path, pasted
+    monkeypatch.setattr(server_app, "OUTCOME_WAIT", 1.0)
+    monkeypatch.setattr(inbox, "LIMITS", limits())
+    enable(tmp_path)
+    for name in ("pal", "nunu"):
+        wolt(tmp_path, name)
+    session(tmp_path, "pal-a-b-a1b2c3", "pal")
+    session(tmp_path, "pal-c-d-e5f6a7", "pal", status="stopped")
+    seen = {"prefer": [], "outcome": {"how": "hinted", "session": "pal-a-b-a1b2c3"}}
+
+    def wake(root, status):
+        store = inbox.Store(root, limits())
+        seen["prefer"].append((store.wake_facts(status.to)["wake"].get("prefer") or {}).get("session"))
+        ring = ((store.wake_facts(status.to) or {}).get("wake") or {}).get("outcomes", [])
+        if seen["outcome"]:
+            store.set_wake(status.to, {"outcomes": ring + [{"seq": status.seq, **seen["outcome"]}]})
+    monkeypatch.setattr(inbox_wake, "notify_admitted", wake)
+    monkeypatch.setattr(server_app, "deliver_message", lambda *a, **k: pytest.fail("pasted"))
+    return TestClient(server_app.app, base_url="http://localhost:7777"), tmp_path, seen
 
 
-@pytest.mark.parametrize("path", ["/sessions/pal-a-b-a1b2c3/message", "/wolts/pal/message"])
-@pytest.mark.parametrize("on", [True, False])
-def test_the_paste_routes_refuse_while_the_inbox_is_on(paste, path, on):
-    client, root, pasted = paste
-    if on:
-        enable(root)
-    answer = client.post(path, json={"text": "hi", "from_wolt": "nunu"})
-    if on:
-        assert (answer.status_code, answer.json()["status"]) == (409, "inbox")
-        assert "start a new session" in answer.json()["error"] and pasted == []
-    else:
-        assert (answer.status_code, answer.json()["status"]) == (200, "delivered")
-        assert pasted == ["pal-a-b-a1b2c3"]
+def terminal_mail(root):
+    return rows(root, "SELECT m.sender, m.priority, b.wolt, m.body FROM inbox_messages m"
+                      " JOIN inbox_mailboxes b ON b.id = m.mailbox ORDER BY m.seq")
+
+
+@pytest.mark.parametrize("path, prefer", [("/sessions/pal-a-b-a1b2c3/message", "pal-a-b-a1b2c3"),
+                                          ("/sessions/pal-c-d-e5f6a7/message", None),  # stopped: never the choice
+                                          ("/wolts/pal/message", None)])
+def test_a_tokenless_send_is_terminal_mail_answered_with_its_own_outcome(terminal, path, prefer):
+    client, root, seen = terminal
+    answer = client.post(path, json={"text": "hi pal", "from_wolt": "nunu", "from_session": "human", "key": "k1"})
+    assert (answer.status_code, answer.json()["status"], answer.json()["session"]) == (200, "notified", "pal-a-b-a1b2c3")
+    [(sender, priority, to, body)] = terminal_mail(root)
+    assert (sender, priority, to) == ("provider:terminal", inbox.AGENT, "pal")
+    assert body.decode().startswith("[message from nunu, session=human]\nhi pal\n")
+    assert seen["prefer"] == [prefer]
+    again = client.post(path, json={"text": "hi pal", "from_wolt": "nunu", "from_session": "human", "key": "k1"})
+    assert again.json()["seq"] == answer.json()["seq"] and len(terminal_mail(root)) == 1  # a re-run is the same message
+
+
+@pytest.mark.parametrize("token", ["", "not-a-reader"])
+def test_a_reader_on_a_legacy_route_is_refused_never_downgraded(terminal, token):
+    client, root, _ = terminal
+    answer = client.post("/wolts/pal/message", json={"text": "hi"}, headers={"X-Woltspace-Inbox-Token": token})
+    assert (answer.status_code, answer.json()["error"]) == (409, "use_inbox_send")
+    assert terminal_mail(root) == []
+
+
+def test_the_sender_hears_cant_wake_or_pending_never_delivered(terminal):
+    client, root, seen = terminal
+    seen["outcome"] = {"how": "blocked", "reason": "launch_unknown"}
+    blocked = client.post("/wolts/pal/message", json={"text": "one", "key": "k1"})
+    assert (blocked.status_code, blocked.json()["status"], blocked.json()["reason"]) == (409, "cant_wake", "launch_unknown")
+    seen["outcome"] = None  # the wake has not decided within the wait; the earlier mail's outcome is not this one's
+    pending = client.post("/wolts/pal/message", json={"text": "two", "key": "k2"})
+    assert (pending.status_code, pending.json()["status"], pending.json()["key"]) == (200, "pending", "k2")
+
+
+def test_the_cli_prints_the_outcome_and_on_no_answer_the_key(tmp_path):
+    import socket
+    hang = socket.socket()
+    hang.bind(("127.0.0.1", 0))
+    hang.listen()  # accepts, never answers
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path),
+           "WOLTSPACE_API": f"http://127.0.0.1:{hang.getsockname()[1]}", "WOLTSPACE_WOLT_NAME": "nunu"}
+    done = subprocess.run([sys.executable, str(ROOT / "container" / "bin" / "woltspace"), "session", "send", "pal",
+                           "--key", "k9"], input="hi", env=env, capture_output=True, text=True, timeout=60)
+    hang.close()
+    assert done.returncode == 1 and "re-run with --key k9 to see its outcome" in done.stderr
+
+
+@pytest.mark.parametrize("outcome, rc, line", [
+    ({"how": "resumed", "session": "pal-a-b-a1b2c3"}, 0, "notified pal-a-b-a1b2c3\n"),
+    ({"how": "blocked", "reason": "launch_unknown"}, 1, "pal can't wake: launch_unknown\n"),
+    (None, 0, "queued for pal; outcome pending: re-run with --key k7 to see it\n")])
+def test_a_terminal_send_prints_this_message_s_own_outcome(terminal, outcome, rc, line):
+    _, root, seen = terminal
+    seen["outcome"] = outcome
+    srv = uvicorn.Server(uvicorn.Config(server_app.app, host="127.0.0.1", port=0, log_level="warning", lifespan="off"))
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+    while not srv.started:
+        time.sleep(0.02)
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(root), "WOLTSPACE_WOLT_NAME": "nunu",
+           "WOLTSPACE_API": f"http://127.0.0.1:{srv.servers[0].sockets[0].getsockname()[1]}"}
+    try:
+        done = subprocess.run([sys.executable, str(ROOT / "container" / "bin" / "woltspace"), "session", "send", "pal",
+                               "--key", "k7"], input="hi", env=env, capture_output=True, text=True, timeout=60)
+    finally:
+        srv.should_exit = True
+        thread.join(5)
+    assert (done.returncode, done.stdout + done.stderr) == (rc, line)

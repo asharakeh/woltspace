@@ -247,6 +247,10 @@ class Store:
                 return None
             wake = json.loads(row["wake"] or "{}")
             session = (wake.get("reserved") or {}).get("session", "")
+            # mail after the last one a wake answered, in any state (before any answer: the
+            # queued only); a reader's session once one has taken it
+            since, args = (("m.seq > ?", (wake["answered"],)) if "answered" in wake
+                           else ("m.state = 'queued'", ()))
             return {"open": row["state"] == "open", "wake": wake,
                     "queued": conn.execute("SELECT count(*) FROM inbox_messages WHERE mailbox=?"
                                            " AND state='queued'", (row["id"],)).fetchone()[0],
@@ -255,7 +259,15 @@ class Store:
                     "human_seq": conn.execute("SELECT max(seq) FROM inbox_messages WHERE mailbox=?"
                                               " AND state='queued' AND priority=?", (row["id"], HUMAN)).fetchone()[0],
                     "acks": conn.execute("SELECT coalesce(sum(acks), 0) FROM inbox_readers"
-                                         " WHERE session=?", (session,)).fetchone()[0]}
+                                         " WHERE session=?", (session,)).fetchone()[0],
+                    "prefer_queued": conn.execute(  # the preference's own message, still for its session
+                        "SELECT 1 FROM inbox_messages WHERE seq=? AND state='queued'",
+                        ((wake.get("prefer") or {}).get("seq"),)).fetchone() is not None,
+                    "unanswered": [{"seq": seq, "human": priority == HUMAN, "session": taker}
+                                   for seq, priority, taker in conn.execute(
+                        "SELECT m.seq, m.priority, CASE WHEN m.state != 'queued' THEN r.session END"
+                        " FROM inbox_messages m LEFT JOIN inbox_readers r ON r.hash = m.reader"
+                        f" WHERE m.mailbox=? AND {since} ORDER BY m.seq", (row["id"], *args))]}
 
     def reader_session(self, token: str) -> tuple[str, str] | None:
         """(session, wolt) of a valid reader, or None."""
@@ -271,28 +283,49 @@ class Store:
                 " WHERE b.state = 'open' AND m.state = 'queued'")]
 
     def set_wake(self, wolt: str, wake: dict) -> None:
+        """The waker's write. What admission records in the same field (_note) is kept from
+        the stored state, never from the waker's copy: the baseline once set, the preferred
+        session, and the routes of the mail not answered yet."""
         with self._write() as conn:
+            row = conn.execute("SELECT wake FROM inbox_mailboxes WHERE wolt=? AND state != 'closed'",
+                               (wolt,)).fetchone()
+            if row is None:
+                return
+            stored, wake = json.loads(row[0] or "{}"), {k: v for k, v in (wake or {}).items()
+                                                          if k not in ("prefer", "chats")}
+            if "answered" in stored:
+                wake["answered"] = max(wake.get("answered", stored["answered"]), stored["answered"])
+            if "prefer" in stored:
+                wake["prefer"] = stored["prefer"]
+            chats = {k: v for k, v in stored.get("chats", {}).items() if int(k) > wake.get("answered", -1)}
+            if chats:
+                wake["chats"] = chats
             conn.execute("UPDATE inbox_mailboxes SET wake=? WHERE wolt=? AND state != 'closed'",
                          (json.dumps(wake) if wake else None, wolt))
 
     # -- the reader's -----------------------------------------------------------
 
-    def send(self, token: str, to: str, key: str, body: str) -> Status:
-        """Mail from the reader's own wolt, always at agent priority."""
+    def send(self, token: str, to: str, key: str, body: str, session: str | None = None) -> Status:
+        """Mail from the reader's own wolt, always at agent priority. session: the one the
+        sender named, only the wake's first choice (inbox_wake checks it is to's)."""
         reader = _hash(token)
+        if session is not None:
+            _text(session, self.limits.name_chars, "session")
 
         def sender(conn):
             mailbox, wolt = self._reader(conn, reader)
             return f"mailbox:{mailbox}", wolt
-        return self._admit(sender, key, to, body, AGENT)
+        return self._admit(sender, key, to, body, AGENT, route={"session": session})
 
     def admit(self, sender: str, key: str, to: str, body: str, *, human: bool = False,
-              mailbox: int | None = None) -> Status:
+              mailbox: int | None = None, route: dict | None = None) -> Status:
         """Library admission for a trusted provider that has verified its
-        sender itself; only it may say human. Nothing in the lodge calls it yet."""
+        sender itself; only it may say human. route: {"session", "chat"}, the
+        session the sender is talking to and the chat its answer goes to,
+        recorded with the message (_note)."""
         _text(sender, self.limits.name_chars, "sender")
         return self._admit(lambda conn: (f"provider:{sender}", sender), key, to, body, HUMAN if human else AGENT,
-                           mailbox)
+                           mailbox, route)
 
     def fetch(self, token: str) -> Delivery | None:
         """The reader's open claim again, or a claim on the next queued
@@ -374,7 +407,7 @@ class Store:
 
     # -- inside a write ---------------------------------------------------------
 
-    def _admit(self, sender_of, key, to, body, priority, expected=None) -> Status:
+    def _admit(self, sender_of, key, to, body, priority, expected=None, route=None) -> Status:
         _text(key, self.limits.key_chars, "key")
         _text(to, self.limits.name_chars, "to")
         payload = _text(body, MAX_PAYLOAD_BYTES, "body", 0).encode("utf-8")
@@ -412,7 +445,29 @@ class Store:
                 (sender, name, key, mailbox, priority, payload, len(payload), digest, now)).lastrowid
             self._charge(conn, mailbox, 1, len(payload), 1)
             self._event(conn, seq, "queued", None)
+            self._note(conn, mailbox, seq, priority, route or {}, now)
             return self._status(conn, "m.seq=?", (seq,))
+
+    @staticmethod
+    def _note(conn, mailbox: int, seq: int, priority: int, route: dict, now: float) -> None:
+        """The waker's accounting, in the admission's own write (inbox_wake answers human mail
+        only once its route is here): on the mailbox's first admission since accounting
+        began, the answered baseline just below the queued mail, whose human messages take
+        the default route; the preferred session; and a human message's route (None: the
+        default channel). A duplicate admission never gets here."""
+        wake = json.loads(conn.execute("SELECT wake FROM inbox_mailboxes WHERE id=?", (mailbox,)).fetchone()[0]
+                          or "{}")
+        chats = wake.setdefault("chats", {})
+        if "answered" not in wake:  # older mail already handled is never answered again
+            queued = conn.execute("SELECT seq, priority FROM inbox_messages WHERE mailbox=? AND state='queued'"
+                                  " ORDER BY seq", (mailbox,)).fetchall()
+            wake["answered"] = queued[0][0] - 1
+            chats.update({str(q): None for q, p in queued if p == HUMAN})
+        if route.get("session"):
+            wake["prefer"] = {"session": route["session"], "seq": seq, "at": int(now)}
+        if priority == HUMAN:
+            chats[str(seq)] = route.get("chat")
+        conn.execute("UPDATE inbox_mailboxes SET wake=? WHERE id=?", (json.dumps(wake), mailbox))
 
     def _mailbox(self, conn, wolt, *, create=False) -> int:
         """The wolt's open mailbox; a new one for a wolt the lodge knows."""

@@ -453,7 +453,8 @@ class ChatLodge:
                 "role": "assistant", "content": f"[delivered to session {name}]"}),
             deliver=(lambda name, wolt, text: self._route_to_session(route, out, name, wolt, text))
             if wrapped else None,
-            admit=(lambda wolt, text: self._admit(route, out, event_id, wolt, text)) if queue else None,
+            admit=(lambda wolt, text, session: self._admit(route, out, event_id, wolt, text, session))
+            if queue else None,
             log=lambda event, data: _bot_log(f"{self.name}_{event}", data),
             log_error=lambda message: logger.error(message),
         )
@@ -478,7 +479,8 @@ class ChatLodge:
         file_name = outbox.display_name(file_name) if file_name else None
         return session, quote_reply(body, file_name, text, bool(reply_to.get("voice")))
 
-    async def _admit(self, route: dict, out, event_id: str, wolt: str, text: str) -> None:
+    async def _admit(self, route: dict, out, event_id: str, wolt: str, text: str,
+                     session: str | None = None) -> None:
         """Queue an owner message in the wolt's inbox at human priority.
 
         Only handle reaches this, after its owner check: agent mail never says
@@ -486,7 +488,9 @@ class ChatLodge:
         delimiter comes from it, so a resent event builds the same body and
         gets the message already queued. Anything else under the key is a
         conflict. Custody starts when admit commits; a failure is told to the
-        owner, never pasted instead.
+        owner, never pasted instead. Otherwise the owner hears once, when the
+        wake has decided (inbox_notice.outcome); `session`, the one they meant,
+        is only the wake's first choice: any session of the wolt may fetch.
         """
         chat = self.chat(route)
         key = f"{self.name}:{event_id}"
@@ -497,8 +501,11 @@ class ChatLodge:
                 raise inbox.Invalid("delimiter")
             reply = notify_reply_instruction(*self.spec.reply_args(self.route_of(chat)), delimiter=delimiter)
             body = f"{self._session_message(text, chat)}\n{reply}"
+            # the session they meant (the wake's first choice) and this chat, recorded with the message
+            route = {"session": session if session and messages.wolt_from_session_name(session) == wolt else None,
+                     "chat": {"adapter": self.name, "chat": chat}}
             status = await asyncio.to_thread(
-                store.admit, f"connector:{self.name}", key, wolt, body, human=True)
+                store.admit, f"connector:{self.name}", key, wolt, body, human=True, route=route)
         except inbox.InboxError as e:
             code = getattr(e, "code", "invalid")
             _bot_log(f"{self.name}_inbox_refused", {"wolt": wolt, "key": key, "code": code})
@@ -506,12 +513,13 @@ class ChatLodge:
             return
         _bot_log(f"{self.name}_inbox_admitted", {"wolt": wolt, "seq": status.seq, "key": key})
         self._append_history(chat, "user", text)
-        # The next plain message goes to the wolt last written to; mail binds no session.
+        # The next plain message goes to the wolt last written to; its session is kept
+        # while it is that wolt's, as the conversation the owner is in.
         state = self._load_chat_state(chat)
+        if state.get("active_wolt") != wolt:
+            state.pop("active_session", None)
         state["active_wolt"] = wolt
-        state.pop("active_session", None)
         self._save_chat_state(chat, state)
-        await out.say(Reply(f"🪵 queued for {self._creature_emoji(wolt)} {self._shown(wolt)}"))
         try:
             await asyncio.to_thread(notify_admitted, self.wolts_dir, status)
         except Exception as e:

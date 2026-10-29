@@ -72,14 +72,17 @@ def test_a_notice_that_cannot_be_sent_never_raises(lodge, failure):
 
 
 def test_each_human_message_to_a_wolt_that_cannot_wake_gets_its_own_notice(lodge):
-    lodge.store.admit("connector:telegram", "telegram:1", "pal", BODY, human=True)
-    lodge.store.set_wake("pal", {"inhibited": "no_progress"})  # held even for human mail, older than it
+    import lodge_db, sessions
+    with lodge_db.write(lodge.root) as conn:  # a launch of pal that never confirmed: the one lasting block
+        sessions.put_session(conn, dict(name="pal-a-b-c", wolt="pal", status="stopped", created_at=1,
+                                        launching={"attempt": "a1"}))
     for n in (1, 2):
-        if n == 2:
-            lodge.store.admit("connector:telegram", "telegram:2", "pal", BODY, human=True)
+        lodge.store.admit("connector:telegram", f"telegram:{n}", "pal", BODY, human=True)
         inbox_wake._wake(str(lodge.root), "pal")  # the wake each admission schedules
+        inbox_wake._wake(str(lodge.root), "pal")  # and a repeat, which adds nothing
         assert len(lodge.sent) == n
-    assert all(body["message"].endswith("its last wake didn't pick the mail up") for _, body in lodge.sent)
+    assert all(body["message"].endswith("an earlier start of it never confirmed and may still come up")
+               for _, body in lodge.sent)
 
 
 @pytest.fixture
@@ -142,4 +145,29 @@ def test_a_sender_recreated_between_the_read_and_the_notice_is_not_told(agents, 
     monkeypatch.setattr(inbox.Store, "unnoticed_agent_mail", then_recreated)
     inbox_notice.notice(agents.root, "pal", "no_progress", owner=False)
     assert lodge_mail(agents, "nunu") == [] and agents.woken == []
+
+
+
+def test_every_wake_outcome_gives_the_owner_exactly_one_line_per_message(lodge):
+    import chat_state
+    chat, line = {"adapter": "chat", "chat": "4242"}, "🪵 your mail for pal is waiting, but pal can't wake now: "
+    chat_state.put(lodge.root, "chat", "4242", {"active_wolt": "pal", "active_session": "pal-old-den-000001"})
+    for how, kw in (("hinted", {"session": "pal-a-b-000002"}), ("resumed", {"session": "pal-c-d-000003"}),
+                    ("started", {"session": "pal-e-f-000004"}), ("blocked", {"reason": "launch_unknown"}),
+                    ("error", {"reason": "error"})):
+        inbox_notice.outcome(lodge.root, "pal", seqs=[7], how=how, chat=chat, **kw)
+    inbox_notice.outcome(lodge.root, "pal", seqs=[8, 9], how="hinted", session="pal-a-b-000002")  # one wake, 2 messages
+    assert [body["message"] for _, body in lodge.sent] == [
+        "🪵 pal-a-b-000002 notified\npal-a-b-000002", "🪵 pal-c-d-000003 notified\npal-c-d-000003",
+        "🪵 pal-e-f-000004 notified\npal-e-f-000004", line + "an earlier start of it never confirmed and may still come up",
+        line + "the lodge hit an error while waking it", "🪵 pal-a-b-000002 notified\npal-a-b-000002",
+        "🪵 pal-a-b-000002 notified\npal-a-b-000002"]
+    assert [(b.get("adapter"), b.get("route")) for _, b in lodge.sent] == [("chat", "4242")] * 5 + [(None, None)] * 2
+    assert chat_state.get(lodge.root, "chat", "4242")["active_session"] == "pal-e-f-000004"  # the last one reached
+
+
+def test_one_lost_line_does_not_silence_the_others(lodge):
+    lodge.answer["status"] = 503  # every send fails at the far end...
+    inbox_notice.outcome(lodge.root, "pal", seqs=[1, 2, 3], how="blocked", reason="error")
+    assert len(lodge.sent) == 3  # ...and each message still got its own attempt
 

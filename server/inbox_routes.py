@@ -22,7 +22,7 @@ from .config import WOLTS_DIR
 
 router = APIRouter(prefix="/inbox")
 TOKEN_HEADER = "X-Woltspace-Inbox-Token"
-_FIELDS = {"send": {"to", "key", "text"}, "fetch": set(), "ack": {"seq", "claim"},
+_FIELDS = {"send": {"to", "key", "text", "session"}, "fetch": set(), "ack": {"seq", "claim"},
            "release": {"seq", "claim"}, "status": {"key"}}
 _HTTP = {"inbox_disabled": 404, "unsupported": 404, "invalid": 400, "reader_invalid": 401,
          "store_busy": 503, "store_failed": 503, "lifecycle_busy": 409, "launch_unknown": 409}
@@ -96,7 +96,7 @@ async def inbox_call(verb: str, request: Request):
         return _error("invalid")
     token, store = request.headers.get(TOKEN_HEADER, ""), inbox.Store(WOLTS_DIR, inbox.LIMITS)
     call = {
-        "send": lambda: store.send(token, body.get("to"), body.get("key"), body.get("text")),
+        "send": lambda: store.send(token, body.get("to"), body.get("key"), body.get("text"), body.get("session")),
         "fetch": lambda: store.fetch(token),
         "ack": lambda: store.ack(token, body.get("seq"), body.get("claim")),
         "release": lambda: store.release(token, body.get("seq"), body.get("claim")),

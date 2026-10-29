@@ -263,10 +263,10 @@ def session_send_argv(
     return argv
 
 
-def session_send_reply_instruction(target: object) -> str:
+def session_send_reply_instruction(target: object, delimiter: str | None = None) -> str:
     """Build an IWCL reply instruction for one exact sender session."""
     return reply_instruction(
-        session_send_argv(target), prefix="WOLTSPACE_IWCL"
+        session_send_argv(target), prefix="WOLTSPACE_IWCL", delimiter=delimiter
     )
 
 

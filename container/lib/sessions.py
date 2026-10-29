@@ -2242,16 +2242,16 @@ def _relaunch(registry: "SessionRegistry", name: str, wolt: str, harness: str, o
     """One resume relaunch segment, under the agent's lock: a new attempt marked
     before the external effect; the caller publishes it. Waits come after.
     only_resting (the inbox wake's resume): refuse unless the session is still
-    resting and none of the agent's sessions carries an owner's stop mark or an
-    unresolved launch, the wake's own admission checks, since the wake chose it."""
+    resting, carries no owner's stop mark, and no launch of the agent is unresolved,
+    the wake's own admission checks, since the wake chose it."""
     with lifecycle.agent_lock(WOLTS_DIR, wolt):
         current = registry.get(name, wolt=wolt, check_alive=False)
         if current is None or current.get("launching"):
             raise ResumeFailed(f"session '{name}' has an unresolved launch; nothing was relaunched")
-        if only_resting and (current.get("status") != "resting" or any(  # the wake's own admission, re-checked
-                r.get("wake_inhibit") or r.get("launching") for r in registry.records(wolt=wolt))):
-            raise ResumeFailed(f"session '{name}' is no longer resting, or the agent is stopped or launching;"
-                               " the wake does not revive it")
+        if only_resting and (current.get("status") != "resting" or current.get("wake_inhibit")
+                             or any(r.get("launching") for r in registry.records(wolt=wolt))):
+            raise ResumeFailed(f"session '{name}' is no longer resting, was stopped by the owner, or the agent"
+                               " is launching; the wake does not revive it")
         invalidate_native(registry, name, wolt, current)
         yield mark_launching(registry, name, wolt, harness)
 
@@ -2530,6 +2530,7 @@ def stop_session(name: str) -> dict:
     with _ending(registry, data) as (wolt, tmux_alive):
         # wake_inhibit: the owner ended it, so the inbox wake starts nothing until rearm
         registry.update(name, wolt=wolt, status="stopped", finished_at=int(time.time()), wake_inhibit=True)
+    _schedule_pickup(wolt)  # mail it was preferred for now wakes another session
     return {"name": name, "status": "stopped", "was_alive": tmux_alive}
 
 
@@ -2547,6 +2548,7 @@ def archive_session(name: str) -> dict:
     with _ending(registry, data) as (wolt, _):
         registry.update(name, wolt=wolt, status="archived", wake_inhibit=True,
                         finished_at=data.get("finished_at") or int(time.time()))
+    _schedule_pickup(wolt)  # mail it was preferred for now wakes another session
     return {"name": name, "status": "archived", "wolt": wolt}
 
 

@@ -575,6 +575,7 @@ def test_only_a_hint_that_reached_the_engine_counts_once(lodge, wake, result):
 @pytest.fixture
 def resting(lodge, monkeypatch):
     """A resting prompt-mode session of pal with a conversation to resume; tmux gone."""
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)  # no pickup thread racing the test
     sessions.start_session(wolt="pal", name="pal-rest", execution_policy="prompt")
     lodge.registry.update("pal-rest", status="resting", harness_session_id="conv-1")
     sent = types.SimpleNamespace(spawned=[], input=[])

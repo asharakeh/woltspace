@@ -220,8 +220,7 @@ def _settle_if_still_dead(reg: SessionRegistry, wolt: str, name: str, now: int,
     if data is not None and data.get("status") == "running" and not stored_resume_id(data):
         claim_resume_id(reg, data, lambda d: stamp_resume_id(reg, wolt, name, d["harness_session_id"]))
     current = reg.get(name, wolt=wolt, check_alive=False)
-    if (current is None or current.get("status") != "running" or current.get("launching")
-            or not still_dead(current)):
+    if current is None or current.get("status") != "running" or not still_dead(current):
         return None
     settled = []
     if stop is None:

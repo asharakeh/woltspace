@@ -85,13 +85,13 @@ def quoted_heredoc(
 
 
 def reply_instruction(
-    argv: Sequence[object], *, prefix: str = "WOLTSPACE_MSG", delimiter: str | None = None
+    argv: Sequence[object], *, prefix: str = "WOLTSPACE_MSG"
 ) -> str:
     """Tell an agent exactly how to reply without loading a skill."""
     return (
         f"Reply by replacing {_REPLY_PLACEHOLDER} in this exact single-quoted "
         "heredoc, then run it:\n"
-        f"{quoted_heredoc(argv, prefix=prefix, delimiter=delimiter)}"
+        f"{quoted_heredoc(argv, prefix=prefix)}"
     )
 
 
@@ -236,18 +236,16 @@ def notify_heredoc(
     )
 
 
-def notify_reply_instruction(*route_args: object, delimiter: str | None = None) -> str:
-    """Build a notify reply instruction, falling back to session routing.
-
-    A fixed ``delimiter`` makes the text the same each time it is built."""
+def notify_reply_instruction(*route_args: object) -> str:
+    """Build a notify reply instruction, falling back to session routing."""
     try:
         return reply_instruction(
-            ["notify", *route_args], prefix="WOLTSPACE_NOTIFY", delimiter=delimiter
+            ["notify", *route_args], prefix="WOLTSPACE_NOTIFY"
         )
     except ValueError:
         # Bad adapter metadata should not break message routing. The unrouted
         # command can still resolve the destination through the session registry.
-        return reply_instruction(["notify"], prefix="WOLTSPACE_NOTIFY", delimiter=delimiter)
+        return reply_instruction(["notify"], prefix="WOLTSPACE_NOTIFY")
 
 
 def session_send_argv(

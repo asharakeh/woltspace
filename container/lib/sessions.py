@@ -2124,6 +2124,7 @@ def start_session(
             thread_ts=str((routing or {}).get("thread_ts", "")),
             session_url=session_url,
         ))
+    _schedule_pickup(wolt)  # after publication: whichever of this and the backend's ready call comes later hints
 
     result = {
         "name": name,
@@ -2398,6 +2399,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
                     _launch_failed(registry, name, wolt, attempt, settle=False)
                     raise ResumeFailed(f"session '{name}': the resume command could not be pasted ({exc})") from exc
                 publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
+            _schedule_pickup(wolt)
             detail = "agent exited, restarted with --resume in existing pane"
         else:
             # The session survived only because unrelated user panes/windows
@@ -2410,6 +2412,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
                     _launch_failed(registry, name, wolt, attempt, settle=False)
                     raise ResumeFailed(f"session '{name}': no window could be opened for the resume ({exc})") from exc
                 publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
+            _schedule_pickup(wolt)
             # The pane on disk just moved. Keep the in-memory record in step so
             # nothing below this line addresses the pane we already replaced.
             data = {**data, "runtime": target.to_record()}
@@ -2451,6 +2454,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
             _launch_failed(registry, name, wolt, attempt, settle=True)  # a fresh new-session never started
             raise
         publish_runtime(registry, name, wolt, attempt, handle.to_record(), status="running")
+    _schedule_pickup(wolt)
     if not _await_agent(handle, harness):
         # run-session.sh may have exited before an agent appeared: a prepare
         # failure, a missing harness binary, an auth wall. Reporting

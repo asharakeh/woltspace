@@ -89,7 +89,9 @@ def test_telegram_to_a_woken_session_to_its_own_fetch_and_ack(flow):
 
     say(flow, "e2", "second")
     assert flow.seen.spawned == [name]  # the live session is hinted, never a second worker
-    (hinted, attempt, native_attempt, hint), = flow.seen.hints
+    # one pickup after the fresh session's publication, then one for the new mail
+    assert len(flow.seen.hints) == 2
+    (hinted, attempt, native_attempt, hint) = flow.seen.hints[-1]
     assert (hinted, attempt) == (name, native_attempt) and "woltspace inbox fetch" in hint
     assert "first" not in hint and "second" not in hint
     assert [s for s, in rows(flow.root, "SELECT state FROM inbox_messages")] == ["queued", "queued"]

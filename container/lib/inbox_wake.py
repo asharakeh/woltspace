@@ -41,7 +41,6 @@ START = ("You have lodge inbox mail. Run `woltspace inbox fetch`, handle the mes
 HINT = ("New inbox mail: run `woltspace inbox fetch`, then `woltspace inbox ack <seq> <claim>` "
         "when handled (nonce {nonce}).")
 BUSY_RETRIES, BUSY_PAUSE = 5, 2.0
-_NOT_PLACED = {("pending", "launching"), ("pending", "not_ready")}  # nothing reached the engine yet
 _GUARD = threading.Lock()
 _PENDING: dict[tuple[str, str], bool] = {}  # (root, wolt) -> another wake was asked for meanwhile
 
@@ -162,7 +161,7 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         return
     status, code = _deliver(record, HINT.format(nonce=uuid.uuid4().hex[:8]))
     log.info("inbox hint for %s via %s: %s (%s)", wolt, live, status, code)
-    if status != "unavailable" and (status, code) not in _NOT_PLACED:
+    if status == "submitted" or (status, code) == ("pending", "placed"):  # only a hint that reached the engine
         with lifecycle.agent_lock(root, wolt):
             facts = store.wake_facts(wolt)
             if facts:

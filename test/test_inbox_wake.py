@@ -536,3 +536,42 @@ def test_owner_mail_retries_only_a_policy_refusal(lodge, wake, notices, inhibite
     lodge.store.set_wake("pal", {"inhibited": inhibited})
     inbox_wake._wake(str(lodge.root), "pal")
     assert len(wake.starts) == starts and all(kw["require_auto"] is False for kw, _ in wake.starts)
+
+
+
+def test_whichever_comes_later_of_publication_and_readiness_hints_once(lodge, monkeypatch):
+    scheduled = []
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda root, wolt, once=False: scheduled.append((wolt, once)))
+    store = inbox.Store(lodge.root, limits(name_chars=64))
+    early = []
+
+    def spawn(name, cwd, command):  # the backend says ready before its publication
+        attempt = record(lodge, name)["launching"]["attempt"]
+        early.append(inbox_wake.ready(lodge.root, store.grant(name, "pal"), name, attempt))
+        return RuntimeHandle(name, name, "%1")
+    monkeypatch.setattr(sessions, "_tmux_spawn", spawn)
+    sessions.start_session(wolt="pal", name="pal-a-b-c")
+    assert early == [False] and scheduled == [("pal", True)]  # refused while launching; publication schedules
+    mail(lodge)  # publication before ready: the pickup finds the backend not ready, which counts for nothing
+    monkeypatch.setattr(sessions, "resolve_active_session", lambda wolt, registry=None: "pal-a-b-c")
+    results = iter([("pending", "not_ready"), ("submitted", "claimed")])
+    sys.modules["native_adapters"].deliver = (
+        lambda record_, hint: lodge.calls.delivered.append(record_["attempt"]) or next(results))
+    inbox_wake._wake(str(lodge.root), "pal", once=True)  # the publication's pickup
+    token = store.grant("pal-a-b-c", "pal")
+    assert inbox_wake.ready(lodge.root, token, "pal-a-b-c", record(lodge, "pal-a-b-c")["attempt"])
+    inbox_wake._wake(str(lodge.root), "pal", once=True)  # the ready call's pickup
+    inbox_wake._wake(str(lodge.root), "pal", once=True)  # a repeat: this attempt is hinted
+    assert len(lodge.calls.delivered) == 2
+
+
+@pytest.mark.parametrize("result", [("unknown", "timeout"), ("failed", "OSError"), ("pending", "not_ready")])
+def test_only_a_hint_that_reached_the_engine_counts_once(lodge, wake, result):
+    mail(lodge)
+    lodge.registry.create("pal-live", wolt="pal")
+    lodge.registry.update("pal-live", attempt="a1")
+    wake.live = "pal-live"
+    sys.modules["native_adapters"].deliver = lambda record_, hint: lodge.calls.delivered.append(1) or result
+    inbox_wake._wake(str(lodge.root), "pal", once=True)
+    inbox_wake._wake(str(lodge.root), "pal", once=True)
+    assert len(lodge.calls.delivered) == 2 and "hinted" not in wake_state(lodge)

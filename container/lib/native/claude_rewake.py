@@ -27,7 +27,7 @@ me, parent, armed = str(os.getpid()), os.getppid(), time.time()
 os.replace(directory / f".{LISTENER}.{me}", directory / LISTENER)  # supersede first: the old one stays gated
 if event.get("hook_event_name") == "Stop":  # a hint from before this turn (none is placed while busy): the
     (directory / HINT).unlink(missing_ok=True)  # turn_end wake below hints again if mail is still queued
-write_state(directory, False)
+    write_state(directory, False)  # only a turn's end says idle: a start may already run its opening prompt
 if not write_ready(directory, {"kind": KINDS["claude"], "attempt": attempt, "pid": int(me), "armed_at": armed,
                                "session_id": event.get("session_id")},
                    announce="turn_end" if event.get("hook_event_name") == "Stop" else "ready"):

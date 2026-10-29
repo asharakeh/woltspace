@@ -569,3 +569,20 @@ def test_a_hint_from_before_the_turn_is_dropped_at_its_end_and_the_next_one_is_c
     assert proc.poll() is None and not (directory / "hint").exists()  # dropped, not claimed
     (directory / "hint").write_text(HINT)  # what the turn_end wake places if mail is still queued
     assert proc.wait(5) == 2 and proc.stderr.read().strip() == HINT
+
+
+def test_a_session_start_never_overrides_the_opening_prompt_s_busy(lodge):
+    wolts, _ = lodge
+    directory = Path(na.prepare(wolts, "pal-x", "claude", "a1")["addr"])
+    na.write_state(directory, True)  # the opening prompt's UserPromptSubmit ran first
+    proc = _listener(directory)
+    proc.stdin.write(json.dumps({"session_id": "s1", "hook_event_name": "SessionStart"}))
+    proc.stdin.close()
+    deadline = time.monotonic() + 5
+    while not (directory / "ready.json").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    (directory / "hint").write_text(HINT)
+    time.sleep(0.6)
+    assert na.is_busy(directory) and proc.poll() is None and (directory / "hint").exists()  # held until the turn ends
+    (directory / "retired").touch()
+    assert proc.wait(5) == 0

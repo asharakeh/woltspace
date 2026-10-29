@@ -9,11 +9,13 @@ lifecycle lock, never the caller's seq or state:
 
 - nothing queued, the mailbox not open, or the wake inhibited: nothing.
 - a live session: a fixed, body-free hint through its native input, sent after
-  the lock is released (native_adapters.deliver). submitted, pending, unknown,
+  the lock is released (native_adapters.deliver), even while the wake is
+  inhibited: an inhibition only ever stops a start. submitted, pending, unknown,
   unavailable and failed are transport facts; none changes custody, and none
   is retried here. Mail waits for the agent's own fetch and ack.
 - no live session: one fresh session, reserved by name first and started with
-  the fixed fetch instruction (auto policy only). The owner's explicit stop or
+  the fixed fetch instruction (auto policy only for agent mail; human mail
+  starts the wolt in its own mode). The owner's explicit stop or
   archive of any of the agent's sessions, whoever started it, marks that record
   (wake_inhibit) and inhibits the wake until rearm clears the marks it sees; so does a reserved session that ended without a first ack
   ("no_progress"). New mail never clears an inhibition. While any launch of
@@ -39,6 +41,7 @@ START = ("You have lodge inbox mail. Run `woltspace inbox fetch`, handle the mes
 HINT = ("New inbox mail: run `woltspace inbox fetch`, then `woltspace inbox ack <seq> <claim>` "
         "when handled (nonce {nonce}).")
 BUSY_RETRIES, BUSY_PAUSE = 5, 2.0
+_NOT_PLACED = {("pending", "launching"), ("pending", "not_ready")}  # nothing reached the engine yet
 _GUARD = threading.Lock()
 _PENDING: dict[tuple[str, str], bool] = {}  # (root, wolt) -> another wake was asked for meanwhile
 
@@ -110,44 +113,72 @@ def _worker(root: str, wolt: str) -> None:
             _PENDING[key], busy = False, 0
 
 
-def _wake(root: str, wolt: str) -> None:
+def _wake(root: str, wolt: str, *, once: bool = False) -> None:
+    """once: hint a live session only if its current attempt has had none yet."""
     store, registry = inbox.Store(root, inbox.LIMITS), sessions.SessionRegistry(root)
     with lifecycle.agent_lock(root, wolt):
         facts = store.wake_facts(wolt)
-        if not facts or not facts["open"] or not facts["queued"] or facts["wake"].get("inhibited"):
+        if not facts or not facts["open"] or not facts["queued"]:
             return
         live = sessions.resolve_active_session(wolt, registry)
-        if live is None:
-            _start(store, registry, wolt, facts)
-            return
-        record = registry.get(live, wolt=wolt, check_alive=False)
+        # An inhibition only ever stops a start, never a live session's hint.
+        why = None if live else (facts["wake"].get("inhibited") or _start(store, registry, wolt, facts))
+        if live:
+            record = registry.get(live, wolt=wolt, check_alive=False) or {}
+            hinted = {"session": live, "attempt": record.get("attempt")}
+            if once and facts["wake"].get("hinted") == hinted:
+                return
+    if not live:
+        if why:  # neither a hint nor a start: outside the lock and any Store write
+            _notice(root, wolt, why)
+        return
     status, code = _deliver(record, HINT.format(nonce=uuid.uuid4().hex[:8]))
     log.info("inbox hint for %s via %s: %s (%s)", wolt, live, status, code)
+    if status != "unavailable" and (status, code) not in _NOT_PLACED:
+        with lifecycle.agent_lock(root, wolt):
+            facts = store.wake_facts(wolt)
+            if facts:
+                store.set_wake(wolt, {**facts["wake"], "hinted": hinted})
 
 
 def _start(store, registry, wolt: str, facts: dict) -> None:
     """No live session: respect an explicit stop, judge the earlier reservation,
-    then reserve and start one."""
+    then reserve and start one. Returns why nothing was started (the owner is told
+    when their mail waits): launch_unknown, or the inhibition it set just now."""
     wake, reserved = facts["wake"], facts["wake"].get("reserved")
     records = registry.records(wolt=wolt)
     if any(r.get("launching") for r in records):
-        return  # an unresolved launch of this agent, whoever made it, may still start: unknown
+        return "launch_unknown"  # an unresolved launch of this agent, whoever made it, may still start
     if any(r.get("wake_inhibit") for r in records):  # an owner's stop
-        store.set_wake(wolt, {**wake, "inhibited": "stopped"})
-        return
+        return _inhibit(store, wolt, wake, "stopped")
     if reserved:
         record = registry.get(reserved["session"], wolt=wolt, check_alive=False) or {}
         if record.get("status") in ("running", sessions.STOPPING):
-            return  # still settling: kept as it is
+            return None  # still settling: kept as it is
         if facts["acks"] <= reserved.get("acks", 0):
-            store.set_wake(wolt, {**wake, "inhibited": "no_progress"})
-            return
+            return _inhibit(store, wolt, wake, "no_progress")
     name = sessions.session_name(wolt)
     store.set_wake(wolt, {"reserved": {"session": name, "acks": 0, "at": int(time.time())}})
-    try:
-        sessions.start_session(wolt=wolt, prompt=START, name=name, require_auto=True)
+    try:  # the owner's own mail starts the wolt in its own mode, as Telegram did before the inbox
+        sessions.start_session(wolt=wolt, prompt=START, name=name, require_auto=not facts["human"])
     except (PermissionError, ValueError, sessions.HarnessNotInstalled) as exc:
-        store.set_wake(wolt, {"inhibited": "not_startable", "detail": str(exc)[:200]})
+        return _inhibit(store, wolt, {"detail": str(exc)[:200]}, "not_startable")
+    return None
+
+
+def _inhibit(store, wolt: str, wake: dict, reason: str) -> str:
+    store.set_wake(wolt, {**wake, "inhibited": reason})
+    return reason
+
+
+def _notice(root, wolt: str, reason: str) -> None:
+    """Tell the owner their mail cannot wake the wolt; inbox_notice stays silent
+    unless human mail is queued. Never raises."""
+    try:
+        import inbox_notice
+        inbox_notice.owner_notice(root, wolt, reason)
+    except Exception:
+        log.exception("inbox owner notice for %s failed", wolt)
 
 
 def _deliver(record: dict | None, hint: str) -> tuple[str, str]:

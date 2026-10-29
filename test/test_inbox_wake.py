@@ -214,8 +214,8 @@ def wake(lodge, monkeypatch):
     return state
 
 
-def mail(lodge, key="k1", to="pal"):
-    return lodge.store.admit("telegram", key, to, "hello", human=True)
+def mail(lodge, key="k1", to="pal", human=True):
+    return lodge.store.admit("telegram", key, to, "hello", human=human)
 
 
 def wake_state(lodge):
@@ -226,7 +226,7 @@ def test_no_session_reserves_and_starts_one_with_the_fixed_fetch_instruction(lod
     mail(lodge)
     inbox_wake._wake(str(lodge.root), "pal")
     (kw, locked), = wake.starts
-    assert locked and kw["require_auto"] and kw["prompt"] == inbox_wake.START and "hello" not in kw["prompt"]
+    assert locked and kw["prompt"] == inbox_wake.START and "hello" not in kw["prompt"]
     assert wake_state(lodge)["reserved"]["session"] == kw["name"]
     assert rows(lodge.root, "SELECT state FROM inbox_messages") == [("queued",)]  # no claim, no ack
 
@@ -412,3 +412,62 @@ def test_a_failed_resume_paste_keeps_the_prior_runtime_and_raises(lodge, monkeyp
     assert "launching" not in after and after["runtime"] == before["runtime"]
     assert after["status"] == before["status"] == "running" and "stop_reason" not in after
     assert len(lodge.calls.retired) == 2  # the old attempt before the paste, the failed one after
+
+
+# -- a1c8ea5: hints despite an inhibition, once per attempt, human mail, owner notice ---------
+
+@pytest.fixture
+def notices(monkeypatch):
+    told = []
+    monkeypatch.setitem(sys.modules, "inbox_notice", types.SimpleNamespace(
+        owner_notice=lambda root, wolt, reason: told.append((wolt, reason))))
+    return told
+
+
+def test_an_inhibited_wolt_with_a_live_session_still_gets_its_hint(lodge, wake, notices):
+    mail(lodge)
+    lodge.store.set_wake("pal", {"inhibited": "not_startable"})
+    lodge.registry.create("pal-live", wolt="pal")
+    wake.live = "pal-live"
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert [d[0] for d in lodge.calls.delivered] == ["pal-live"] and not wake.starts and not notices
+
+
+def test_once_hints_each_attempt_once_and_retries_while_nothing_was_placed(lodge, wake):
+    mail(lodge)
+    lodge.registry.create("pal-live", wolt="pal")
+    lodge.registry.update("pal-live", attempt="a1")
+    wake.live = "pal-live"
+    results = iter([("pending", "not_ready")] + [("submitted", "ok")] * 3)
+    sys.modules["native_adapters"].deliver = lambda record, hint: (
+        lodge.calls.delivered.append(record["attempt"]) or next(results))
+    for _ in range(3):
+        inbox_wake._wake(str(lodge.root), "pal", once=True)
+    assert lodge.calls.delivered == ["a1", "a1"]  # retried after not_ready, then never again
+    lodge.registry.update("pal-live", attempt="a2")  # a resume: a new attempt
+    inbox_wake._wake(str(lodge.root), "pal", once=True)
+    assert lodge.calls.delivered == ["a1", "a1", "a2"]
+    inbox_wake._wake(str(lodge.root), "pal")  # a new arrival hints regardless
+    assert len(lodge.calls.delivered) == 4
+
+
+@pytest.mark.parametrize("human", [True, False])
+def test_human_mail_starts_the_wolt_in_its_own_mode(lodge, wake, human):
+    mail(lodge, human=human)
+    inbox_wake._wake(str(lodge.root), "pal")
+    (kw, _), = wake.starts
+    assert kw["require_auto"] is (not human)
+
+
+def test_the_owner_is_told_whenever_mail_neither_hints_nor_starts(lodge, wake, notices, monkeypatch):
+    def refuse(**kw):
+        raise PermissionError("prompt mode")
+    monkeypatch.setattr(sessions, "start_session", refuse)
+    mail(lodge)
+    inbox_wake._wake(str(lodge.root), "pal")  # sets not_startable
+    inbox_wake._wake(str(lodge.root), "pal")  # finds it already set
+    lodge.registry.create("pal-x", wolt="pal")
+    lodge.registry.update("pal-x", launching={"attempt": "a9"})
+    lodge.store.set_wake("pal", {})
+    inbox_wake._wake(str(lodge.root), "pal")  # an unresolved launch
+    assert notices == [("pal", "not_startable"), ("pal", "not_startable"), ("pal", "launch_unknown")]

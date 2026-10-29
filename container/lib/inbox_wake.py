@@ -13,14 +13,14 @@ lifecycle lock, never the caller's seq or state:
   inhibited: an inhibition only ever stops a start. submitted, pending, unknown,
   unavailable and failed are transport facts; none changes custody, and none
   is retried here. Mail waits for the agent's own fetch and ack.
-- no live session: the wolt's newest resting session is resumed without a
-  prompt (the post-publication pickup and its backend's ready call hint it);
-  with none, one fresh session, reserved by name first and started with the
-  fixed fetch instruction. Either runs in the wolt's own recorded mode. The owner's explicit stop or
-  archive of any of the agent's sessions, whoever started it, marks that record
-  (wake_inhibit) and inhibits the wake until rearm clears the marks it sees; so does a reserved session that ended without a first ack
-  ("no_progress"). New mail never clears an inhibition. While any launch of
-  the agent is unresolved, whoever made it, nothing starts and rearm refuses.
+- no live session: all mail brings the wolt up (the owner's rule). The wolt's
+  newest resting session is resumed without a prompt (the post-publication pickup
+  and its backend's ready call hint it); with none, one fresh session, reserved
+  by name first and started with the fixed fetch instruction. Either runs in the
+  wolt's own recorded mode. The owner's explicit stop or archive of a session
+  marks that record (wake_inhibit): that conversation is never auto-resumed, and
+  nothing else. While any launch of the agent is unresolved, whoever made it,
+  nothing starts and rearm refuses.
 
 Inbox off: notify_admitted does nothing.
 """
@@ -85,9 +85,9 @@ def reconcile(wolts_dir) -> None:
 
 
 def rearm(wolts_dir, wolt: str) -> dict:
-    """The operator's explicit clear of an inhibited wake. Refused while any of
-    the agent's launches is unresolved; mail and policy are re-checked by the
-    wake it schedules."""
+    """The operator's explicit clear of the wake state, then a wake. Refused while any
+    of the agent's launches is unresolved. An owner's stop mark stays: that
+    conversation is never auto-resumed."""
     with lifecycle.agent_lock(wolts_dir, wolt):
         store = inbox.Store(wolts_dir, inbox.LIMITS)
         facts = store.wake_facts(wolt)
@@ -96,10 +96,6 @@ def rearm(wolts_dir, wolt: str) -> dict:
         registry = sessions.SessionRegistry(wolts_dir)
         for record in registry.records(wolt=wolt):  # any unresolved launch of the agent refuses it
             sessions.refuse_unresolved(record)
-        for stopped in registry.records(wolt=wolt):  # exactly the stops seen now; a later one counts
-            if stopped.get("wake_inhibit"):
-                with registry.edit(stopped["name"], wolt=wolt) as current:
-                    current.pop("wake_inhibit", None)
         store.set_wake(wolt, {})
     _schedule(str(wolts_dir), wolt)
     return {"wolt": wolt, "rearmed": True}
@@ -145,12 +141,9 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         if not facts or not facts["open"] or not facts["queued"]:
             return
         live = sessions.resolve_active_session(wolt, registry)
-        # An inhibition only ever stops a start, never a live session's hint. The owner's own
-        # mail may retry a start that only a policy refused: it starts in the wolt's own mode.
-        inhibited = facts["wake"].get("inhibited")
-        if inhibited == "not_startable" and facts["human"]:
-            inhibited = None
-        why, resume = (None, None) if live else ((inhibited, None) if inhibited else _start(store, registry, wolt, facts))
+        # All mail brings the wolt up (the owner's rule): with no live session it resumes or
+        # starts one; only an unresolved launch holds it (in _start). A live session is hinted.
+        why, resume = (None, None) if live else _start(store, registry, wolt, facts)
         owner = bool(why) and _reserve_notice(store, wolt, why) is not None
         if live:
             record = registry.get(live, wolt=wolt, check_alive=False) or {}
@@ -178,24 +171,21 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
 
 
 def _start(store, registry, wolt: str, facts: dict) -> tuple[str | None, str | None]:
-    """No live session: respect an explicit stop, judge the earlier reservation, then
-    reserve the wolt's newest resting session to resume, or start one, in the wolt's own
-    mode. Returns (why nothing was started, the session to resume after the lock);
-    why is launch_unknown or the inhibition it set just now (the owner is told)."""
+    """No live session: wait for an unresolved launch or a reserved session still
+    settling, then reserve the wolt's newest unmarked resting session to resume, or
+    start one, in the wolt's own mode. Returns (why nothing was started, the session to
+    resume after the lock); why is launch_unknown or not_startable (the owner is told)."""
     wake, reserved = facts["wake"], facts["wake"].get("reserved")
     records = registry.records(wolt=wolt)
     if any(r.get("launching") for r in records):
         return "launch_unknown", None  # an unresolved launch of this agent, whoever made it, may still start
-    if any(r.get("wake_inhibit") for r in records):  # an owner's stop
-        return _inhibit(store, wolt, wake, "stopped"), None
     if reserved:
         record = registry.get(reserved["session"], wolt=wolt, check_alive=False) or {}
         if record.get("status") in ("running", sessions.STOPPING):
             return None, None  # still settling: kept as it is
-        if facts["acks"] <= reserved.get("acks", 0):
-            return _inhibit(store, wolt, wake, "no_progress"), None
     keep = {"noticed": wake["noticed"]} if "noticed" in wake else {}  # the owner was told about this mail
-    resting = [r for r in records if r.get("status") == "resting" and sessions.stored_resume_id(r)]
+    resting = [r for r in records if r.get("status") == "resting" and sessions.stored_resume_id(r)
+               and not r.get("wake_inhibit")]  # a conversation the owner stopped is never auto-resumed
     if resting:  # its own conversation, in its own mode: resumed after the lock, without a prompt
         name = max(resting, key=lambda r: r.get("last_activity") or 0)["name"]
         store.set_wake(wolt, {**keep, "reserved": {"session": name, "acks": 0, "at": int(time.time())}})

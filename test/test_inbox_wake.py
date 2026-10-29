@@ -999,3 +999,16 @@ def test_a_preferred_session_that_ends_with_its_message_queued_hands_it_on(lodge
     inbox_wake._wake(str(lodge.root), "pal", once=True)
     assert [d[0] for d in lodge.calls.delivered] == ["pal-s1", "pal-s2"]
     assert len(notices.lines) == 1  # the message's one line was already sent
+
+
+@pytest.mark.parametrize("named", ["pal-s1", "nunu-s9"])  # its own session, or another wolt's: ignored
+def test_an_enrolled_send_naming_a_session_nudges_only_that_one(lodge, wake, notices, monkeypatch, named):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    wolt(lodge.root, "nunu")
+    for name, owner in (("pal-s1", "pal"), ("pal-s2", "pal"), ("nunu-s9", "nunu")):
+        lodge.registry.create(name, wolt=owner)
+    wake.live = "pal-s2"  # the newest live session
+    lodge.store.send(lodge.store.grant("nunu-s9", "nunu"), "pal", "k1", "hello", session=named)
+    inbox_wake._wake(str(lodge.root), "pal")
+    inbox_wake._wake(str(lodge.root), "pal", once=True)
+    assert [d[0] for d in lodge.calls.delivered] == (["pal-s1"] if named == "pal-s1" else ["pal-s2"])

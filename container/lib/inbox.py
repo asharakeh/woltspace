@@ -305,14 +305,17 @@ class Store:
 
     # -- the reader's -----------------------------------------------------------
 
-    def send(self, token: str, to: str, key: str, body: str) -> Status:
-        """Mail from the reader's own wolt, always at agent priority."""
+    def send(self, token: str, to: str, key: str, body: str, session: str | None = None) -> Status:
+        """Mail from the reader's own wolt, always at agent priority. session: the one the
+        sender named, only the wake's first choice (inbox_wake checks it is to's)."""
         reader = _hash(token)
+        if session is not None:
+            _text(session, self.limits.name_chars, "session")
 
         def sender(conn):
             mailbox, wolt = self._reader(conn, reader)
             return f"mailbox:{mailbox}", wolt
-        return self._admit(sender, key, to, body, AGENT)
+        return self._admit(sender, key, to, body, AGENT, route={"session": session})
 
     def admit(self, sender: str, key: str, to: str, body: str, *, human: bool = False,
               mailbox: int | None = None, route: dict | None = None) -> Status:

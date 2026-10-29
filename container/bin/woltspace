@@ -271,7 +271,8 @@ def cmd_session_send(args):
         header = f"[message from {from_wolt}" + (f", session={from_session}" if from_session else "") + "]"
         reply = f"\n{session_send_reply_instruction(from_session)}" if from_session else ""
         key = f"iwcl-{uuid.uuid4().hex}"
-        body = {"to": wolt, "key": key, "text": f"{header}\n{message}{reply}"}
+        body = {"to": wolt, "key": key, "text": f"{header}\n{message}{reply}",
+                **({"session": target} if wolt != target else {})}  # only the wake's first choice
         # The outcome can be unknown (no answer, a lost commit reply): the key
         # tells, never a resend under a fresh one.
         check = f"; check key {key} with `woltspace inbox status --key {key}` before sending again"

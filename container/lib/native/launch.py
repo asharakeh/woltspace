@@ -153,7 +153,7 @@ def _watch_codex(conn, thread, directory, attempt, on_known):
                               "params": {"clientInfo": {"name": "woltspace-native", "version": "1"}}}))
         conn.send(json.dumps({"method": "initialized"}))
         conn.send(json.dumps({"id": 2, "method": "thread/read", "params": {"threadId": thread}}))
-        active = False
+        first, active = True, False
         for raw in conn:
             message = json.loads(raw)
             if message.get("id") == 2:
@@ -162,15 +162,17 @@ def _watch_codex(conn, thread, directory, attempt, on_known):
                 status = message["params"].get("status") or {}
             else:
                 continue
+            if status.get("type") not in ("active", "idle"):
+                continue  # an error or an unknown status leaves it unknown
             now = status.get("type") == "active"
             if not write_state(directory, now, os.getpid()):
                 return  # retired
             if on_known:
                 on_known()
                 on_known = None
-            if active and not now:
+            elif (first or active) and not now:  # a turn ended, possibly while the watch was down
                 announce_ready(attempt, "turn_end")
-            active = now
+            first, active = False, now
 
 
 def _opencode_api(plan: dict, method: str, path: str, body=None):

@@ -520,3 +520,35 @@ def test_the_codex_watcher_follows_its_own_thread_and_announces_each_turn_end(lo
     assert states == ["busy", "idle", "busy", "idle"]  # the helper thread's idle changes nothing
     assert [body.get("kind") for _, _, body in stand_in.seen] == ["turn_end", "turn_end"]  # one per active -> idle
     assert na.engine_state(directory) == "unknown"  # a lost watch is not idle
+
+
+@pytest.mark.parametrize("reply, announced, after", [
+    ({"result": {"thread": {"id": "t1", "status": {"type": "idle"}}}}, ["turn_end"], "idle"),  # missed while down
+    ({"error": {"code": -1, "message": "no"}}, [], "unknown"),
+    ({"result": {"thread": {"id": "t1"}}}, [], "unknown"),
+])
+def test_a_rewatch_wakes_once_on_a_known_idle_and_never_takes_a_bad_status_for_idle(lodge, monkeypatch, reply, announced,
+                                                                                     after):
+    from websockets.sync.server import unix_serve
+    wolts, _ = lodge
+    directory = Path(na.prepare(wolts, "pal-x", "codex", "a1")["addr"])
+    stand_in, seen = Lodge(), []
+    for key, value in stand_in.env.items():
+        monkeypatch.setenv(key, value)
+
+    def app_server(conn):
+        for raw in conn:
+            if json.loads(raw).get("id") == 2:
+                conn.send(json.dumps({"id": 2, **reply}))
+                time.sleep(0.3)
+                seen.append(na.engine_state(directory))
+                return
+    with unix_serve(app_server, str(directory / "app.sock")) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            launch.watch_codex(str(directory / "app.sock"), "t1", directory, "a1")  # a reconnect: no on_known
+        finally:
+            server.shutdown()
+            stand_in.server.shutdown()
+    assert seen == [after]
+    assert [body.get("kind") for _, _, body in stand_in.seen] == announced

@@ -176,8 +176,7 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
                 # A hint this attempt has not drained (fetched to nothing) covers new mail: an
                 # engine that queues input (codex) would get them all after the mail is gone.
                 left = HINT_OPEN - (time.time() - last.get("at", 0))
-                covered = same and left > 0 and not (drained.get("session") == live
-                                                     and drained.get("at", 0) >= last.get("at", 0))
+                covered = same and left > 0 and drained.get(live, 0) < last.get("at", 0)
     if taken or not facts or not facts["open"] or not facts["queued"]:
         if taken:
             _answer(root, wolt)

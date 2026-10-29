@@ -1091,3 +1091,17 @@ def test_a_new_attempt_is_hinted_whatever_the_last_one_left_open(lodge, busy):
     lodge.registry.update("pal-s1", attempt="pal-s1-a2")  # resumed
     admit(lodge, "k2")
     assert len(lodge.calls.delivered) == 2
+
+
+def test_a_drain_during_the_first_hints_delivery_spends_it(lodge, busy):
+    def deliver_then_drained(record_, hint):  # the agent drains before the hint is recorded
+        lodge.calls.delivered.append(record_["name"])
+        take(lodge, busy.token)
+        assert lodge.store.fetch(busy.token) is None
+        return "submitted", "ok"
+    sys.modules["native_adapters"].deliver = deliver_then_drained
+    mail(lodge, "k1")
+    inbox_wake._wake(str(lodge.root), "pal")
+    sys.modules["native_adapters"].deliver = lambda record_, hint: lodge.calls.delivered.append(1) or ("submitted", "ok")
+    admit(lodge, "k2")
+    assert len(lodge.calls.delivered) == 2

@@ -453,13 +453,14 @@ class Store:
     @staticmethod
     def _drained(conn, mailbox: int, reader: bytes) -> None:
         """A reader found nothing left: its session has taken all the mail a hint was for, so
-        the waker may hint it again (inbox_wake: a hint covers new mail until then)."""
+        the waker may hint it again (inbox_wake: a hint covers new mail until then). Kept per
+        session, the newest few, whether or not a hint is recorded yet: one may be on its way."""
         session = conn.execute("SELECT session FROM inbox_readers WHERE hash=?", (reader,)).fetchone()[0]
         wake = json.loads(conn.execute("SELECT wake FROM inbox_mailboxes WHERE id=?", (mailbox,)).fetchone()[0]
                           or "{}")
-        if (wake.get("hinted") or {}).get("session") == session:
-            wake["drained"] = {"session": session, "at": time.time()}
-            conn.execute("UPDATE inbox_mailboxes SET wake=? WHERE id=?", (json.dumps(wake), mailbox))
+        drained = {**wake.get("drained", {}), session: time.time()}
+        wake["drained"] = dict(sorted(drained.items(), key=lambda item: item[1])[-8:])
+        conn.execute("UPDATE inbox_mailboxes SET wake=? WHERE id=?", (json.dumps(wake), mailbox))
 
     @staticmethod
     def _note(conn, mailbox: int, seq: int, priority: int, route: dict, now: float) -> None:

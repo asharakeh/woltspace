@@ -942,18 +942,18 @@ async def _terminal_mail(request: Request, wolt: str, session: str = ""):
         reply = f"\n{session_send_reply_instruction(from_session, delimiter)}" if from_session else ""
     except ValueError:
         reply = ""
+    from sessions import SessionRegistry
+    record = SessionRegistry(WOLTS_DIR).get(session, check_alive=False) if session else None
+    route = {"session": session if record and record.get("wolt") == wolt
+             and record.get("status") not in ("stopped", "archived") else None, "chat": None}
     store = inbox.Store(WOLTS_DIR, inbox.LIMITS)
     try:
-        status = await run_in_threadpool(store.admit, "terminal", key, wolt, f"{header}\n{text}{reply}")
+        status = await run_in_threadpool(store.admit, "terminal", key, wolt, f"{header}\n{text}{reply}", route=route)
     except inbox.InboxError as exc:
         return JSONResponse({"ok": False, "status": "not_queued", "error": exc.code, "wolt": wolt, "key": key},
                             status_code=inbox_routes._HTTP.get(exc.code, 409))
-    from sessions import SessionRegistry
-    record = SessionRegistry(WOLTS_DIR).get(session, check_alive=False) if session else None
-    prefer = ({"session": session, "chat": None} if record and record.get("wolt") == wolt
-              and record.get("status") not in ("stopped", "archived") else None)
     import inbox_wake
-    await run_in_threadpool(inbox_wake.notify_admitted, WOLTS_DIR, status, prefer)
+    await run_in_threadpool(inbox_wake.notify_admitted, WOLTS_DIR, status)
     answer = {"wolt": wolt, "key": key, "seq": status.seq}
     for _ in range(int(OUTCOME_WAIT / OUTCOME_POLL)):
         facts = await run_in_threadpool(store.wake_facts, wolt)

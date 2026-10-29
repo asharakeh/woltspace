@@ -1,9 +1,10 @@
 """
 The inbox's waker: once mail has committed, see that the agent will look at it.
 
-notify_admitted(wolts_dir, status, prefer) is the one post-commit port, for Telegram and
-for the inbox's own send; prefer names the session the sender is talking to (tried
-first) and the chat that hears how its mail was answered. It never blocks, raises, claims or acknowledges: it
+notify_admitted(wolts_dir, status) is the one post-commit port, for Telegram and
+for the inbox's own send. Admission itself records, in the same write, the session
+the sender is talking to (tried first) and the chat that hears how a human message
+was answered (Store.admit's route). It never blocks, raises, claims or acknowledges: it
 schedules one coalesced wake per agent on a background thread, so a burst is
 one wake. A wake re-reads the agent's real mailbox and sessions under its
 lifecycle lock, never the caller's seq or state:
@@ -54,44 +55,13 @@ _GUARD = threading.Lock()
 _PENDING: dict[tuple[str, str], bool] = {}  # (root, wolt) -> another wake was asked for meanwhile
 
 
-def notify_admitted(wolts_dir, status, prefer: dict | None = None) -> None:
-    """Called after Store admission committed. Never raises. prefer: {"session", "chat"}, the
-    session the sender is talking to (tried first; the newest admission's wins) and the chat
-    this message's answer goes to."""
+def notify_admitted(wolts_dir, status) -> None:
+    """Called after Store admission committed. Never raises."""
     try:
         if status.state != "acknowledged" and inbox.enabled(wolts_dir):
-            _admitted(str(wolts_dir), status, prefer or {})
             _schedule(str(wolts_dir), status.to)
     except Exception:
         log.exception("inbox wake not scheduled")
-
-
-def _admitted(root: str, status, prefer: dict) -> None:
-    """The wake state learns of an admission: the preferred session; for human mail its route,
-    the chat it came from or None, the default (a human message is answered only once its
-    route is recorded, so a wake in between never sends it elsewhere); and, on a mailbox's
-    first admission since accounting began, the answered baseline (just below this message
-    and any still queued: older mail is never answered again)."""
-    try:
-        store = inbox.Store(root, inbox.LIMITS)
-        human = status.priority == inbox.HUMAN
-        facts = store.wake_facts(status.to)
-        if not facts or (not prefer and not human and "answered" in facts["wake"]):
-            return
-        with lifecycle.agent_lock(root, status.to):
-            facts = store.wake_facts(status.to)
-            if not facts:
-                return
-            wake = dict(facts["wake"])
-            if "answered" not in wake:  # unanswered is the queued mail here
-                wake["answered"] = min([status.seq] + [m["seq"] for m in facts["unanswered"]]) - 1
-            if prefer.get("session"):
-                wake["prefer"] = {"session": prefer["session"], "at": int(time.time())}
-            if human and status.seq > wake["answered"]:
-                wake["chats"] = {**wake.get("chats", {}), str(status.seq): prefer.get("chat")}
-            store.set_wake(status.to, wake)
-    except Exception:  # the wake still runs, on the usual rule and the default channel
-        log.exception("inbox admission of %s not recorded for its wake", status.seq)
 
 
 def ready(wolts_dir, token: str, session: str, attempt: str) -> bool:
@@ -117,17 +87,9 @@ def schedule_pickup(wolts_dir, wolt: str) -> None:
 
 
 def reconcile(wolts_dir) -> None:
-    """At boot: mail admitted just before a crash never got its wake, nor its route: the
-    owner's line goes to the default channel."""
+    """At boot: mail admitted just before a crash never got its wake."""
     if inbox.enabled(wolts_dir):
-        store = inbox.Store(wolts_dir, inbox.LIMITS)
-        for wolt in store.queued_wolts():
-            with lifecycle.agent_lock(wolts_dir, wolt):
-                facts = store.wake_facts(wolt)
-                if facts:
-                    chats = facts["wake"].get("chats", {})
-                    store.set_wake(wolt, {**facts["wake"], "chats": {
-                        **{str(m["seq"]): None for m in facts["unanswered"] if m["human"]}, **chats}})
+        for wolt in inbox.Store(wolts_dir, inbox.LIMITS).queued_wolts():
             _schedule(str(wolts_dir), wolt)
 
 
@@ -190,7 +152,9 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         if not facts or not facts["open"] or not facts["queued"]:
             taken = bool(facts and facts["unanswered"])  # a reader took them before any wake did
         else:
-            taken, prefer = False, (facts["wake"].get("prefer") or {}).get("session")
+            taken, prefer = False, facts["wake"].get("prefer") or {}
+            # current while its message is not answered yet
+            prefer = prefer.get("session") if prefer.get("seq", 0) > facts["wake"].get("answered", -1) else None
             # the session the sender is talking to first, live or resumable; else the newest live one
             live = _live(registry, wolt, prefer)
             if not live and not _resumable(registry.get(prefer, wolt=wolt, check_alive=False) if prefer else None):
@@ -289,19 +253,18 @@ def _judge_failed_resume(root, registry, wolt: str, name: str) -> None:
 
 
 def _kept(wake: dict) -> dict:
-    """What a reset of the wake state keeps: the answered mail, its outcomes, the preference
-    and the chats of the mail not answered yet."""
-    return {k: wake[k] for k in ("answered", "outcomes", "prefer", "chats") if k in wake}
+    """What a reset of the wake state keeps: the answered mail and its outcomes (Store.set_wake
+    keeps what admission recorded)."""
+    return {k: wake[k] for k in ("answered", "outcomes") if k in wake}
 
 
-def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=None, hinted=None,
-            routed=True) -> None:
+def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=None, hinted=None) -> None:
     """Every message no wake answered yet is answered now (one a reader already took: "hinted"
     to that reader's session) and recorded in the wake state's outcomes, under the lock; then
     the owner gets exactly one line per human message (inbox_notice.outcome), never retried,
     each on the chat it came from. how None: only those a reader
-    already took. hinted: also record the hint this attempt had. routed: a human message waits
-    for its route (its admission's); a failed wake answers without one. Never raises."""
+    already took. A human message waits until its admission's route is recorded. hinted: also
+    record the hint this attempt had. Never raises."""
     try:
         store = inbox.Store(root, inbox.LIMITS)
         with lifecycle.agent_lock(root, wolt):
@@ -311,12 +274,10 @@ def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=Non
             wake = {**facts["wake"], **({"hinted": hinted} if hinted else {})}
             chats = dict(wake.get("chats", {}))
             mail = list(itertools.takewhile(lambda m: (how or m["session"]) and (
-                not routed or not m["human"] or str(m["seq"]) in chats), facts["unanswered"]))
+                not m["human"] or str(m["seq"]) in chats), facts["unanswered"]))
             done = [("hinted", m["session"], None) if m["session"] else (how, session, reason) for m in mail]
             if mail:
                 wake["answered"] = mail[-1]["seq"]
-                wake.pop("prefer", None)
-                wake["chats"] = {k: v for k, v in chats.items() if int(k) > mail[-1]["seq"]}
                 wake["outcomes"] = (wake.get("outcomes", []) + [  # the last OUTCOMES, for a sender who waits
                     {"seq": m["seq"], "how": h, **({"session": s} if s else {"reason": r})}
                     for m, (h, s, r) in zip(mail, done)])[-OUTCOMES:]
@@ -335,7 +296,7 @@ def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=Non
 def _failed(root, wolt: str, reason: str) -> None:
     """A wake that ended in an exception still answers: the senders and the owner are told."""
     _notice(root, wolt, reason)
-    _answer(root, wolt, "error", reason=reason, routed=False)
+    _answer(root, wolt, "error", reason=reason)
 
 
 def _inhibit(store, wolt: str, wake: dict, reason: str) -> str:

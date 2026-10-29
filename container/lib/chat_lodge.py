@@ -72,10 +72,10 @@ REPLY_FOOTER_MARKER = "↩️ reply to this message to talk to this session dire
 _MEDIA_LABEL = {"image": "image received", "video": "video received", "file": "file received"}
 
 
-def notify_admitted(wolts_dir, status, prefer=None) -> None:
+def notify_admitted(wolts_dir, status) -> None:
     """The wake for a wolt with new mail (inbox_wake, the runtime's): quick, never raises."""
     import inbox_wake
-    inbox_wake.notify_admitted(wolts_dir, status, prefer)
+    inbox_wake.notify_admitted(wolts_dir, status)
 
 
 def wolts_dir() -> Path:
@@ -501,8 +501,11 @@ class ChatLodge:
                 raise inbox.Invalid("delimiter")
             reply = notify_reply_instruction(*self.spec.reply_args(self.route_of(chat)), delimiter=delimiter)
             body = f"{self._session_message(text, chat)}\n{reply}"
+            # the session they meant (the wake's first choice) and this chat, recorded with the message
+            route = {"session": session if session and messages.wolt_from_session_name(session) == wolt else None,
+                     "chat": {"adapter": self.name, "chat": chat}}
             status = await asyncio.to_thread(
-                store.admit, f"connector:{self.name}", key, wolt, body, human=True)
+                store.admit, f"connector:{self.name}", key, wolt, body, human=True, route=route)
         except inbox.InboxError as e:
             code = getattr(e, "code", "invalid")
             _bot_log(f"{self.name}_inbox_refused", {"wolt": wolt, "key": key, "code": code})
@@ -517,10 +520,8 @@ class ChatLodge:
             state.pop("active_session", None)
         state["active_wolt"] = wolt
         self._save_chat_state(chat, state)
-        prefer = {"session": session if session and messages.wolt_from_session_name(session) == wolt else None,
-                  "chat": {"adapter": self.name, "chat": chat}}
         try:
-            await asyncio.to_thread(notify_admitted, self.wolts_dir, status, prefer)
+            await asyncio.to_thread(notify_admitted, self.wolts_dir, status)
         except Exception as e:
             # The mail is in custody either way; a lost wake leaves it pending.
             logger.error(f"{self.name}: wake for {wolt} failed: {type(e).__name__}")

@@ -43,10 +43,9 @@ def lodge(tmp_path, monkeypatch):
     side = chat_lodge.ChatLodge(connector_registry.spec("telegram"), [OWNER])
     calls = {"pasted": [], "spawned": [], "woken": []}
 
-    def notify_admitted(root, status, prefer=None):
+    def notify_admitted(root, status):
         # What a reader would see at wake time: the row must already be committed.
         calls["woken"].append((status, rows(root, "SELECT state FROM inbox_messages WHERE key=?", status.key)))
-        calls.setdefault("prefer", []).append(prefer)
 
     for name, value in [
         ("message_session", lambda name, text: calls["pasted"].append((name, text)) or {"ok": True, "url": ""}),
@@ -167,7 +166,9 @@ def test_the_session_the_owner_meant_is_the_wake_s_first_choice_and_the_chat_kee
                     "https://lodge.invalid/tui?session=pal-other-marsh-abc123")
     handle(lodge, event_id="e2", body={"text": "yes", "reply_to": {"from_bot": True, "text": notification}})
     chat = {"adapter": "telegram", "chat": CHAT}
-    assert lodge.calls["prefer"] == [{"session": LIVE, "chat": chat},
-                                     {"session": "pal-other-marsh-abc123", "chat": chat}]
+    (first, _), (second, _) = lodge.calls["woken"]
+    wake = inbox.Store(lodge.root, inbox.LIMITS).wake_facts("pal")["wake"]  # recorded with each message
+    assert wake["prefer"]["session"] == "pal-other-marsh-abc123" and wake["prefer"]["seq"] == second.seq
+    assert wake["chats"] == {str(first.seq): chat, str(second.seq): chat}
     assert lodge._load_chat_state(CHAT) == {"active_wolt": "pal", "active_session": LIVE}  # same wolt: kept
 

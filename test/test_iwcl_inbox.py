@@ -125,9 +125,9 @@ def terminal(tmp_path, monkeypatch):
     session(tmp_path, "pal-c-d-e5f6a7", "pal", status="stopped")
     seen = {"prefer": [], "outcome": {"how": "hinted", "session": "pal-a-b-a1b2c3"}}
 
-    def wake(root, status, prefer=None):
-        seen["prefer"].append(prefer)
+    def wake(root, status):
         store = inbox.Store(root, limits())
+        seen["prefer"].append((store.wake_facts(status.to)["wake"].get("prefer") or {}).get("session"))
         ring = ((store.wake_facts(status.to) or {}).get("wake") or {}).get("outcomes", [])
         if seen["outcome"]:
             store.set_wake(status.to, {"outcomes": ring + [{"seq": status.seq, **seen["outcome"]}]})
@@ -141,7 +141,7 @@ def terminal_mail(root):
                       " JOIN inbox_mailboxes b ON b.id = m.mailbox ORDER BY m.seq")
 
 
-@pytest.mark.parametrize("path, prefer", [("/sessions/pal-a-b-a1b2c3/message", {"session": "pal-a-b-a1b2c3", "chat": None}),
+@pytest.mark.parametrize("path, prefer", [("/sessions/pal-a-b-a1b2c3/message", "pal-a-b-a1b2c3"),
                                           ("/sessions/pal-c-d-e5f6a7/message", None),  # stopped: never the choice
                                           ("/wolts/pal/message", None)])
 def test_a_tokenless_send_is_terminal_mail_answered_with_its_own_outcome(terminal, path, prefer):

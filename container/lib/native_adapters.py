@@ -1,0 +1,210 @@
+"""Native inbox hints: one private directory per launch attempt, and bounded delivery.
+
+A session's launch prepares an immutable locator {kind, addr, attempt} before
+the engine starts. `addr` is a fresh owner-only directory; the engine side (a
+hook, an extension or the wrapper's supervisor) later writes ready.json there
+once it knows the engine's own identity. The registry never holds secrets or
+readiness: it holds the locator, published by the lifecycle owner.
+
+deliver() answers from the registry first, then from the attempt's ready
+file, and only then talks to the engine. Every answer is a transport fact
+(submitted / pending / unavailable / failed / unknown): none of them ACKs or
+erases mail, and unknown is not a retry signal.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+KINDS = {
+    "claude": "claude-rewake",
+    "codex": "codex-app-server",
+    "opencode": "opencode-http",
+    "pi": "pi-extension",
+    "hermes": "hermes-gateway",
+}
+ASSETS = Path(__file__).resolve().parent / "native"
+READY, HINT, RETIRED, LISTENER = "ready.json", "hint", "retired", "listener.json"
+BUDGET = 3.0          # deliver() never takes longer than this
+CLAIM_WAIT = 1.0      # how long a file hint waits to be taken before it counts as pending
+HOOK_TIMEOUT = 86400  # Claude's asyncRewake listener lifetime, in seconds
+_SOCKET_MAX = 100     # AF_UNIX paths stop at 107 bytes on Linux, 103 on macOS
+
+
+def capability(harness: str | None) -> str:
+    """'native' when this harness has a native hint path, else 'none'."""
+    return "native" if harness in KINDS else "none"
+
+
+def attempt_dir(wolts_dir: str | Path, session: str, attempt: str) -> Path:
+    """Short and unique per (session, attempt): codex puts a unix socket in it."""
+    digest = hashlib.sha256(f"{session}\0{attempt}".encode()).hexdigest()[:20]
+    return Path(wolts_dir) / ".space" / "native" / digest
+
+
+def prepare(wolts_dir: str | Path, session: str, harness: str | None, attempt: str) -> dict | None:
+    """Create this attempt's private directory and return its locator (None: no native path).
+
+    Called once per launch attempt, before exec. Never reuses a directory: a
+    new attempt is a new locator, so a stale child can only write its old one.
+    """
+    kind = KINDS.get(harness or "")
+    if not kind or not attempt:
+        return None
+    directory = attempt_dir(wolts_dir, session, attempt)
+    if harness == "codex" and len(str(directory / "app.sock")) > _SOCKET_MAX:
+        return None
+    directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.mkdir(mode=0o700)
+    if harness == "claude":
+        hook = {"type": "command", "asyncRewake": True, "timeout": HOOK_TIMEOUT,
+                "command": shlex.join([sys.executable, str(ASSETS / "claude_rewake.py"), str(directory), attempt])}
+        _write_private(directory / "settings.json",
+                       {"hooks": {event: [{"hooks": [hook]}] for event in ("SessionStart", "Stop")}})
+    return {"kind": kind, "addr": str(directory), "attempt": attempt}
+
+
+def launch_env(native: dict | None) -> dict:
+    """The variables a launch carries so its wrapper and helpers find their attempt."""
+    if not native:
+        return {}
+    return {"WOLTSPACE_NATIVE_DIR": native["addr"], "WOLTSPACE_NATIVE_ATTEMPT": native["attempt"],
+            "WOLTSPACE_NATIVE_KIND": native["kind"]}
+
+
+def write_ready(directory: str | Path, data: dict) -> bool:
+    """Atomically publish an attempt's ready data (owner-only). Refused once retired."""
+    directory = Path(directory)
+    if (directory / RETIRED).exists():
+        return False
+    _write_private(directory / READY, data)
+    return True
+
+
+def retire(native: dict | None) -> None:
+    """Invalidate an attempt before its helpers are torn down; later ready writes are refused."""
+    if not native:
+        return
+    directory = Path(native["addr"])
+    try:
+        (directory / RETIRED).touch(mode=0o600)
+        (directory / READY).unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
+
+
+def state(record: dict) -> tuple[str, str, dict | None]:
+    """(ready | pending | unavailable, code, ready data) from registry facts, then the ready file."""
+    native = record.get("native")
+    if not isinstance(native, dict) or native.get("kind") not in KINDS.values():
+        return "unavailable", "no_native", None
+    if record.get("launching"):  # an unresolved or in-progress launch: never routed to yet
+        return "pending", "launching", None
+    if record.get("status") != "running":
+        return "unavailable", "not_running", None
+    if not native.get("attempt") or native.get("attempt") != record.get("attempt"):
+        return "unavailable", "stale_attempt", None
+    directory = Path(native.get("addr", ""))
+    if (directory / RETIRED).exists() or not directory.is_dir():
+        return "unavailable", "retired", None
+    try:
+        ready = json.loads((directory / READY).read_text())
+    except FileNotFoundError:
+        return "pending", "not_ready", None
+    except (OSError, ValueError):
+        return "unavailable", "bad_ready", None
+    if not isinstance(ready, dict) or ready.get("attempt") != native["attempt"] or ready.get("kind") != native["kind"]:
+        return "unavailable", "stale_ready", None
+    known = record.get("harness_session_id")
+    if known and ready.get("session_id") and ready["session_id"] != known:
+        return "unavailable", "other_conversation", None
+    if native["kind"] == KINDS["claude"] and time.time() > ready.get("armed_at", 0) + HOOK_TIMEOUT:
+        return "pending", "listener_expired", ready
+    return "ready", "ready", ready
+
+
+def deliver(record: dict, hint: str) -> tuple[str, str]:
+    """Hand one fixed, body-free hint to a live session's own engine, within BUDGET seconds.
+
+    Returns (submitted | pending | unavailable | failed | unknown, code). Never
+    raises, never ACKs, never pastes and never starts anything.
+    """
+    deadline = time.monotonic() + BUDGET
+    try:
+        status, code, ready = state(record)
+        if status == "unavailable" or ready is None:
+            return status, code
+        native = record["native"]
+        if native["kind"] == KINDS["codex"]:
+            return _codex(ready, hint, deadline)
+        if native["kind"] == KINDS["opencode"]:
+            return _opencode(ready, hint, deadline)
+        return _drop(Path(native["addr"]), hint, deadline)
+    except Exception as exc:  # a transport fact, never an exception for the wake thread
+        return "failed", type(exc).__name__
+
+
+def _drop(directory: Path, hint: str, deadline: float) -> tuple[str, str]:
+    """File hint: one atomic file the engine side claims by renaming it away. Repeats overwrite it."""
+    tmp = directory / f"{HINT}.{os.getpid()}.tmp"
+    _write_private(tmp, hint, raw=True)
+    os.replace(tmp, directory / HINT)
+    until = min(deadline, time.monotonic() + CLAIM_WAIT)
+    while time.monotonic() < until:
+        if not (directory / HINT).exists():
+            return "submitted", "claimed"
+        time.sleep(0.05)
+    return "pending", "placed"
+
+
+def _codex(ready: dict, hint: str, deadline: float) -> tuple[str, str]:
+    """codex queue against the session's own app-server, never the shared daemon."""
+    try:
+        done = subprocess.run(
+            ["codex", "queue", "--remote", f"unix://{ready['sock']}", "--thread", ready["thread"],
+             "--message", hint],
+            capture_output=True, timeout=max(0.1, deadline - time.monotonic()),
+        )
+    except subprocess.TimeoutExpired:
+        return "unknown", "timeout"
+    return ("submitted", "queued") if done.returncode == 0 else ("failed", f"rc{done.returncode}")
+
+
+def _opencode(ready: dict, hint: str, deadline: float) -> tuple[str, str]:
+    """OpenCode's prompt API on the session's own password-protected loopback server."""
+    auth = base64.b64encode(f"opencode:{ready['password']}".encode()).decode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{int(ready['port'])}/session/{ready['session_id']}/prompt_async",
+        data=json.dumps({"parts": [{"type": "text", "text": hint}]}).encode(), method="POST",
+        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=max(0.1, deadline - time.monotonic())) as answer:
+            return "submitted", f"http{answer.status}"
+    except urllib.error.HTTPError as exc:
+        return "failed", f"http{exc.code}"
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            return "unknown", "timeout"
+        return "failed", "unreachable"
+    except TimeoutError:
+        return "unknown", "timeout"
+
+
+def _write_private(path: Path, data, raw: bool = False) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(data if raw else json.dumps(data))
+    os.replace(tmp, path)

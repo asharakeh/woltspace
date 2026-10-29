@@ -111,9 +111,11 @@ from apps import (
     unshare_app,
 )
 from sites import ensure_site, site_dir
+import inbox
 import wolfcore
 import wolt_archive
 from site_shell import inject_shell, load_site_config, memory_payload, shell_manifest, shell_tags, shell_wanted
+from .inbox_routes import router as inbox_router
 from .state import (
     bot_log,
     get_current_meta,
@@ -245,6 +247,11 @@ async def lifespan(app: FastAPI):
     _start_file_watcher()
     _start_tool_gc()
     tunnel_mgr.start_tunnel()
+    try:  # mail admitted just before a crash still gets its wake
+        import inbox_wake
+        await asyncio.to_thread(inbox_wake.reconcile, WOLTS_DIR)
+    except Exception as exc:
+        print(f"[inbox] wake reconcile failed: {type(exc).__name__}: {exc}")
     try:
         import connector_host
         await connector_host.start(WOLTS_DIR)
@@ -268,6 +275,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
+app.include_router(inbox_router)  # off unless woltspace.json enables the inbox
 
 
 @app.get("/health")
@@ -899,6 +907,13 @@ async def memory_read(request: Request):
 
 # --- Session messaging ---
 
+# With the lodge inbox on, messages are mail (`woltspace session send` with the
+# session's inbox reader), never pasted into a live session.
+def _inbox_on():
+    return JSONResponse({"ok": False, "status": "inbox", "error":
+                         "inbox is on; this session has no inbox token (start a new session)"}, status_code=409)
+
+
 async def _deliver_or_resume(safe: str, text: str, body: dict):
     result = await asyncio.to_thread(
         deliver_message,
@@ -1052,6 +1067,8 @@ async def release_hold(session_id: str):
 @app.post("/sessions/{session_id}/message")
 async def session_message(session_id: str, request: Request):
     """Deliver to a running session, or resume a resting one on contact."""
+    if inbox.enabled(WOLTS_DIR):
+        return _inbox_on()
     safe = sanitize_session(session_id)
     body = await request.json()
     text = body.get("text")
@@ -1141,6 +1158,8 @@ async def wolt_message(name: str, request: Request):
     Same body as /sessions/{id}/message. 404 if the wolt has no live session.
     This is the ergonomic entry point: senders address `codexw`, not a slug.
     """
+    if inbox.enabled(WOLTS_DIR):
+        return _inbox_on()
     safe_wolt = "".join(c for c in name if c.isalnum() or c in "-_")
     from sessions import SessionRegistry
     registry = SessionRegistry(WOLTS_DIR)
@@ -3057,6 +3076,15 @@ async def connectors_page(request: Request):
     """Show lodge address and messaging connector health."""
     return templates.TemplateResponse(request, "connectors.html", context={
         "active_nav": "connectors",
+        "cache_bust": int(time.time()),
+    })
+
+
+@app.get("/inbox")
+async def inbox_page(request: Request):
+    """Each agent's mailbox by counts, read from /inbox/summary; never message text."""
+    return templates.TemplateResponse(request, "inbox.html", context={
+        "active_nav": "inbox",
         "cache_bust": int(time.time()),
     })
 

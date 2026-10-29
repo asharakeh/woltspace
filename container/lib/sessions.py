@@ -29,6 +29,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+import lifecycle
 import lodge_db
 from env_compat import get_env
 from paths import (
@@ -94,7 +95,7 @@ LIVENESS_FIELDS = frozenset({"alive", "tmux_alive", "agent_alive"})
 # A session whose tmux is being stopped outside any write (stop_and_settle).
 STOPPING = "stopping"
 # What decides whether a session may be stopped: a claim compares these only.
-_CLAIM_FIELDS = ("status", "last_activity", "hold", "harness_session_id")
+_CLAIM_FIELDS = ("status", "last_activity", "hold", "harness_session_id", "launching")
 # How long a message waits for a stop in progress before it goes on.
 STOPPING_WAIT = 30
 
@@ -763,7 +764,8 @@ class SessionRegistry:
         orphaned = []
         with self._tx() as conn:
             for data in self._rows(conn):
-                if data.get("status") == "running" and data.get("name") not in live_sessions:
+                if (data.get("status") == "running" and data.get("name") not in live_sessions
+                        and not data.get("launching")):  # an unresolved launch stays unknown
                     data["status"] = "orphaned"
                     data["orphaned_reason"] = ORPHAN_TMUX_MISSING
                     data["last_activity"] = int(time.time())
@@ -804,6 +806,10 @@ class SessionRegistry:
 
                 name = data.get("name") or row["name"]
                 previous = data.get("status") or ""
+                if data.get("launching"):  # may still start: never settled or adopted here
+                    report["unchanged"].append({"session": name, "wolt": wolt,
+                                                "reason": "unresolved launch"})
+                    continue
                 if previous == STOPPING:
                     report["settled"].append(self._finish_stop(name, wolt, data, runtime))
                     continue
@@ -1643,6 +1649,68 @@ def still_as_seen(record: dict | None, seen: dict) -> bool:
     return record is not None and all(record.get(k) == seen.get(k) for k in _CLAIM_FIELDS)
 
 
+def mark_launching(registry: "SessionRegistry", name: str, wolt: str, harness: str) -> str:
+    """Commit a new launch attempt (and its native locator, when the inbox is on)
+    before the external launch. Call under the agent's lifecycle lock."""
+    attempt = lifecycle.new_attempt()
+    native = _native_adapters()
+    registry.update(name, wolt=wolt, launching={
+        "attempt": attempt, "at": int(time.time()),
+        # {kind, addr: a new private attempt dir, attempt}, or None: no native input
+        "native": native.prepare(registry.wolts_dir, name, resolve_harness(harness), attempt)
+        if native else None})
+    return attempt
+
+
+def publish_runtime(registry: "SessionRegistry", name: str, wolt: str, attempt: str,
+                    runtime: dict, **fields) -> bool:
+    """The one writer of runtime + native + marker clear: a single write, and only
+    for the exact attempt still marked. Waits for readiness belong after it."""
+    with lifecycle.agent_lock(registry.wolts_dir, wolt), registry.edit(name, wolt=wolt) as current:
+        marker = (current or {}).get("launching") or {}
+        if marker.get("attempt") != attempt:
+            return False
+        current.update(fields, runtime=runtime, attempt=attempt, last_activity=int(time.time()))
+        current.pop("launching")
+        if marker.get("native"):
+            current["native"] = marker["native"]
+        else:
+            current.pop("native", None)
+    return True
+
+
+def invalidate_native(registry: "SessionRegistry", name: str, wolt: str, seen: dict) -> None:
+    """Retire the session's native locator and its attempt's ready data, before any
+    teardown or replacement: a stale child can never be routed to again."""
+    if not seen.get("native"):
+        return
+    with registry.edit(name, wolt=wolt) as current:
+        native = (current or {}).pop("native", None)
+    adapters = _native_adapters()
+    if native and adapters:
+        adapters.retire(native)  # marks the attempt dir retired: a late child write is refused
+
+
+def refuse_unresolved(data: dict | None) -> None:
+    """An unresolved launch may still start: nothing may settle or relaunch it."""
+    if data and data.get("launching"):
+        raise lifecycle.LifecycleUnknown(
+            f"session '{data.get('name')}' has an unresolved launch "
+            f"(attempt {data['launching'].get('attempt')}); it is left as is")
+
+
+def _native_adapters():
+    """native_adapters while the inbox is on and the module is present, else None."""
+    import inbox
+    if not inbox.enabled(WOLTS_DIR):
+        return None
+    try:
+        import native_adapters
+    except ImportError:
+        return None
+    return native_adapters
+
+
 def stop_and_settle(registry: "SessionRegistry", name: str, seen: dict, stop, settle,
                     *, wolt: str = None) -> bool | None:
     """Stop a session's tmux with no write transaction around the stop.
@@ -1653,17 +1721,23 @@ def stop_and_settle(registry: "SessionRegistry", name: str, seen: dict, stop, se
     write. A message that finds `stopping` waits for it to end, then wakes the
     session (wait_out_stopping), so it never lands in a pane being stopped.
     A failed stop gives back the judged status and nothing else, so what was
-    written meanwhile stays. None: the claim lost. False: the stop failed.
+    written meanwhile stays. None: the claim lost, the agent's lifecycle lock was
+    busy, or an unresolved launch forbids settling. False: the stop failed.
     """
-    if not registry.claim(name, seen, STOPPING, wolt=wolt):
+    try:
+        with lifecycle.agent_lock(WOLTS_DIR, wolt or seen.get("wolt") or ""):
+            if seen.get("launching") or not registry.claim(name, seen, STOPPING, wolt=wolt):
+                return None
+            invalidate_native(registry, name, wolt or seen.get("wolt") or "", seen)
+            stopped = bool(stop(seen))
+            with registry.edit(name, wolt=wolt) as current:
+                if current is not None and current.get("status") == STOPPING:
+                    if stopped:
+                        settle(current)
+                    else:
+                        current["status"] = seen.get("status")
+    except lifecycle.LifecycleBusy:
         return None
-    stopped = bool(stop(seen))
-    with registry.edit(name, wolt=wolt) as current:
-        if current is not None and current.get("status") == STOPPING:
-            if stopped:
-                settle(current)
-            else:
-                current["status"] = seen.get("status")
     return stopped
 
 
@@ -1706,6 +1780,11 @@ def prepare_session_command(name: str, mode: str, prompt: str = "") -> str:
     harness = resolve_harness(data.get("harness"))
     wolt = data.get("wolt", "")
     model = data.get("model", "")
+    # The attempt's locator: the marker's while it is still marked, else the one publish_runtime
+    # copied onto the row (the child reads it after the parent may already have published).
+    # The builders add its native wiring; none = the original command.
+    locator = data["launching"].get("native") if data.get("launching") else data.get("native")
+    native = {"native": locator} if locator else {}
 
     if wolt and (WOLTS_DIR / wolt / "wolt" / "wolt.json").is_file():
         from lodge_skills import sync_lodge_skills
@@ -1744,7 +1823,7 @@ def prepare_session_command(name: str, mode: str, prompt: str = "") -> str:
             harness, "spawn",
             session_id=session_id, session_name=name,
             model=model, prompt=full_prompt,
-            execution_policy=data.get("execution_policy"),
+            execution_policy=data.get("execution_policy"), **native,
         )
 
     if mode == "resume":
@@ -1784,7 +1863,7 @@ def prepare_session_command(name: str, mode: str, prompt: str = "") -> str:
             prompt = ""
         return build_command(
             harness, "resume", resume_id=resume_id, model=model, prompt=prompt,
-            execution_policy=data.get("execution_policy"),
+            execution_policy=data.get("execution_policy"), **native,
         )
 
     raise ValueError(f"unknown mode: {mode}")
@@ -1958,6 +2037,8 @@ def start_session(
     harness: str = "",
     workdir: str | Path | None = None,
     execution_policy: str | None = None,
+    name: str = "",
+    require_auto: bool = False,
 ) -> dict:
     """Start an agent session for a specific wolt.
 
@@ -1968,6 +2049,8 @@ def start_session(
     app: optional app name — session runs in wolt/apps/{name}/.
     harness: optional harness override (per-session). Falls back to the wolt's
         wolt.json "harness" field, then the platform default (claude).
+    name: a session name reserved by the caller (the inbox wake); default a new one.
+    require_auto: refuse (PermissionError) unless the resolved policy is auto.
 
     Returns dict with session info: name, url, wolt, and optionally app/creature/model.
     Raises ValueError if the wolt directory doesn't exist.
@@ -2018,7 +2101,9 @@ def start_session(
         grants=AutoGrantStore(WOLTS_DIR),
     )
 
-    name = session_name(wolt)
+    if require_auto and policy.mode != "auto":
+        raise PermissionError(f"wolt '{wolt}' does not run in auto mode")
+    name = name or session_name(wolt)
     # pin wins if valid for the resolved harness, else the tier default (see resolve_model)
     model = resolve_model(harness, creature, pinned_model)
 
@@ -2026,28 +2111,19 @@ def start_session(
     session_url = f"{tunnel_url}/tui?session={name}" if tunnel_url else ""
 
     registry = SessionRegistry()
-    registry.create(
-        name,
-        wolt=wolt,
-        creature=creature or "",
-        model=model or "",
-        harness=harness,
-        dir=str(target.canonical_workdir),
-        target=target,
-        execution_policy=policy,
-        auto_grant=grant.to_record() if grant else None,
-        app=app or "",
-        prompt=prompt,
-        adapter=(routing or {}).get("adapter", ""),
-        chat_id=str((routing or {}).get("chat_id", "")),
-        user_id=str((routing or {}).get("user_id", "")),
-        thread_ts=str((routing or {}).get("thread_ts", "")),
-        session_url=session_url,
-    )
-
-    cmd = build_session_command(name, prompt)
-    handle = _tmux_spawn(name, str(target.canonical_workdir), cmd)
-    registry.update(name, wolt=wolt, runtime=handle.to_record())
+    with lifecycle.agent_lock(WOLTS_DIR, wolt):
+        _create_and_launch(registry, name, wolt, harness, target, prompt, dict(
+            creature=creature or "",
+            model=model or "",
+            execution_policy=policy,
+            auto_grant=grant.to_record() if grant else None,
+            app=app or "",
+            adapter=(routing or {}).get("adapter", ""),
+            chat_id=str((routing or {}).get("chat_id", "")),
+            user_id=str((routing or {}).get("user_id", "")),
+            thread_ts=str((routing or {}).get("thread_ts", "")),
+            session_url=session_url,
+        ))
 
     result = {
         "name": name,
@@ -2090,6 +2166,37 @@ def start_session(
     return result
 
 
+def _create_and_launch(registry, name, wolt, harness, target, prompt, fields) -> None:
+    """Create the row, mark the attempt, spawn, publish: under the agent's lock."""
+    registry.create(name, wolt=wolt, harness=harness, dir=str(target.canonical_workdir),
+                    target=target, prompt=prompt, **fields)
+    attempt = mark_launching(registry, name, wolt, harness)
+    try:
+        handle = _tmux_spawn(name, str(target.canonical_workdir), build_session_command(name, prompt))
+    except subprocess.CalledProcessError:
+        _launch_failed(registry, name, wolt, attempt, settle=True)
+        raise
+    publish_runtime(registry, name, wolt, attempt, handle.to_record())
+
+
+def _launch_failed(registry, name: str, wolt: str, attempt: str, *, settle: bool) -> None:
+    """A tmux call that exited non-zero is a reaped client, a definite failure (a
+    timeout is not: it stays UNKNOWN). Under the held lock, clear exactly this
+    attempt and retire its locator. settle: a fresh new-session never started, so
+    the row is stopped (launch_failed); a failed paste or new-window keeps the
+    session's prior runtime and status untouched."""
+    with registry.edit(name, wolt=wolt) as current:
+        marker = (current or {}).get("launching") or {}
+        if marker.get("attempt") != attempt:
+            return
+        current.pop("launching")
+        if settle:
+            current.update(status="stopped", finished_at=int(time.time()), stop_reason="launch_failed")
+    adapters = _native_adapters()
+    if adapters and marker.get("native"):
+        adapters.retire(marker["native"])
+
+
 # ---------------------------------------------------------------------------
 # Session resume — shared entry point for bot + API
 # ---------------------------------------------------------------------------
@@ -2127,6 +2234,18 @@ def _paste_into_live_agent(registry: "SessionRegistry", wolt: str, name: str,
             _tmux_paste(target, _guard_paste_text(harness, prompt),
                         settle=get_harness(harness).get("paste_settle", 0.0))
     return True
+
+
+@contextmanager
+def _relaunch(registry: "SessionRegistry", name: str, wolt: str, harness: str):
+    """One resume relaunch segment, under the agent's lock: a new attempt marked
+    before the external effect; the caller publishes it. Waits come after."""
+    with lifecycle.agent_lock(WOLTS_DIR, wolt):
+        current = registry.get(name, wolt=wolt, check_alive=False)
+        if current is None or current.get("launching"):
+            raise ResumeFailed(f"session '{name}' has an unresolved launch; nothing was relaunched")
+        invalidate_native(registry, name, wolt, current)
+        yield mark_launching(registry, name, wolt, harness)
 
 
 def resume_session(name: str, prompt: str = "") -> dict:
@@ -2269,21 +2388,26 @@ def resume_session(name: str, prompt: str = "") -> dict:
         if _runtime().handle_is_alive(target):
             # The exact dedicated pane survived; reuse it rather than creating
             # a new window on every ordinary agent exit.
-            with _paste_lock(name, registry.db_dir):
-                _tmux_paste(target, resume_cmd)
-            registry.update(name, wolt=wolt, status="running")
+            with _relaunch(registry, name, wolt, harness) as attempt:
+                try:
+                    with _paste_lock(name, registry.db_dir):
+                        _tmux_paste(target, resume_cmd)
+                except subprocess.CalledProcessError as exc:
+                    _launch_failed(registry, name, wolt, attempt, settle=False)
+                    raise ResumeFailed(f"session '{name}': the resume command could not be pasted ({exc})") from exc
+                publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
             detail = "agent exited, restarted with --resume in existing pane"
         else:
             # The session survived only because unrelated user panes/windows
             # remain. Never commandeer one: add a detached dedicated window and
             # persist the exact pane tmux returns.
-            target = _tmux_spawn_in_session(target, work_dir or "/workspace", resume_cmd)
-            registry.update(
-                name,
-                wolt=wolt,
-                status="running",
-                runtime=target.to_record(),
-            )
+            with _relaunch(registry, name, wolt, harness) as attempt:
+                try:
+                    target = _tmux_spawn_in_session(target, work_dir or "/workspace", resume_cmd)
+                except subprocess.CalledProcessError as exc:
+                    _launch_failed(registry, name, wolt, attempt, settle=False)
+                    raise ResumeFailed(f"session '{name}': no window could be opened for the resume ({exc})") from exc
+                publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
             # The pane on disk just moved. Keep the in-memory record in step so
             # nothing below this line addresses the pane we already replaced.
             data = {**data, "runtime": target.to_record()}
@@ -2318,8 +2442,13 @@ def resume_session(name: str, prompt: str = "") -> dict:
 
     # Tmux is dead (or was just cleared out from under a stale, agentless
     # session) — create a fresh tmux session running the wrapper.
-    handle = _tmux_spawn(name, work_dir or "/workspace", resume_cmd)
-    registry.update(name, wolt=wolt, status="running", runtime=handle.to_record())
+    with _relaunch(registry, name, wolt, harness) as attempt:
+        try:
+            handle = _tmux_spawn(name, work_dir or "/workspace", resume_cmd)
+        except subprocess.CalledProcessError:
+            _launch_failed(registry, name, wolt, attempt, settle=True)  # a fresh new-session never started
+            raise
+        publish_runtime(registry, name, wolt, attempt, handle.to_record(), status="running")
     if not _await_agent(handle, harness):
         # run-session.sh may have exited before an agent appeared: a prepare
         # failure, a missing harness binary, an auth wall. Reporting
@@ -2345,6 +2474,22 @@ def resume_session(name: str, prompt: str = "") -> dict:
             "detail": respawn_detail}
 
 
+@contextmanager
+def _ending(registry: "SessionRegistry", data: dict):
+    """Stop, archive or delete under the agent's lock: retire the native locator,
+    stop tmux if alive, then let the caller settle, unless a launch is unresolved
+    (the cleanup is still attempted; LifecycleUnknown, nothing settled)."""
+    wolt = data.get("wolt", "")
+    with lifecycle.agent_lock(WOLTS_DIR, wolt):
+        data = registry.get(data["name"], wolt=wolt, check_alive=False) or data
+        invalidate_native(registry, data["name"], wolt, data)
+        tmux_alive = _tmux_alive(data)
+        if tmux_alive:
+            _tmux_stop(data)
+        refuse_unresolved(data)
+        yield wolt, tmux_alive
+
+
 def stop_session(name: str) -> dict:
     """Stop a running session — kill tmux, mark as stopped.
 
@@ -2356,16 +2501,12 @@ def stop_session(name: str) -> dict:
     if data is None:
         raise ValueError(f"session '{name}' not found in registry")
 
-    wolt = data.get("wolt", "")
     # Session-level: kill whenever tmux still holds the session, even if the
     # persisted pane is long gone. Gating this on the pane would mark the
     # record stopped while the tmux session ran on, unreachable forever.
-    tmux_alive = _tmux_alive(data)
-
-    if tmux_alive:
-        _tmux_stop(data)
-
-    registry.update(name, wolt=wolt, status="stopped", finished_at=int(time.time()))
+    with _ending(registry, data) as (wolt, tmux_alive):
+        # wake_inhibit: the owner ended it, so the inbox wake starts nothing until rearm
+        registry.update(name, wolt=wolt, status="stopped", finished_at=int(time.time()), wake_inhibit=True)
     return {"name": name, "status": "stopped", "was_alive": tmux_alive}
 
 
@@ -2380,13 +2521,9 @@ def archive_session(name: str) -> dict:
     if data is None:
         raise ValueError(f"session '{name}' not found in registry")
 
-    wolt = data.get("wolt", "")
-
-    # Stop tmux if still alive
-    if _tmux_alive(data):
-        _tmux_stop(data)
-
-    registry.update(name, wolt=wolt, status="archived", finished_at=data.get("finished_at") or int(time.time()))
+    with _ending(registry, data) as (wolt, _):
+        registry.update(name, wolt=wolt, status="archived", wake_inhibit=True,
+                        finished_at=data.get("finished_at") or int(time.time()))
     return {"name": name, "status": "archived", "wolt": wolt}
 
 
@@ -2401,13 +2538,8 @@ def delete_session(name: str) -> dict:
     if data is None:
         raise ValueError(f"session '{name}' not found in registry")
 
-    wolt = data.get("wolt", "")
-
-    # Stop tmux if still alive
-    if _tmux_alive(data):
-        _tmux_stop(data)
-
-    registry.delete(name, wolt=wolt)
+    with _ending(registry, data) as (wolt, _):
+        registry.delete(name, wolt=wolt)
     return {"name": name, "status": "deleted", "wolt": wolt}
 
 
@@ -2554,6 +2686,22 @@ def cli():
         except ValueError as e:
             print(str(e), file=sys.stderr)
             sys.exit(1)
+
+    elif cmd == "inbox-grant":
+        # session-reg inbox-grant <name>: revoke the session's earlier inbox
+        # readers and print a fresh one, once. Nothing while the inbox is off.
+        import inbox
+        if inbox.enabled(reg.wolts_dir):
+            data = reg.get(args[1], check_alive=False) if len(args) > 1 else None
+            try:
+                if data is None:
+                    raise inbox.Refused("no_session")
+                token = inbox.Store(reg.wolts_dir, inbox.LIMITS).grant(args[1], data["wolt"] or "")
+                if token:  # none for a wolt that cannot have a mailbox
+                    print(token)
+            except inbox.InboxError as exc:
+                print(f"inbox-grant: {exc.code}", file=sys.stderr)
+                sys.exit(1)
 
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)

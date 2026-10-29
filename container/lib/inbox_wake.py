@@ -55,6 +55,28 @@ def notify_admitted(wolts_dir, status) -> None:
         log.exception("inbox wake not scheduled")
 
 
+def ready(wolts_dir, token: str, session: str, attempt: str) -> bool:
+    """A native backend announced its attempt ready (native_adapters.announce_ready). Only the
+    session's own reader, for its current, published, running attempt, schedules a pickup:
+    one hint if this attempt never had one. False for anything stale or not its own."""
+    if not inbox.enabled(wolts_dir):
+        return False
+    owner = inbox.Store(wolts_dir, inbox.LIMITS).reader_session(token)
+    record = sessions.SessionRegistry(wolts_dir).get(session, check_alive=False) or {}
+    if (owner is None or owner[0] != session or record.get("wolt") != owner[1]
+            or record.get("status") != "running" or record.get("launching") or record.get("attempt") != attempt):
+        return False
+    _schedule(str(wolts_dir), owner[1], once=True)
+    return True
+
+
+def schedule_pickup(wolts_dir, wolt: str) -> None:
+    """A resume that found the agent already running: its backend was ready before, so no
+    ready call will come. One pickup hint for the attempt if it never had one."""
+    if wolt and inbox.enabled(wolts_dir):
+        _schedule(str(wolts_dir), wolt, once=True)
+
+
 def reconcile(wolts_dir) -> None:
     """At boot: mail admitted just before a crash never got its wake."""
     if inbox.enabled(wolts_dir):
@@ -83,21 +105,22 @@ def rearm(wolts_dir, wolt: str) -> dict:
     return {"wolt": wolt, "rearmed": True}
 
 
-def _schedule(root: str, wolt: str) -> None:
+def _schedule(root: str, wolt: str, once: bool = False) -> None:
+    """One worker per agent; what arrives meanwhile is one more pass ("all" outranks "once")."""
     key = (root, wolt)
     with _GUARD:
         if key in _PENDING:
-            _PENDING[key] = True
+            _PENDING[key] = "all" if not once or _PENDING[key] == "all" else "once"
             return
-        _PENDING[key] = False
-    threading.Thread(target=_worker, args=key, daemon=True, name=f"inbox-wake-{wolt}").start()
+        _PENDING[key] = None
+    threading.Thread(target=_worker, args=(root, wolt, once), daemon=True, name=f"inbox-wake-{wolt}").start()
 
 
-def _worker(root: str, wolt: str) -> None:
+def _worker(root: str, wolt: str, once: bool = False) -> None:
     key, busy = (root, wolt), 0
     while True:
         try:
-            _wake(root, wolt)
+            _wake(root, wolt, once=once)
         except lifecycle.LifecycleBusy:
             busy += 1
             if busy < BUSY_RETRIES:
@@ -107,10 +130,11 @@ def _worker(root: str, wolt: str) -> None:
         except Exception:
             log.exception("inbox wake for %s failed; the mail stays queued", wolt)
         with _GUARD:
-            if not _PENDING[key]:
+            again = _PENDING[key]
+            if again is None:
                 del _PENDING[key]
                 return
-            _PENDING[key], busy = False, 0
+            _PENDING[key], busy, once = None, 0, again == "once"
 
 
 def _wake(root: str, wolt: str, *, once: bool = False) -> None:
@@ -121,8 +145,12 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         if not facts or not facts["open"] or not facts["queued"]:
             return
         live = sessions.resolve_active_session(wolt, registry)
-        # An inhibition only ever stops a start, never a live session's hint.
-        why = None if live else (facts["wake"].get("inhibited") or _start(store, registry, wolt, facts))
+        # An inhibition only ever stops a start, never a live session's hint. The owner's own
+        # mail may retry a start that only a policy refused: it starts in the wolt's own mode.
+        inhibited = facts["wake"].get("inhibited")
+        if inhibited == "not_startable" and facts["human"]:
+            inhibited = None
+        why = None if live else (inhibited or _start(store, registry, wolt, facts))
         if live:
             record = registry.get(live, wolt=wolt, check_alive=False) or {}
             hinted = {"session": live, "attempt": record.get("attempt")}

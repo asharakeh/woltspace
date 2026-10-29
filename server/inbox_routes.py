@@ -45,6 +45,26 @@ async def inbox_summary():
     return {"ok": True, "now": time.time(), "wolts": wolts}
 
 
+@router.post("/ready")
+async def inbox_ready(request: Request):
+    """A session's native backend announces its attempt ready (native_adapters.announce_ready).
+    The caller is the session's own reader; inbox_wake.ready checks session and attempt."""
+    if not inbox.enabled(WOLTS_DIR):
+        return _error("inbox_disabled")
+    try:
+        body = json.loads(await request.body() or b"{}")
+        assert isinstance(body, dict) and set(body) == {"session", "attempt"}
+        assert all(isinstance(body[k], str) and body[k] for k in body)
+    except (ValueError, AssertionError):
+        return _error("invalid")
+    try:
+        scheduled = await run_in_threadpool(inbox_wake.ready, WOLTS_DIR, request.headers.get(TOKEN_HEADER, ""),
+                                            body["session"], body["attempt"])
+    except inbox.InboxError as exc:
+        return _error(exc.code)
+    return {"ok": True, "result": {"scheduled": scheduled}}
+
+
 @router.post("/rearm")
 async def inbox_rearm(request: Request):
     """The owner's explicit rearm of an agent's inhibited wake (inbox_wake.rearm)."""

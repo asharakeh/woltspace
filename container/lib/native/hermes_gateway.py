@@ -66,6 +66,23 @@ def _write_ready(session_id):
         json.dump({"kind": "hermes-gateway", "attempt": attempt, "pid": os.getpid(), "gateway_session": session_id},
                   handle)
     os.replace(tmp, directory / "ready.json")
+    _announce_ready()
+
+
+def _announce_ready():
+    """As native_adapters.announce_ready (this runs on Hermes's own interpreter): one bounded,
+    reader-authenticated POST so mail that waited gets its hint. A failure is ignored."""
+    import urllib.request
+    token, session = os.environ.get("WOLTSPACE_INBOX_TOKEN"), os.environ.get("WOLTSPACE_WOLT_SESSION")
+    if token and session:
+        request = urllib.request.Request(
+            f"{os.environ.get('WOLTSPACE_API', 'http://localhost:7777')}/inbox/ready", method="POST",
+            data=json.dumps({"session": session, "attempt": attempt}).encode(),
+            headers={"Content-Type": "application/json", "X-Woltspace-Inbox-Token": token})
+        try:
+            urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=2).close()
+        except Exception:
+            pass
 
 
 def _watch():

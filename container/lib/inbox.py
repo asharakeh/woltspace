@@ -255,6 +255,13 @@ class Store:
                     "acks": conn.execute("SELECT coalesce(sum(acks), 0) FROM inbox_readers"
                                          " WHERE session=?", (session,)).fetchone()[0]}
 
+    def reader_session(self, token: str) -> tuple[str, str] | None:
+        """(session, wolt) of a valid reader, or None."""
+        with self._read() as conn:
+            row = conn.execute(_VALID.replace("SELECT r.mailbox, b.wolt", "SELECT r.session, b.wolt"),
+                               (_hash(token),)).fetchone()
+            return (row[0], row[1]) if row else None
+
     def queued_wolts(self) -> list[str]:
         with self._read() as conn:
             return [row[0] for row in conn.execute(

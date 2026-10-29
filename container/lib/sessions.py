@@ -2314,6 +2314,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
         if booting and not prompt:
             # Nothing to paste, and nothing to relaunch: the agent is on its way.
             registry.update(name, wolt=wolt, status="running", runtime=target.to_record())
+            _schedule_pickup(wolt)
             return {"name": name, "url": session_url, "status": "delivered",
                     "detail": "agent booting, nothing to send"}
         # Wait for the agent to take input before any write, never inside one:
@@ -2327,6 +2328,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
             )
         if _paste_into_live_agent(registry, wolt, name, data.get("status"), harness,
                                   prompt.replace("\n", " ")):
+            _schedule_pickup(wolt)
             return {"name": name, "url": session_url, "status": "delivered",
                     "detail": "agent running, message sent"}
         # A rest (or a stop) took the lock between our look and the paste and
@@ -2488,6 +2490,16 @@ def _ending(registry: "SessionRegistry", data: dict):
             _tmux_stop(data)
         refuse_unresolved(data)
         yield wolt, tmux_alive
+
+
+def _schedule_pickup(wolt: str) -> None:
+    """A resume that reused a running agent (and its ready backend): mail that waited
+    gets one hint. Outside any lock; never fails the resume."""
+    try:
+        import inbox_wake
+        inbox_wake.schedule_pickup(WOLTS_DIR, wolt)
+    except Exception as exc:
+        print(f"[inbox] pickup not scheduled for {wolt}: {exc}", file=sys.stderr)
 
 
 def stop_session(name: str) -> dict:

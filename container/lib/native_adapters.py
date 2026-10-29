@@ -88,7 +88,25 @@ def write_ready(directory: str | Path, data: dict) -> bool:
     if (directory / RETIRED).exists():
         return False
     _write_private(directory / READY, data)
+    announce_ready(data.get("attempt", ""))
     return True
+
+
+def announce_ready(attempt: str) -> None:
+    """Tell the lodge, once ready data is published, that this attempt takes input now, so
+    mail that waited (a rest, a resume) gets its hint. Authenticated as the session's own
+    inbox reader. Bounded and custody-neutral: a failure is ignored, never a launch failure."""
+    token, session = os.environ.get("WOLTSPACE_INBOX_TOKEN"), os.environ.get("WOLTSPACE_WOLT_SESSION")
+    if not (token and session and attempt):
+        return
+    api = os.environ.get("WOLTSPACE_API", "http://localhost:7777")
+    request = urllib.request.Request(
+        f"{api}/inbox/ready", data=json.dumps({"session": session, "attempt": attempt}).encode(), method="POST",
+        headers={"Content-Type": "application/json", "X-Woltspace-Inbox-Token": token})
+    try:  # the lodge's own API: never through a proxy
+        urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=2).close()
+    except Exception:
+        pass
 
 
 def retire(native: dict | None) -> None:

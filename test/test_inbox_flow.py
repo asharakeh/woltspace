@@ -80,15 +80,22 @@ def say(flow, event_id, text):
     return out.said
 
 
-def test_telegram_to_a_woken_session_to_its_own_fetch_and_ack(flow):
-    assert say(flow, "e1", "first") == ["🪵 queued for 🐾 pal"]
+def test_telegram_to_a_woken_session_to_its_own_fetch_and_ack(flow, monkeypatch):
+    import inbox_notice
+    lines = []  # what the lodge's /notify would get: the owner's one line per message
+    monkeypatch.setattr(inbox_notice, "_call", lambda method, path, body=None: (
+        lines.append(body) if method == "POST" else None))
+    assert say(flow, "e1", "first") == []  # no line at admission: the wake answers
     (name,) = flow.seen.spawned  # no session: exactly one fresh start, by the wake
+    to_chat = {"adapter": "telegram", "chat_id": CHAT, "session": ""}
+    assert lines == [{**to_chat, "message": f"🪵 {name} notified\n{name}"}]
     record = sessions.SessionRegistry(flow.root).get(name, check_alive=False)
     assert record["prompt"] == inbox_wake.START[:500] and record["native"]["attempt"] == record["attempt"]
     assert "launching" not in record
 
     say(flow, "e2", "second")
     assert flow.seen.spawned == [name]  # the live session is hinted, never a second worker
+    assert lines[1:] == [{**to_chat, "message": f"🪵 {name} notified\n{name}"}]  # its own one line
     # one pickup after the fresh session's publication, then one for the new mail
     assert len(flow.seen.hints) == 2
     (hinted, attempt, native_attempt, hint) = flow.seen.hints[-1]

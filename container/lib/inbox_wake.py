@@ -152,9 +152,10 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         if not facts or not facts["open"] or not facts["queued"]:
             taken = bool(facts and facts["unanswered"])  # a reader took them before any wake did
         else:
-            taken, prefer = False, facts["wake"].get("prefer") or {}
-            # current while its message is not answered yet
-            prefer = prefer.get("session") if prefer.get("seq", 0) > facts["wake"].get("answered", -1) else None
+            # current while its own message waits unfetched: until then every wake nudges only that
+            # session, if it is live or resumable; another may still fetch it, unnudged
+            taken = False
+            prefer = (facts["wake"].get("prefer") or {}).get("session") if facts["prefer_queued"] else None
             # the session the sender is talking to first, live or resumable; else the newest live one
             live = _live(registry, wolt, prefer)
             if not live and not _resumable(registry.get(prefer, wolt=wolt, check_alive=False) if prefer else None):
@@ -204,7 +205,8 @@ def _resumable(record: dict | None) -> bool:
 
 
 def _live(registry, wolt: str, name: str | None) -> str | None:
-    return name if name and (registry.get(name, wolt=wolt) or {}).get("alive") else None
+    record = registry.get(name, wolt=wolt) if name else None
+    return name if record and record.get("status") == "running" and record.get("alive") else None
 
 
 def _start(store, registry, wolt: str, facts: dict, prefer: str | None) -> tuple[str | None, str | None]:

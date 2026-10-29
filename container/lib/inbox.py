@@ -260,6 +260,9 @@ class Store:
                                               " AND state='queued' AND priority=?", (row["id"], HUMAN)).fetchone()[0],
                     "acks": conn.execute("SELECT coalesce(sum(acks), 0) FROM inbox_readers"
                                          " WHERE session=?", (session,)).fetchone()[0],
+                    "prefer_queued": conn.execute(  # the preference's own message, still for its session
+                        "SELECT 1 FROM inbox_messages WHERE seq=? AND state='queued'",
+                        ((wake.get("prefer") or {}).get("seq"),)).fetchone() is not None,
                     "unanswered": [{"seq": seq, "human": priority == HUMAN, "session": taker}
                                    for seq, priority, taker in conn.execute(
                         "SELECT m.seq, m.priority, CASE WHEN m.state != 'queued' THEN r.session END"

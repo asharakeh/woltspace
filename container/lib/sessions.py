@@ -2530,6 +2530,7 @@ def stop_session(name: str) -> dict:
     with _ending(registry, data) as (wolt, tmux_alive):
         # wake_inhibit: the owner ended it, so the inbox wake starts nothing until rearm
         registry.update(name, wolt=wolt, status="stopped", finished_at=int(time.time()), wake_inhibit=True)
+    _schedule_pickup(wolt)  # mail it was preferred for now wakes another session
     return {"name": name, "status": "stopped", "was_alive": tmux_alive}
 
 
@@ -2547,6 +2548,7 @@ def archive_session(name: str) -> dict:
     with _ending(registry, data) as (wolt, _):
         registry.update(name, wolt=wolt, status="archived", wake_inhibit=True,
                         finished_at=data.get("finished_at") or int(time.time()))
+    _schedule_pickup(wolt)  # mail it was preferred for now wakes another session
     return {"name": name, "status": "archived", "wolt": wolt}
 
 

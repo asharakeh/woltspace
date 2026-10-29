@@ -937,6 +937,7 @@ def test_a_true_duplicate_admission_keeps_the_route_and_accounting_it_was_accept
 @pytest.mark.parametrize("adapter, chat", [("telegram", "4242"), ("slack", "D1:1712345678.000100")])
 def test_a_session_the_wake_starts_for_owner_mail_is_routed_to_its_chat_as_chat_lodge_did(lodge, monkeypatch,
                                                                                            adapter, chat):
+    from test_chat_lodge_inbox import ROOT  # noqa: F401 (puts container/ on the path for chat_lodge)
     import chat_lodge
     import connector_registry
     monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
@@ -960,3 +961,41 @@ def test_a_session_the_wake_starts_for_agent_mail_only_is_unrouted(lodge, monkey
     inbox_wake._wake(str(lodge.root), "pal")
     (name, _, _), = lodge.calls.spawned
     assert not record(lodge, name).get("routing")
+
+
+@pytest.mark.parametrize("again", [True, False])  # a later pickup (another session's ready) or a coalesced pass
+def test_while_the_preferred_live_session_has_not_fetched_only_it_is_hinted(lodge, wake, notices, monkeypatch,
+                                                                             again):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    for name in ("pal-s1", "pal-s2"):
+        lodge.registry.create(name, wolt="pal")
+        lodge.registry.update(name, attempt=f"{name}-a1")
+    wake.live = "pal-s2"  # the newest live session
+    mail(lodge, route={"session": "pal-s1", "chat": None})
+    inbox_wake._wake(str(lodge.root), "pal")
+    inbox_wake._wake(str(lodge.root), "pal", once=again)
+    assert [d[0] for d in lodge.calls.delivered] == ["pal-s1"] * (1 if again else 2)
+    lodge.store.fetch(lodge.store.grant("pal-s1", "pal"))  # it took the message: the preference is spent
+    mail(lodge, "k2")
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert lodge.calls.delivered[-1][0] == "pal-s2"
+
+
+@pytest.mark.parametrize("end", ["stopped", "died"])
+def test_a_preferred_session_that_ends_with_its_message_queued_hands_it_on(lodge, wake, notices, monkeypatch, end):
+    scheduled = []
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda root, wolt, once=False: scheduled.append((wolt, once)))
+    for name in ("pal-s1", "pal-s2"):
+        lodge.registry.create(name, wolt="pal")
+        lodge.registry.update(name, attempt=f"{name}-a1")
+    wake.live = "pal-s2"
+    mail(lodge, route={"session": "pal-s1", "chat": None})
+    inbox_wake._wake(str(lodge.root), "pal")
+    if end == "stopped":
+        sessions.stop_session("pal-s1")  # the owner's stop schedules a pickup
+        assert scheduled == [("pal", True)]
+    else:  # its tmux is gone: not live, not resumable (the vulture's settle schedules a pickup)
+        monkeypatch.setattr(sessions, "_tmux_alive", lambda data: data.get("name") != "pal-s1")
+    inbox_wake._wake(str(lodge.root), "pal", once=True)
+    assert [d[0] for d in lodge.calls.delivered] == ["pal-s1", "pal-s2"]
+    assert len(notices.lines) == 1  # the message's one line was already sent

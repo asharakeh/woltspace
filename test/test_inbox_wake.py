@@ -490,6 +490,11 @@ def test_only_the_sessions_own_reader_for_its_current_attempt_schedules_a_pickup
     lodge.registry.update("pal-a", launching={"attempt": "pal-a-2"})
     assert not inbox_wake.ready(lodge.root, token, "pal-a", "pal-a-1")  # a relaunch in flight
     assert scheduled == [("pal", True)]
+    lodge.registry.update("pal-a", launching=None)
+    assert inbox_wake.ready(lodge.root, token, "pal-a", "pal-a-1", "turn_end")  # a plain wake
+    assert not inbox_wake.ready(lodge.root, token, "pal-a", "pal-a-1", "other")
+    assert not inbox_wake.ready(lodge.root, token, "pal-b", "pal-b-1", "turn_end")  # not its own
+    assert scheduled == [("pal", True), ("pal", False)]
 
 
 def test_a_published_ready_file_announces_itself_once_and_a_failure_is_ignored(tmp_path, monkeypatch):
@@ -1012,3 +1017,40 @@ def test_an_enrolled_send_naming_a_session_nudges_only_that_one(lodge, wake, not
     inbox_wake._wake(str(lodge.root), "pal")
     inbox_wake._wake(str(lodge.root), "pal", once=True)
     assert [d[0] for d in lodge.calls.delivered] == (["pal-s1"] if named == "pal-s1" else ["pal-s2"])
+
+
+# -- a busy engine gets no hint; the end of its turn does (bug note 5) -------------------------
+
+def test_mail_for_a_busy_session_is_told_to_the_owner_at_once_and_hinted_at_its_turn_end(lodge, wake, notices,
+                                                                                        monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    lodge.registry.create("pal-s1", wolt="pal")
+    lodge.registry.update("pal-s1", attempt="a1")
+    wake.live = "pal-s1"
+    engine = types.SimpleNamespace(busy=True, placed=[])
+    sys.modules["native_adapters"].deliver = lambda record_, hint: (
+        ("pending", "busy") if engine.busy else engine.placed.append(hint) or ("submitted", "queued"))
+    for key in ("k1", "k2", "k3"):  # a burst while its turn runs
+        mail(lodge, key)
+        inbox_wake._wake(str(lodge.root), "pal")
+    assert engine.placed == [] and "hinted" not in wake_state(lodge)  # nothing to go stale
+    assert notices.lines == [("busy", [seq], "pal-s1", None) for seq in seqs(lodge)]  # each its one line
+    engine.busy = False  # the turn ends: its wake hints once, and adds no second line
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert len(engine.placed) == 1 and len(notices.lines) == 3
+
+
+def test_a_turn_end_after_the_session_took_its_mail_hints_nothing(lodge, wake, notices, monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    lodge.registry.create("pal-s1", wolt="pal")
+    wake.live = "pal-s1"
+    placed = []
+    sys.modules["native_adapters"].deliver = lambda record_, hint: ("pending", "busy")
+    mail(lodge)
+    inbox_wake._wake(str(lodge.root), "pal")
+    token = lodge.store.grant("pal-s1", "pal")
+    got = lodge.store.fetch(token)  # during its turn, the agent takes the mail itself
+    lodge.store.ack(token, got.seq, got.claim)
+    sys.modules["native_adapters"].deliver = lambda record_, hint: placed.append(hint) or ("submitted", "queued")
+    inbox_wake._wake(str(lodge.root), "pal")  # its turn end
+    assert placed == [] and [line[0] for line in notices.lines] == ["busy"]

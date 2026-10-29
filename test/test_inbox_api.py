@@ -213,3 +213,16 @@ def test_archive_and_delete_without_a_mailbox_change_nothing_of_the_inbox(tmp_pa
     wolt_archive.archive_wolt("pal", wolts_dir=tmp_path)
     wolt_archive.delete_archived_wolt("pal", wolts_dir=tmp_path)
     assert rows(tmp_path, "SELECT count(*) FROM inbox_mailboxes") == [(0,)]
+
+
+def test_ready_takes_an_optional_kind_and_nothing_else(tmp_path, store, client, monkeypatch):
+    enable(tmp_path)
+    import inbox_wake
+    seen = []
+    monkeypatch.setattr(inbox_wake, "ready", lambda root, token, session, attempt, kind: seen.append(kind) or True)
+    for body, expect in (({"session": "s1", "attempt": "a1"}, 200),
+                         ({"session": "s1", "attempt": "a1", "kind": "turn_end"}, 200),
+                         ({"session": "s1", "attempt": "a1", "kind": ""}, 400),
+                         ({"session": "s1", "attempt": "a1", "other": "x"}, 400)):
+        assert client.post("/inbox/ready", json=body).status_code == expect
+    assert seen == ["ready", "turn_end"]

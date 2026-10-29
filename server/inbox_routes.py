@@ -53,13 +53,13 @@ async def inbox_ready(request: Request):
         return _error("inbox_disabled")
     try:
         body = json.loads(await request.body() or b"{}")
-        assert isinstance(body, dict) and set(body) == {"session", "attempt"}
+        assert isinstance(body, dict) and {"session", "attempt"} <= set(body) <= {"session", "attempt", "kind"}
         assert all(isinstance(body[k], str) and body[k] for k in body)
     except (ValueError, AssertionError):
         return _error("invalid")
     try:
         scheduled = await run_in_threadpool(inbox_wake.ready, WOLTS_DIR, request.headers.get(TOKEN_HEADER, ""),
-                                            body["session"], body["attempt"])
+                                            body["session"], body["attempt"], body.get("kind", "ready"))
     except inbox.InboxError as exc:
         return _error(exc.code)
     return {"ok": True, "result": {"scheduled": scheduled}}

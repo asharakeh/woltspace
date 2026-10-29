@@ -270,14 +270,19 @@ def cmd_session_send(args):
         wolt = target.rsplit("-", 3)[0] if _SESSION_RE.search(target) and target.count("-") >= 3 else target
         header = f"[message from {from_wolt}" + (f", session={from_session}" if from_session else "") + "]"
         reply = f"\n{session_send_reply_instruction(from_session)}" if from_session else ""
-        body = {"to": wolt, "key": f"iwcl-{uuid.uuid4().hex}", "text": f"{header}\n{message}{reply}"}
-        status, result = _req("POST", "/inbox/send", body, headers={"X-Woltspace-Inbox-Token": token})
+        key = f"iwcl-{uuid.uuid4().hex}"
+        body = {"to": wolt, "key": key, "text": f"{header}\n{message}{reply}"}
+        # The outcome can be unknown (no answer, a lost commit reply): the key
+        # tells, never a resend under a fresh one.
+        check = f"; check key {key} with `woltspace inbox status --key {key}` before sending again"
+        status, result = _req("POST", "/inbox/send", body, headers={"X-Woltspace-Inbox-Token": token}, hint=check)
         if args.json:
             print(json.dumps(result, indent=2))
         elif result.get("ok"):
             print(f"queued → {wolt} (seq {result['result']['seq']})")
         else:
-            print(f"not queued ({result.get('error', status)})", file=sys.stderr)
+            code = result.get("error", status)
+            print(f"not queued ({code})" + (check if code in ("store_busy", "store_failed") else ""), file=sys.stderr)
         if not result.get("ok"):
             sys.exit(1)
         return

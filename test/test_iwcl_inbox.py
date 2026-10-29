@@ -15,7 +15,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from starlette.testclient import TestClient
 
-from inbox_support import limits, reader, rows, wolt
+from inbox_support import limits, lose_confirmation, reader, rows, wolt
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -60,12 +60,16 @@ def lodge(tmp_path, monkeypatch):
     thread.join(5)
 
 
-def send(lodge, target, text="hello nunu"):
+def cli(lodge, *args, text="hello nunu"):
     env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("TMPDIR", "/tmp"),
            "WOLTSPACE_API": lodge["api"], "WOLTSPACE_INBOX_TOKEN": lodge["token"],
            "WOLTSPACE_WOLT_NAME": "pal", "WOLTSPACE_WOLT_SESSION": "pal-a-b-a1b2c3"}
-    return subprocess.run([sys.executable, str(ROOT / "container" / "bin" / "woltspace"), "session", "send", target],
+    return subprocess.run([sys.executable, str(ROOT / "container" / "bin" / "woltspace"), *args],
                           input=text, env=env, capture_output=True, text=True, timeout=30)
+
+
+def send(lodge, target):
+    return cli(lodge, "session", "send", target)
 
 
 def mail(root):
@@ -95,6 +99,16 @@ def test_a_refusal_is_not_queued_and_falls_back_to_nothing(lodge):
     done = send(lodge, "ghost")
     assert (done.returncode, done.stderr) == (1, "not queued (no_mailbox)\n")
     assert mail(lodge["root"]) == [] and lodge["woken"] == [] and lodge["strays"] == []
+
+
+def test_an_unknown_outcome_names_its_key_and_is_never_resent(lodge, monkeypatch):
+    lose_confirmation(monkeypatch, 1)  # the send commits; its caller sees store_failed
+    done = send(lodge, "nunu")
+    key = done.stderr.split("check key ")[1].split()[0]
+    assert done.returncode == 1 and done.stderr.startswith("not queued (store_failed); check key iwcl-")
+    assert f"`woltspace inbox status --key {key}`" in done.stderr
+    assert len(mail(lodge["root"])) == 1 and lodge["strays"] == []
+    assert json.loads(cli(lodge, "inbox", "status", "--key", key).stdout)["state"] == "queued"
 
 
 @pytest.fixture

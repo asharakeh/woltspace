@@ -38,6 +38,7 @@ READY, HINT, RETIRED, LISTENER, STATE = "ready.json", "hint", "retired", "listen
 BUDGET = 3.0          # deliver() never takes longer than this
 CLAIM_WAIT = 1.0      # how long a file hint waits to be taken before it counts as pending
 HOOK_TIMEOUT = 86400  # Claude's asyncRewake listener lifetime, in seconds
+CLAUDE_BUSY_TTL = 300  # an Esc interrupt fires no hook: a Claude busy this old no longer counts
 _SOCKET_MAX = 100     # AF_UNIX paths stop at 107 bytes on Linux, 103 on macOS
 
 
@@ -70,9 +71,11 @@ def prepare(wolts_dir: str | Path, session: str, harness: str | None, attempt: s
         command = [sys.executable, str(ASSETS / "claude_rewake.py"), str(directory), attempt]
         hook = {"type": "command", "asyncRewake": True, "timeout": HOOK_TIMEOUT, "command": shlex.join(command)}
         busy = {"type": "command", "timeout": 10, "command": shlex.join([*command, "--busy"])}
+        idle = {"type": "command", "timeout": 10, "command": shlex.join([*command, "--idle"])}
         _write_private(directory / "settings.json", {"hooks": {
             "SessionStart": [{"hooks": [hook]}], "Stop": [{"hooks": [hook]}],
-            "UserPromptSubmit": [{"hooks": [busy]}]}})
+            "UserPromptSubmit": [{"hooks": [busy]}],
+            "StopFailure": [{"hooks": [idle]}]}})  # an API error ends a turn with no Stop
     return {"kind": kind, "addr": str(directory), "attempt": attempt}
 
 
@@ -94,12 +97,12 @@ def write_ready(directory: str | Path, data: dict, announce: str = "ready") -> b
     return True
 
 
-def write_state(directory: str | Path, busy: bool, pid: int | None = None) -> bool:
-    """The engine's own busy/idle; with `pid`, it only counts while that keeper lives."""
+def write_state(directory: str | Path, busy: bool, pid: int | None = None, ttl: float | None = None) -> bool:
+    """The engine's own busy/idle; with `pid`, it only counts while that keeper lives, with `ttl` only that long."""
     directory = Path(directory)
     if (directory / RETIRED).exists():
         return False
-    _write_private(directory / STATE, {"busy": busy, "since": time.time(), "pid": pid})
+    _write_private(directory / STATE, {"busy": busy, "since": time.time(), "pid": pid, "ttl": ttl})
     return True
 
 
@@ -109,8 +112,8 @@ def engine_state(directory: str | Path) -> str:
         state_ = json.loads((Path(directory) / STATE).read_text())
     except (OSError, ValueError):
         return "unknown"
-    pid = state_.get("pid")
-    if pid is not None and not _alive(pid):
+    pid, ttl = state_.get("pid"), state_.get("ttl")
+    if pid is not None and not _alive(pid) or ttl and time.time() - state_.get("since", 0) > ttl:
         return "unknown"
     return "busy" if state_.get("busy") is True else "idle"
 

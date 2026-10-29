@@ -92,12 +92,14 @@ def test_claude_settings_arm_an_async_rewake_listener_at_start_and_every_turn_en
     wolts, _ = lodge
     native = na.prepare(wolts, "pal-x", "claude", "a1")
     hooks = json.loads((Path(native["addr"]) / "settings.json").read_text())["hooks"]
-    assert sorted(hooks) == ["SessionStart", "Stop", "UserPromptSubmit"]
+    assert sorted(hooks) == ["SessionStart", "Stop", "StopFailure", "UserPromptSubmit"]
     for event in ("SessionStart", "Stop"):
         [hook] = hooks[event][0]["hooks"]
         assert hook["asyncRewake"] is True and hook["timeout"] == 86400
         assert hook["command"].endswith(f"claude_rewake.py {native['addr']} a1")
     [busy] = hooks["UserPromptSubmit"][0]["hooks"]  # synchronous: the turn waits for it
+    [idle] = hooks["StopFailure"][0]["hooks"]  # an API error's end: no Stop fires
+    assert "asyncRewake" not in idle and idle["command"].endswith(f"claude_rewake.py {native['addr']} a1 --idle")
     assert "asyncRewake" not in busy and busy["command"].endswith(f"claude_rewake.py {native['addr']} a1 --busy")
 
 
@@ -586,3 +588,45 @@ def test_a_session_start_never_overrides_the_opening_prompt_s_busy(lodge):
     assert na.is_busy(directory) and proc.poll() is None and (directory / "hint").exists()  # held until the turn ends
     (directory / "retired").touch()
     assert proc.wait(5) == 0
+
+
+def test_a_turn_ended_without_a_stop_clears_busy_once_and_announces_its_end(lodge):
+    wolts, _ = lodge
+    directory = Path(na.prepare(wolts, "pal-x", "claude", "a1")["addr"])
+    stand_in = Lodge()
+    try:
+        na.write_state(directory, True)  # interrupted (Esc) or failed mid-turn
+        first = _hook(directory, "StopFailure", "--idle", env=stand_in.env)
+        again = _hook(directory, "StopFailure", "--idle", env=stand_in.env)  # a repeat: already idle
+    finally:
+        stand_in.server.shutdown()
+    assert first.returncode == again.returncode == 0 and first.stdout == again.stdout == ""
+    assert na.engine_state(directory) == "idle"
+    assert [body.get("kind") for _, _, body in stand_in.seen] == ["turn_end"]
+
+
+def test_an_interrupted_claude_turn_frees_the_session_after_its_busy_ages_out(lodge, monkeypatch):
+    wolts, live = lodge
+    record = live("claude", ready={"armed_at": time.time()})
+    directory = Path(record["native"]["addr"])
+    stand_in = Lodge()
+    for key, value in stand_in.env.items():
+        monkeypatch.setenv(key, value)
+    try:
+        proc = _listener(directory)  # armed at the last completed turn's Stop
+        proc.stdin.write(json.dumps({"session_id": "s1", "hook_event_name": "Stop"}))
+        proc.stdin.close()
+        deadline = time.monotonic() + 5
+        while len(stand_in.seen) < 1 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        na.write_state(directory, True, ttl=1.5)  # the next turn, then Esc: no Stop, no StopFailure
+        assert na.deliver(record, HINT) == ("pending", "busy")
+        deadline = time.monotonic() + 6
+        while len(stand_in.seen) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert na.engine_state(directory) == "unknown" and not na.is_busy(directory)
+        assert [body.get("kind") for _, _, body in stand_in.seen] == ["turn_end", "turn_end"]  # the aged busy's end
+        assert na.deliver(record, HINT) == ("submitted", "claimed")  # the lodge's re-check: the live listener takes it
+        assert proc.wait(5) == 2
+    finally:
+        stand_in.server.shutdown()

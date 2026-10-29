@@ -56,27 +56,39 @@ _PENDING: dict[tuple[str, str], bool] = {}  # (root, wolt) -> another wake was a
 
 def notify_admitted(wolts_dir, status, prefer: dict | None = None) -> None:
     """Called after Store admission committed. Never raises. prefer: {"session", "chat"}, the
-    session the sender is talking to (tried first) and the chat its answer goes to; the
-    newest admission's preference replaces any earlier one."""
+    session the sender is talking to (tried first; the newest admission's wins) and the chat
+    this message's answer goes to."""
     try:
         if status.state != "acknowledged" and inbox.enabled(wolts_dir):
-            if prefer:
-                _prefer(str(wolts_dir), status.to, prefer)
+            _admitted(str(wolts_dir), status, prefer or {})
             _schedule(str(wolts_dir), status.to)
     except Exception:
         log.exception("inbox wake not scheduled")
 
 
-def _prefer(root: str, wolt: str, prefer: dict) -> None:
+def _admitted(root: str, status, prefer: dict) -> None:
+    """The wake state learns of an admission: the preferred session, this message's chat, and,
+    on a mailbox's first admission since accounting began, the answered baseline (just below
+    this message and any still queued: older mail is never answered again)."""
     try:
-        with lifecycle.agent_lock(root, wolt):
-            store = inbox.Store(root, inbox.LIMITS)
-            facts = store.wake_facts(wolt)
-            if facts:
-                store.set_wake(wolt, {**facts["wake"], "prefer": {
-                    "session": prefer.get("session"), "chat": prefer.get("chat"), "at": int(time.time())}})
+        store = inbox.Store(root, inbox.LIMITS)
+        facts = store.wake_facts(status.to)
+        if not facts or (not prefer and "answered" in facts["wake"]):
+            return
+        with lifecycle.agent_lock(root, status.to):
+            facts = store.wake_facts(status.to)
+            if not facts:
+                return
+            wake = dict(facts["wake"])
+            if "answered" not in wake:  # unanswered is the queued mail here
+                wake["answered"] = min([status.seq] + [m["seq"] for m in facts["unanswered"]]) - 1
+            if prefer.get("session"):
+                wake["prefer"] = {"session": prefer["session"], "at": int(time.time())}
+            if prefer.get("chat"):
+                wake["chats"] = {**wake.get("chats", {}), str(status.seq): prefer["chat"]}
+            store.set_wake(status.to, wake)
     except Exception:  # the wake still runs, on the usual rule and the default channel
-        log.exception("inbox wake preference for %s not stored", wolt)
+        log.exception("inbox admission of %s not recorded for its wake", status.seq)
 
 
 def ready(wolts_dir, token: str, session: str, attempt: str) -> bool:
@@ -167,12 +179,14 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         if not facts or not facts["open"] or not facts["queued"]:
             taken = bool(facts and facts["unanswered"])  # a reader took them before any wake did
         else:
-            taken, prefer = False, facts["wake"].get("prefer") or {}
-            # the session the sender is talking to first, if it is live; else the newest live one
-            live = _live(registry, wolt, prefer.get("session")) or sessions.resolve_active_session(wolt, registry)
+            taken, prefer = False, (facts["wake"].get("prefer") or {}).get("session")
+            # the session the sender is talking to first, live or resumable; else the newest live one
+            live = _live(registry, wolt, prefer)
+            if not live and not _resumable(registry.get(prefer, wolt=wolt, check_alive=False) if prefer else None):
+                live = sessions.resolve_active_session(wolt, registry)
             # All mail brings the wolt up (the owner's rule): with no live session it resumes or
             # starts one; only an unresolved launch holds it (in _start). A live session is hinted.
-            how, what = (None, None) if live else _start(store, registry, wolt, facts, prefer.get("session"))
+            how, what = (None, None) if live else _start(store, registry, wolt, facts, prefer)
             if live:
                 record = registry.get(live, wolt=wolt, check_alive=False) or {}
                 hinted = {"session": live, "attempt": record.get("attempt")}
@@ -201,11 +215,17 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         return
     status, code = _deliver(record, HINT.format(nonce=uuid.uuid4().hex[:8]))
     log.info("inbox hint for %s via %s: %s (%s)", wolt, live, status, code)
-    reached = status == "submitted" or (status, code) == ("pending", "placed")  # only a hint that reached the engine
-    if status in ("submitted", "pending"):
-        _answer(root, wolt, "hinted", session=live, hinted=hinted if reached else None)
-    else:
+    if status == "submitted" or (status, code) == ("pending", "placed"):  # only a hint that reached the engine
+        _answer(root, wolt, "hinted", session=live, hinted=hinted)
+    elif status != "pending":
         _answer(root, wolt, "blocked", reason=f"hint_{status}")
+    # pending, not placed: a wait, unanswered; the hint of its ready pickup answers it
+
+
+def _resumable(record: dict | None) -> bool:
+    return bool(record and record.get("status") == "resting" and sessions.stored_resume_id(record)
+                and not record.get("wake_inhibit")  # a conversation the owner stopped is never auto-resumed
+                and not record.get("resume_failed"))  # nor one whose resume failed for certain
 
 
 def _live(registry, wolt: str, name: str | None) -> str | None:
@@ -222,14 +242,12 @@ def _start(store, registry, wolt: str, facts: dict, prefer: str | None) -> tuple
     records = registry.records(wolt=wolt)
     if any(r.get("launching") for r in records):
         return "blocked", "launch_unknown"  # an unresolved launch of this agent, whoever made it, may still start
-    if reserved:
+    resting = [r for r in records if _resumable(r)]
+    if reserved and prefer not in {r["name"] for r in resting}:  # the preferred one never waits
         record = registry.get(reserved["session"], wolt=wolt, check_alive=False) or {}
         if record.get("status") in ("running", sessions.STOPPING):
             return None, None  # still settling: kept as it is
     keep = _kept(wake)
-    resting = [r for r in records if r.get("status") == "resting" and sessions.stored_resume_id(r)
-               and not r.get("wake_inhibit")  # a conversation the owner stopped is never auto-resumed
-               and not r.get("resume_failed")]  # nor one whose resume failed for certain
     if resting:  # its own conversation, in its own mode: resumed after the lock, without a prompt
         name = (prefer if prefer in {r["name"] for r in resting}
                 else max(resting, key=lambda r: r.get("last_activity") or 0)["name"])
@@ -260,15 +278,16 @@ def _judge_failed_resume(root, registry, wolt: str, name: str) -> None:
 
 
 def _kept(wake: dict) -> dict:
-    """What a reset of the wake state keeps: the answered mail, its outcomes, the preference."""
-    return {k: wake[k] for k in ("answered", "outcomes", "prefer") if k in wake}
+    """What a reset of the wake state keeps: the answered mail, its outcomes, the preference
+    and the chats of the mail not answered yet."""
+    return {k: wake[k] for k in ("answered", "outcomes", "prefer", "chats") if k in wake}
 
 
 def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=None, hinted=None) -> None:
     """Every message no wake answered yet is answered now (one a reader already took: "hinted"
     to that reader's session) and recorded in the wake state's outcomes, under the lock; then
     the owner gets exactly one line per human message (inbox_notice.outcome), never retried,
-    on the chat of the stored preference, which goes with it. how None: only those a reader
+    each on the chat it came from. how None: only those a reader
     already took. hinted: also record the hint this attempt had. Never raises."""
     try:
         store = inbox.Store(root, inbox.LIMITS)
@@ -278,20 +297,21 @@ def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=Non
                 return
             wake = {**facts["wake"], **({"hinted": hinted} if hinted else {})}
             mail = facts["unanswered"] if how else list(itertools.takewhile(lambda m: m["session"], facts["unanswered"]))
-            chat = (wake.get("prefer") or {}).get("chat")
+            chats = dict(wake.get("chats", {}))
             done = [("hinted", m["session"], None) if m["session"] else (how, session, reason) for m in mail]
             if mail:
                 wake["answered"] = mail[-1]["seq"]
                 wake.pop("prefer", None)
+                wake["chats"] = {k: v for k, v in chats.items() if int(k) > mail[-1]["seq"]}
                 wake["outcomes"] = (wake.get("outcomes", []) + [  # the last OUTCOMES, for a sender who waits
                     {"seq": m["seq"], "how": h, **({"session": s} if s else {"reason": r})}
                     for m, (h, s, r) in zip(mail, done)])[-OUTCOMES:]
             if mail or hinted:
                 store.set_wake(wolt, wake)
-        human = [(m["seq"], d) for m, d in zip(mail, done) if m["human"]]
+        human = [(m["seq"], (*d, chats.get(str(m["seq"])))) for m, d in zip(mail, done) if m["human"]]
         if human:
             import inbox_notice
-            for (h, sess, r), group in itertools.groupby(human, lambda pair: pair[1]):
+            for (h, sess, r, chat), group in itertools.groupby(human, lambda pair: pair[1]):
                 inbox_notice.outcome(root, wolt, seqs=[seq for seq, _ in group], how=h, session=sess,
                                      reason=r, chat=chat)
     except Exception:

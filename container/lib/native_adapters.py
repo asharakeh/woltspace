@@ -71,11 +71,10 @@ def prepare(wolts_dir: str | Path, session: str, harness: str | None, attempt: s
         command = [sys.executable, str(ASSETS / "claude_rewake.py"), str(directory), attempt]
         hook = {"type": "command", "asyncRewake": True, "timeout": HOOK_TIMEOUT, "command": shlex.join(command)}
         busy = {"type": "command", "timeout": 10, "command": shlex.join([*command, "--busy"])}
-        idle = {"type": "command", "timeout": 10, "command": shlex.join([*command, "--idle"])}
         _write_private(directory / "settings.json", {"hooks": {
             "SessionStart": [{"hooks": [hook]}], "Stop": [{"hooks": [hook]}],
             "UserPromptSubmit": [{"hooks": [busy]}],
-            "StopFailure": [{"hooks": [idle]}]}})  # an API error ends a turn with no Stop
+            "StopFailure": [{"hooks": [hook]}]}})  # an API error ends a turn with no Stop: arm as a Stop does
     return {"kind": kind, "addr": str(directory), "attempt": attempt}
 
 
@@ -191,6 +190,8 @@ def state(record: dict) -> tuple[str, str, dict | None]:
         return "unavailable", "other_conversation", None
     if native["kind"] == KINDS["claude"] and time.time() > ready.get("armed_at", 0) + HOOK_TIMEOUT:
         return "pending", "listener_expired", ready
+    if native["kind"] == KINDS["claude"] and ready.get("pid") and not _alive(ready["pid"]):
+        return "pending", "listener_gone", None  # it claimed a hint, and no turn end armed another: wait, place nothing
     return "ready", "ready", ready
 
 

@@ -23,19 +23,16 @@ event = json.load(sys.stdin)
 if sys.argv[3:] == ["--busy"]:  # a human turn starts
     write_state(directory, True, ttl=CLAUDE_BUSY_TTL)
     sys.exit(0)
-if sys.argv[3:] == ["--idle"]:  # a turn that ended without a Stop: clear busy once, as its end would
-    if is_busy(directory) and write_state(directory, False):
-        announce_ready(attempt, "turn_end")
-    sys.exit(0)
 me, parent, armed = str(os.getpid()), os.getppid(), time.time()
 (directory / f".{LISTENER}.{me}").write_text(me)
 os.replace(directory / f".{LISTENER}.{me}", directory / LISTENER)  # supersede first: the old one stays gated
-if event.get("hook_event_name") == "Stop":  # a hint from before this turn (none is placed while busy): the
+ended = event.get("hook_event_name") in ("Stop", "StopFailure")  # StopFailure: a turn ended on an API error
+if ended:  # a hint from before this turn (none is placed while busy): the
     (directory / HINT).unlink(missing_ok=True)  # turn_end wake below hints again if mail is still queued
     write_state(directory, False)  # only a turn's end says idle: a start may already run its opening prompt
 if not write_ready(directory, {"kind": KINDS["claude"], "attempt": attempt, "pid": int(me), "armed_at": armed,
                                "session_id": event.get("session_id")},
-                   announce="turn_end" if event.get("hook_event_name") == "Stop" else "ready"):
+                   announce="turn_end" if ended else "ready"):
     sys.exit(0)
 waited = False
 while time.time() < armed + HOOK_TIMEOUT - 60:  # leave before Claude's own timeout ends us

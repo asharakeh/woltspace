@@ -16,8 +16,8 @@ lifecycle lock, never the caller's seq or state:
   the fixed fetch instruction (auto policy only). The owner's explicit stop or
   archive of any of the agent's sessions, whoever started it, marks that record
   (wake_inhibit) and inhibits the wake until rearm clears the marks it sees; so does a reserved session that ended without a first ack
-  ("no_progress"). New mail never clears an inhibition. A reserved session
-  whose launch is unresolved stays unknown.
+  ("no_progress"). New mail never clears an inhibition. While any launch of
+  the agent is unresolved, whoever made it, nothing starts and rearm refuses.
 
 Inbox off: notify_admitted does nothing.
 """
@@ -60,19 +60,17 @@ def reconcile(wolts_dir) -> None:
 
 
 def rearm(wolts_dir, wolt: str) -> dict:
-    """The operator's explicit clear of an inhibited wake. Refused while the
-    reserved session's launch is unresolved; mail and policy are re-checked by
-    the wake it schedules."""
+    """The operator's explicit clear of an inhibited wake. Refused while any of
+    the agent's launches is unresolved; mail and policy are re-checked by the
+    wake it schedules."""
     with lifecycle.agent_lock(wolts_dir, wolt):
         store = inbox.Store(wolts_dir, inbox.LIMITS)
         facts = store.wake_facts(wolt)
         if facts is None:
             raise inbox.Refused("no_mailbox")
-        reserved = facts["wake"].get("reserved") or {}
-        record = sessions.SessionRegistry(wolts_dir).get(
-            reserved.get("session", ""), wolt=wolt, check_alive=False)
-        sessions.refuse_unresolved(record)
         registry = sessions.SessionRegistry(wolts_dir)
+        for record in registry.records(wolt=wolt):  # any unresolved launch of the agent refuses it
+            sessions.refuse_unresolved(record)
         for stopped in registry.records(wolt=wolt):  # exactly the stops seen now; a later one counts
             if stopped.get("wake_inhibit"):
                 with registry.edit(stopped["name"], wolt=wolt) as current:
@@ -131,13 +129,16 @@ def _start(store, registry, wolt: str, facts: dict) -> None:
     """No live session: respect an explicit stop, judge the earlier reservation,
     then reserve and start one."""
     wake, reserved = facts["wake"], facts["wake"].get("reserved")
-    if any(r.get("wake_inhibit") for r in registry.records(wolt=wolt)):  # an owner's stop
+    records = registry.records(wolt=wolt)
+    if any(r.get("launching") for r in records):
+        return  # an unresolved launch of this agent, whoever made it, may still start: unknown
+    if any(r.get("wake_inhibit") for r in records):  # an owner's stop
         store.set_wake(wolt, {**wake, "inhibited": "stopped"})
         return
     if reserved:
         record = registry.get(reserved["session"], wolt=wolt, check_alive=False) or {}
-        if record.get("launching") or record.get("status") in ("running", sessions.STOPPING):
-            return  # unresolved or still settling: unknown, kept as it is
+        if record.get("status") in ("running", sessions.STOPPING):
+            return  # still settling: kept as it is
         if facts["acks"] <= reserved.get("acks", 0):
             store.set_wake(wolt, {**wake, "inhibited": "no_progress"})
             return

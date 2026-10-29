@@ -352,3 +352,10 @@ def test_boot_reconcile_wakes_every_agent_with_queued_mail(lodge, monkeypatch):
     mail(lodge, "k2", "nunu")
     inbox_wake.reconcile(lodge.root)
     assert sorted(woken) == ["nunu", "pal"]
+
+
+def test_rearm_is_refused_while_any_launch_of_the_agent_is_unresolved(lodge, unresolved):
+    mail(lodge)
+    with pytest.raises(lifecycle.LifecycleUnknown):
+        inbox_wake.rearm(lodge.root, "pal")
+    assert record(lodge, unresolved)["launching"]

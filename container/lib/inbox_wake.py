@@ -10,13 +10,15 @@ one wake. A wake re-reads the agent's real mailbox and sessions under its
 lifecycle lock, never the caller's seq or state:
 
 - nothing queued, the mailbox not open, or the wake inhibited: nothing.
-- a live session: a fixed, body-free hint through its native input, sent after
+- a live session: a body-free hint naming the senders, through its native input, sent after
   the lock is released (native_adapters.deliver), even while the wake is
   inhibited: an inhibition only ever stops a start. submitted, pending, unknown,
   unavailable and failed are transport facts; none changes custody, and none
-  is retried here. Mail waits for the agent's own fetch and ack. A busy engine (its
-  deliver says pending/busy) gets no hint: the owner hears it is busy, and the end of
-  its turn (ready kind=turn_end) is a wake that hints once if mail is still queued.
+  is retried here. Mail waits for the agent's own fetch and ack. A busy Claude or
+  Codex engine gets the hint inside its running turn (a tool step's hook, a steer);
+  any other busy engine (deliver says pending/busy) gets none: the owner hears it is
+  busy. Either way the end of its turn (ready kind=turn_end) is a wake that hints
+  once if mail is still queued.
 - no live session: all mail brings the wolt up (the owner's rule). The wolt's
   newest resting session is resumed without a prompt (the post-publication pickup
   and its backend's ready call hint it); with none, one fresh session, reserved
@@ -47,15 +49,16 @@ import lifecycle
 import sessions
 
 log = logging.getLogger("inbox_wake")
-START = ("You have lodge inbox mail. Fetch your inbox (`woltspace inbox fetch`). ACK each message once "
+START = ("You have lodge inbox mail{sender}. Fetch your inbox (`woltspace inbox fetch`). ACK each message once "
          "received into your context (`woltspace inbox ack <seq> <claim>`); ACK confirms receipt, not task "
          "completion. Release a claim if you cannot accept it (`woltspace inbox release <seq> <claim>`). "
          "Fetch again for the next message, until fetch returns nothing.")
-HINT = ("New inbox mail. Fetch your inbox (`woltspace inbox fetch`). ACK each message once received into "
+HINT = ("New inbox mail{sender}. Fetch your inbox (`woltspace inbox fetch`). ACK each message once received into "
         "your context (`woltspace inbox ack <seq> <claim>`); ACK confirms receipt, not task completion. "
         "Release a claim if you cannot accept it (`woltspace inbox release <seq> <claim>`). Fetch again "
         "for the next message (nonce {nonce}).")
 BUSY_RETRIES, BUSY_PAUSE = 5, 2.0
+SENDERS = 3  # names in a hint; more are counted
 OUTCOMES = 50  # per-message outcomes kept in the wake state
 _GUARD = threading.Lock()
 _PENDING: dict[tuple[str, str], bool] = {}  # (root, wolt) -> another wake was asked for meanwhile
@@ -198,7 +201,7 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         elif how:
             _answer(root, wolt, how, session=what)
         return
-    status, code = _deliver(record, HINT.format(nonce=uuid.uuid4().hex[:8]))
+    status, code = _deliver(record, HINT.format(sender=_sender(facts), nonce=uuid.uuid4().hex[:8]))
     log.info("inbox hint for %s via %s: %s (%s)", wolt, live, status, code)
     if status == "submitted" or (status, code) == ("pending", "placed"):  # only a hint that reached the engine
         _answer(root, wolt, "hinted", session=live, hinted=hinted)
@@ -207,6 +210,13 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
     elif status != "pending":
         _answer(root, wolt, "blocked", reason=f"hint_{status}")
     # pending, not placed: a wait, unanswered; the hint of its ready pickup answers it
+
+
+def _sender(facts: dict) -> str:
+    """" from pal-a, your human": who the queued mail is from, never what it says."""
+    names = facts.get("senders") or []
+    more = f" and {len(names) - SENDERS} more" if len(names) > SENDERS else ""
+    return f" from {', '.join(names[:SENDERS])}{more}" if names else ""
 
 
 def _resumable(record: dict | None) -> bool:
@@ -247,7 +257,7 @@ def _start(store, registry, wolt: str, facts: dict, prefer: str | None) -> tuple
     owner = [chats[str(m["seq"])] for m in facts["unanswered"] if m["human"] and chats.get(str(m["seq"]))]
     routing = _routing(store.root, owner[-1]) if owner else None
     try:  # any mail starts the wolt in its own recorded mode, as Telegram did before the inbox
-        sessions.start_session(wolt=wolt, prompt=START, name=name, **({"routing": routing} if routing else {}))
+        sessions.start_session(wolt=wolt, prompt=START.format(sender=_sender(facts)), name=name, **({"routing": routing} if routing else {}))
     except (PermissionError, ValueError, sessions.HarnessNotInstalled) as exc:
         return "blocked", _inhibit(store, wolt, {**keep, "detail": str(exc)[:200]}, "not_startable")
     return "started", name

@@ -92,7 +92,7 @@ def test_claude_settings_arm_an_async_rewake_listener_at_start_and_every_turn_en
     wolts, _ = lodge
     native = na.prepare(wolts, "pal-x", "claude", "a1")
     hooks = json.loads((Path(native["addr"]) / "settings.json").read_text())["hooks"]
-    assert sorted(hooks) == ["SessionStart", "Stop", "StopFailure", "UserPromptSubmit"]
+    assert sorted(hooks) == ["PostToolUse", "SessionStart", "Stop", "StopFailure", "UserPromptSubmit"]
     for event in ("SessionStart", "Stop"):
         [hook] = hooks[event][0]["hooks"]
         assert hook["asyncRewake"] is True and hook["timeout"] == 86400
@@ -100,6 +100,8 @@ def test_claude_settings_arm_an_async_rewake_listener_at_start_and_every_turn_en
     [busy] = hooks["UserPromptSubmit"][0]["hooks"]  # synchronous: the turn waits for it
     assert hooks["StopFailure"] == hooks["Stop"]  # an API error's end arms the same listener a Stop does
     assert "asyncRewake" not in busy and busy["command"].endswith(f"claude_rewake.py {native['addr']} a1 --busy")
+    [tool] = hooks["PostToolUse"][0]["hooks"]  # synchronous: its output joins the running turn
+    assert "asyncRewake" not in tool and tool["command"].endswith(f"claude_rewake.py {native['addr']} a1 --tool")
 
 
 @pytest.mark.parametrize("change, expected", [
@@ -419,13 +421,16 @@ class Lodge:
 
 @pytest.mark.parametrize("harness, ready", [("claude", {"armed_at": time.time()}),
                                             ("codex", {"sock": "/x/app.sock", "thread": "t1"})])
-def test_a_busy_engine_gets_nothing_now_and_a_dead_watcher_never_holds_hints(lodge, harness, ready):
+def test_a_busy_engine_gets_its_hint_mid_turn_and_a_dead_watcher_never_holds_hints(lodge, harness, ready):
     _, live = lodge
     record = live(harness, ready=ready)
     directory = Path(record["native"]["addr"])
-    na.write_state(directory, True)
-    assert na.deliver(record, HINT) == ("pending", "busy")
-    assert not (directory / "hint").exists()
+    na.write_state(directory, True)  # codex: no running turn known yet, so nothing to steer into
+    if harness == "claude":  # left for its next tool step's hook
+        assert na.deliver(record, HINT) == ("pending", "placed") and (directory / "hint").exists()
+        (directory / "hint").unlink()
+    else:
+        assert na.deliver(record, HINT) == ("pending", "busy") and not (directory / "hint").exists()
     gone = subprocess.Popen(["true"])
     gone.wait()
     na.write_state(directory, True, gone.pid)  # its keeper is gone: unknown, never idle
@@ -653,15 +658,10 @@ def test_an_interrupted_claude_turn_frees_the_session_after_its_busy_ages_out(lo
         deadline = time.monotonic() + 5
         while len(stand_in.seen) < 1 and time.monotonic() < deadline:
             time.sleep(0.05)
-        na.write_state(directory, True, ttl=1.5)  # the next turn, then Esc: no Stop, no StopFailure
-        assert na.deliver(record, HINT) == ("pending", "busy")
-        deadline = time.monotonic() + 6
-        while len(stand_in.seen) < 2 and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert na.engine_state(directory) == "unknown" and not na.is_busy(directory)
+        na.write_state(directory, True, ttl=1.5)  # the next turn, then Esc: no Stop, no StopFailure, no tool step
+        assert na.deliver(record, HINT) == ("pending", "placed")  # left for a tool step that never comes
+        assert proc.wait(8) == 2 and proc.stderr.read().strip() == HINT  # the aged busy's end: the listener takes it
         assert [body.get("kind") for _, _, body in stand_in.seen] == ["turn_end", "turn_end"]  # the aged busy's end
-        assert na.deliver(record, HINT) == ("submitted", "claimed")  # the lodge's re-check: the live listener takes it
-        assert proc.wait(5) == 2
     finally:
         stand_in.server.shutdown()
 
@@ -675,11 +675,52 @@ def test_with_no_live_claude_listener_nothing_is_placed(lodge):
     assert not (Path(record["native"]["addr"]) / "hint").exists()
 
 
-def test_a_busy_hint_turn_with_an_exited_listener_stays_busy(lodge):
+def test_a_busy_hint_turn_with_an_exited_listener_gets_the_next_hint_at_a_tool_step(lodge):
     _, live = lodge
     gone = subprocess.Popen(["true"])
     gone.wait()
     record = live("claude", ready={"armed_at": time.time(), "pid": gone.pid})
-    na.write_state(record["native"]["addr"], True, ttl=na.CLAUDE_BUSY_TTL)
-    assert na.deliver(record, HINT) == ("pending", "busy")
-    assert not (Path(record["native"]["addr"]) / "hint").exists()
+    directory = Path(record["native"]["addr"])
+    na.write_state(directory, True, ttl=na.CLAUDE_BUSY_TTL)
+    assert na.deliver(record, HINT) == ("pending", "placed")
+    tool = _hook(directory, "PostToolUse", "--tool")
+    assert tool.returncode == 0 and not (directory / "hint").exists()
+    assert json.loads(tool.stdout) == {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": HINT}}
+    again = _hook(directory, "PostToolUse", "--tool")  # nothing placed: a tool step adds nothing
+    assert again.returncode == 0 and again.stdout == ""
+
+
+def test_a_busy_codex_turn_is_steered_with_the_hint_and_a_refused_steer_waits_for_the_turn_end(lodge):
+    from websockets.sync.server import unix_serve
+    _, live = lodge
+    record = live("codex", ready={"thread": "t1"})
+    directory = Path(record["native"]["addr"])
+    sock = str(directory / "app.sock")
+    na.write_ready(directory, {"kind": record["native"]["kind"], "attempt": "a1", "sock": sock, "thread": "t1"})
+    na.write_state(directory, True)
+    steers, refuse, status = [], [], ["inProgress"]
+
+    def app_server(conn):
+        for raw in conn:
+            message = json.loads(raw)
+            if message.get("method") == "thread/turns/list":
+                assert message["params"] == {"threadId": "t1", "limit": 1, "itemsView": "notLoaded"}
+                conn.send(json.dumps({"id": message["id"], "result": {"data": [{"id": "turn-7", "status": status[0]}]}}))
+            elif message.get("method") == "turn/steer":
+                steers.append(message["params"])
+                conn.send(json.dumps({"id": message["id"], **({"error": {"code": -1, "message": "not active"}}
+                                                              if refuse else {"result": {"turnId": "turn-7"}})}))
+            elif "id" in message:
+                conn.send(json.dumps({"id": message["id"], "result": {}}))
+    with unix_serve(app_server, sock) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            assert na.deliver(record, HINT) == ("submitted", "steered")
+            refuse.append(True)  # the turn ends between the read and the steer
+            assert na.deliver(record, HINT) == ("pending", "busy")
+            status[0] = "completed"  # already over when read: nothing is steered
+            assert na.deliver(record, HINT) == ("pending", "busy")
+        finally:
+            server.shutdown()
+    assert steers[0] == {"threadId": "t1", "expectedTurnId": "turn-7", "input": [{"type": "text", "text": HINT}]}
+    assert len(steers) == 2

@@ -4,9 +4,11 @@ Claude runs this in the background at session start and after every turn. The
 newest listener records itself as the attempt's ready data, waits for the
 hint file, claims it with one rename and exits 2: Claude then wakes the model
 with stderr as a system notification. With `--busy` it is the UserPromptSubmit
-hook: a turn running marks the attempt busy, and no hint is claimed until the
-Stop listener clears it. A newer listener, a retired attempt or a gone parent
-ends an older one quietly (exit 0). Never reads mail.
+hook: a turn running marks the attempt busy, and the listener claims no hint until
+the Stop clears it. With `--tool` it is the PostToolUse hook: a hint placed during
+the turn is handed to the model as added context after its next tool step. A
+newer listener, a retired attempt or a gone parent ends an older one quietly
+(exit 0). Never reads mail.
 """
 import json
 import os
@@ -23,12 +25,22 @@ event = json.load(sys.stdin)
 if sys.argv[3:] == ["--busy"]:  # a human turn starts
     write_state(directory, True, ttl=CLAUDE_BUSY_TTL)
     sys.exit(0)
+if sys.argv[3:] == ["--tool"]:  # PostToolUse: a hint placed while the turn runs joins it as context, no new turn
+    claimed = directory / f".claimed.tool.{os.getpid()}"
+    try:
+        os.rename(directory / HINT, claimed)
+    except FileNotFoundError:
+        sys.exit(0)
+    text = claimed.read_text().strip()
+    claimed.unlink()
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}))
+    sys.exit(0)
 me, parent, armed = str(os.getpid()), os.getppid(), time.time()
 (directory / f".{LISTENER}.{me}").write_text(me)
 os.replace(directory / f".{LISTENER}.{me}", directory / LISTENER)  # supersede first: the old one stays gated
 ended = event.get("hook_event_name") in ("Stop", "StopFailure")  # StopFailure: a turn ended on an API error
-if ended:  # a hint from before this turn (none is placed while busy): the
-    (directory / HINT).unlink(missing_ok=True)  # turn_end wake below hints again if mail is still queued
+if ended:  # a hint no tool step of this turn took: the turn_end
+    (directory / HINT).unlink(missing_ok=True)  # wake below hints again if mail is still queued
     write_state(directory, False)  # only a turn's end says idle: a start may already run its opening prompt
 if not write_ready(directory, {"kind": KINDS["claude"], "attempt": attempt, "pid": int(me), "armed_at": armed,
                                "session_id": event.get("session_id")},

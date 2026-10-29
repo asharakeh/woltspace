@@ -102,7 +102,8 @@ def plan_hermes(argv: list[str], directory: Path, attempt: str, python: str) -> 
             "tui_env": {"HERMES_TUI_GATEWAY_URL": f"ws://127.0.0.1:{port}/ws"}, "port": port}
 
 
-def _codex_rpc(sock: str, calls: list[tuple[str, dict]]) -> list[dict]:
+def _codex_rpc(sock: str, calls: list[tuple[str, dict]], strict: bool = False) -> list[dict]:
+    """strict: an error reply raises instead of reading as an empty result."""
     from websockets.sync.client import unix_connect
     with unix_connect(sock, "ws://localhost/", open_timeout=5) as conn:
         out, n = [], 0
@@ -113,6 +114,8 @@ def _codex_rpc(sock: str, calls: list[tuple[str, dict]]) -> list[dict]:
                 pass
             if n == 1:
                 conn.send(json.dumps({"method": "initialized"}))
+            elif strict and "error" in reply:
+                raise RuntimeError(f"{method}: {reply['error'].get('message', '')[:200]}")
             else:
                 out.append(reply.get("result") or {})
         return out

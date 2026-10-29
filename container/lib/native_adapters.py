@@ -71,9 +71,10 @@ def prepare(wolts_dir: str | Path, session: str, harness: str | None, attempt: s
         command = [sys.executable, str(ASSETS / "claude_rewake.py"), str(directory), attempt]
         hook = {"type": "command", "asyncRewake": True, "timeout": HOOK_TIMEOUT, "command": shlex.join(command)}
         busy = {"type": "command", "timeout": 10, "command": shlex.join([*command, "--busy"])}
+        tool = {"type": "command", "timeout": 10, "command": shlex.join([*command, "--tool"])}
         _write_private(directory / "settings.json", {"hooks": {
             "SessionStart": [{"hooks": [hook]}], "Stop": [{"hooks": [hook]}],
-            "UserPromptSubmit": [{"hooks": [busy]}],
+            "UserPromptSubmit": [{"hooks": [busy]}], "PostToolUse": [{"hooks": [tool]}],
             "StopFailure": [{"hooks": [hook]}]}})  # an API error ends a turn with no Stop: arm as a Stop does
     return {"kind": kind, "addr": str(directory), "attempt": attempt}
 
@@ -209,7 +210,11 @@ def deliver(record: dict, hint: str) -> tuple[str, str]:
             return status, code
         native = record["native"]
         engine = engine_state(native["addr"]) if native["kind"] in (KINDS["claude"], KINDS["codex"]) else "idle"
-        if engine == "busy":
+        if engine == "busy":  # inside the running turn where the engine allows it; never typed into its input
+            if native["kind"] == KINDS["claude"]:
+                return _drop(Path(native["addr"]), hint, deadline)  # its next tool step's hook shows it
+            if native["kind"] == KINDS["codex"]:
+                return _steer(ready, hint)
             return "pending", "busy"  # nothing placed: the turn_end announce brings the wake back
         if engine == "unknown" and native["kind"] == KINDS["codex"]:  # not yet (or no longer) observed
             return "pending", "not_ready"
@@ -246,6 +251,24 @@ def _codex(ready: dict, hint: str, deadline: float) -> tuple[str, str]:
     except subprocess.TimeoutExpired:
         return "unknown", "timeout"
     return ("submitted", "queued") if done.returncode == 0 else ("failed", f"rc{done.returncode}")
+
+
+def _steer(ready: dict, hint: str) -> tuple[str, str]:
+    """turn/steer into the thread's running turn, on the session's own app-server. Its newest turn
+    is read first (no items): only one still in progress is steered. None, or a steer the turn
+    refuses (it just ended): pending/busy, so the turn's end hints instead."""
+    from native.launch import _codex_rpc
+    try:
+        [turns] = _codex_rpc(ready["sock"], [("thread/turns/list", {"threadId": ready["thread"], "limit": 1,
+                                                                    "itemsView": "notLoaded"})], strict=True)
+        newest = (turns.get("data") or [{}])[0]
+        if newest.get("status") != "inProgress" or not newest.get("id"):
+            return "pending", "busy"
+        _codex_rpc(ready["sock"], [("turn/steer", {"threadId": ready["thread"], "expectedTurnId": newest["id"],
+                                                   "input": [{"type": "text", "text": hint}]})], strict=True)
+    except Exception:
+        return "pending", "busy"
+    return "submitted", "steered"
 
 
 def _opencode(ready: dict, hint: str, deadline: float) -> tuple[str, str]:

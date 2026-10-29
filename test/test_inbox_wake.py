@@ -628,7 +628,7 @@ def test_an_owners_stop_still_blocks_a_resume_and_a_start(lodge, resting, monkey
 
 @pytest.mark.parametrize("failure", [sessions.ResumeFailed("no agent came up"), subprocess.TimeoutExpired("tmux", 10)])
 def test_a_failed_or_unknown_resume_never_falls_back_to_a_new_session(lodge, resting, monkeypatch, failure):
-    def resume(name, prompt=""):
+    def resume(name, prompt="", **kw):
         raise failure
     monkeypatch.setattr(sessions, "resume_session", resume)
     monkeypatch.setattr(sessions, "start_session", lambda **kw: pytest.fail("a second worker after a failed resume"))
@@ -638,3 +638,18 @@ def test_a_failed_or_unknown_resume_never_falls_back_to_a_new_session(lodge, res
     mail(lodge, "k2", human=False)
     inbox_wake._wake(str(lodge.root), "pal")  # still no new session: no_progress per the existing rule
     assert wake_state(lodge)["inhibited"] == "no_progress"
+
+
+
+@pytest.mark.parametrize("ending", ["stopped", "archived"])
+def test_an_owners_stop_in_the_gap_before_the_relaunch_is_never_revived(lodge, resting, monkeypatch, ending):
+    real = sessions.resume_session
+
+    def stop_first(name, prompt="", **kw):  # the owner's stop lands after the wake chose the session
+        lodge.registry.update(name, status=ending, wake_inhibit=True)
+        return real(name, prompt, **kw)
+    monkeypatch.setattr(sessions, "resume_session", stop_first)
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert resting.spawned == [] and record(lodge, "pal-rest")["status"] == ending
+    assert "launching" not in record(lodge, "pal-rest")

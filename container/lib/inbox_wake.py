@@ -159,7 +159,9 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
                 return
     if resume:  # outside the lock: resume relaunches under its own lock and waits after it
         try:
-            sessions.resume_session(resume, "")  # no prompt: nothing is pasted; the pickup hints
+            # no prompt: nothing is pasted; the pickup hints. only_resting: an owner's stop or
+            # archive that landed after the choice wins at the relaunch itself
+            sessions.resume_session(resume, "", only_resting=True)
         except Exception as exc:  # the reservation lets the next wake judge it
             log.warning("inbox wake could not resume %s: %s", resume, exc)
     if not live:

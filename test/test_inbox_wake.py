@@ -801,3 +801,26 @@ def test_a_resume_that_fails_is_the_owners_error_line(lodge, resting, notices, m
     mail(lodge)
     inbox_wake._wake(str(lodge.root), "pal")
     assert notices.lines == [("error", seqs(lodge), "resume_failed", None)]
+
+
+def test_every_message_an_agents_too_gets_its_outcome_recorded_in_a_bounded_ring(lodge, wake, notices, monkeypatch):
+    monkeypatch.setattr(inbox_wake, "OUTCOMES", 3)
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)  # rearm's wake: not raced here
+    mail(lodge, "a1", human=False)
+    mail(lodge, "k1")
+    inbox_wake._wake(str(lodge.root), "pal")
+    (kw, _), = wake.starts
+    a1, k1 = [seq for seq, in rows(lodge.root, "SELECT seq FROM inbox_messages ORDER BY seq")]
+    assert wake_state(lodge)["outcomes"] == [{"seq": a1, "how": "started", "session": kw["name"]},
+                                             {"seq": k1, "how": "started", "session": kw["name"]}]
+    assert notices.lines == [("started", [k1], kw["name"], None)]  # the owner's line: human mail only
+    mail(lodge, "a2", human=False)
+    mail(lodge, "a3", human=False)
+    sys.modules["native_adapters"].deliver = lambda record_, hint: ("failed", "OSError")
+    wake.live = kw["name"]
+    inbox_wake._wake(str(lodge.root), "pal")
+    ring = wake_state(lodge)["outcomes"]
+    assert [e["seq"] for e in ring] == [k1, k1 + 1, k1 + 2]  # the oldest dropped
+    assert ring[-1] == {"seq": k1 + 2, "how": "blocked", "reason": "hint_failed"} and len(notices.lines) == 1
+    inbox_wake.rearm(lodge.root, "pal")
+    assert wake_state(lodge)["outcomes"] == ring

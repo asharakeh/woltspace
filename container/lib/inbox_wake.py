@@ -25,7 +25,8 @@ lifecycle lock, never the caller's seq or state:
 
 The owner gets exactly one line per human message, once a wake decides
 (inbox_notice.outcome): hinted, resumed or started, or blocked or error, a crashed
-wake included. "answered" in the wake state is the last human message answered.
+wake included. Every message, an agent's too, gets that outcome recorded in the wake
+state ("outcomes", the last 50); "answered" is the last message answered.
 
 Inbox off: notify_admitted does nothing.
 """
@@ -48,6 +49,7 @@ START = ("You have lodge inbox mail. Run `woltspace inbox fetch`, handle the mes
 HINT = ("New inbox mail: run `woltspace inbox fetch`, then `woltspace inbox ack <seq> <claim>` "
         "when handled (nonce {nonce}).")
 BUSY_RETRIES, BUSY_PAUSE = 5, 2.0
+OUTCOMES = 50  # per-message outcomes kept in the wake state
 _GUARD = threading.Lock()
 _PENDING: dict[tuple[str, str], bool] = {}  # (root, wolt) -> another wake was asked for meanwhile
 
@@ -258,16 +260,16 @@ def _judge_failed_resume(root, registry, wolt: str, name: str) -> None:
 
 
 def _kept(wake: dict) -> dict:
-    """What a reset of the wake state keeps: the owner's answered mail and the preference."""
-    return {k: wake[k] for k in ("answered", "prefer") if k in wake}
+    """What a reset of the wake state keeps: the answered mail, its outcomes, the preference."""
+    return {k: wake[k] for k in ("answered", "outcomes", "prefer") if k in wake}
 
 
 def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=None, hinted=None) -> None:
-    """The owner's one line per human message: every human message no wake answered yet is
-    answered now (one taken by a reader as "hinted" to that reader's session), marked under
-    the lock before inbox_notice.outcome is called, never retried, on the chat of the
-    stored preference, which goes with it. how None: only those a reader already took.
-    hinted: also record the hint this attempt had. Never raises."""
+    """Every message no wake answered yet is answered now (one a reader already took: "hinted"
+    to that reader's session) and recorded in the wake state's outcomes, under the lock; then
+    the owner gets exactly one line per human message (inbox_notice.outcome), never retried,
+    on the chat of the stored preference, which goes with it. how None: only those a reader
+    already took. hinted: also record the hint this attempt had. Never raises."""
     try:
         store = inbox.Store(root, inbox.LIMITS)
         with lifecycle.agent_lock(root, wolt):
@@ -277,19 +279,23 @@ def _answer(root, wolt: str, how: str | None = None, *, session=None, reason=Non
             wake = {**facts["wake"], **({"hinted": hinted} if hinted else {})}
             mail = facts["unanswered"] if how else list(itertools.takewhile(lambda m: m["session"], facts["unanswered"]))
             chat = (wake.get("prefer") or {}).get("chat")
+            done = [("hinted", m["session"], None) if m["session"] else (how, session, reason) for m in mail]
             if mail:
                 wake["answered"] = mail[-1]["seq"]
                 wake.pop("prefer", None)
+                wake["outcomes"] = (wake.get("outcomes", []) + [  # the last OUTCOMES, for a sender who waits
+                    {"seq": m["seq"], "how": h, **({"session": s} if s else {"reason": r})}
+                    for m, (h, s, r) in zip(mail, done)])[-OUTCOMES:]
             if mail or hinted:
                 store.set_wake(wolt, wake)
-        if mail:
+        human = [(m["seq"], d) for m, d in zip(mail, done) if m["human"]]
+        if human:
             import inbox_notice
-            key = lambda m: ("hinted", m["session"], None) if m["session"] else (how, session, reason)
-            for (h, sess, r), group in itertools.groupby(mail, key):
-                inbox_notice.outcome(root, wolt, seqs=[m["seq"] for m in group], how=h, session=sess,
+            for (h, sess, r), group in itertools.groupby(human, lambda pair: pair[1]):
+                inbox_notice.outcome(root, wolt, seqs=[seq for seq, _ in group], how=h, session=sess,
                                      reason=r, chat=chat)
     except Exception:
-        log.exception("inbox owner answer for %s failed", wolt)
+        log.exception("inbox answer for %s failed", wolt)
 
 
 def _failed(root, wolt: str, reason: str) -> None:

@@ -81,7 +81,7 @@ def plan_opencode(argv: list[str], directory: Path, cwd: str) -> dict:
 
 
 def plan_hermes(argv: list[str], directory: Path, attempt: str, python: str) -> dict:
-    """Our gateway on Hermes's own interpreter; `hermes chat` attaches through HERMES_TUI_GATEWAY_URL.
+    """Our gateway on Hermes's own interpreter; `hermes chat --tui` attaches through HERMES_TUI_GATEWAY_URL.
 
     The flags `hermes chat` would turn into its own gateway's env are given to
     this gateway instead, since that is where the agent runs.
@@ -94,8 +94,11 @@ def plan_hermes(argv: list[str], directory: Path, attempt: str, python: str) -> 
         env["HERMES_TUI_PROVIDER"] = env["HERMES_INFERENCE_PROVIDER"] = provider
     if "--yolo" in argv:
         env["HERMES_YOLO_MODE"] = "1"
+    tui = list(argv)
+    if "--tui" not in tui:  # only Hermes's own TUI attaches to a gateway; the classic REPL runs its agent in-process
+        tui.insert(1 if tui[:1] == ["chat"] else 0, "--tui")
     return {"backend": [python, str(ASSETS / "hermes_gateway.py"), str(port), str(directory), attempt],
-            "backend_env": env, "tui": ["hermes", *argv],
+            "backend_env": env, "tui": ["hermes", *tui],
             "tui_env": {"HERMES_TUI_GATEWAY_URL": f"ws://127.0.0.1:{port}/ws"}, "port": port}
 
 

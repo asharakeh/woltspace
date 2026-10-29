@@ -233,7 +233,7 @@ def test_hermes_plan_gives_the_gateway_the_flags_hermes_chat_would_give_its_own(
     assert plan["backend"] == ["/py", str(na.ASSETS / "hermes_gateway.py"), str(plan["port"]), str(tmp_path), "a1"]
     assert plan["backend_env"] == {"HERMES_MODEL": "a/b", "HERMES_INFERENCE_MODEL": "a/b", "HERMES_TUI_PROVIDER": "or",
                                    "HERMES_INFERENCE_PROVIDER": "or", "HERMES_YOLO_MODE": "1"}
-    assert plan["tui"] == ["hermes", "chat", "--resume", "r1", "--yolo", "--provider", "or", "-m", "a/b"]
+    assert plan["tui"] == ["hermes", "chat", "--tui", "--resume", "r1", "--yolo", "--provider", "or", "-m", "a/b"]
     assert plan["tui_env"] == {"HERMES_TUI_GATEWAY_URL": f"ws://127.0.0.1:{plan['port']}/ws"}
 
 
@@ -352,5 +352,33 @@ def test_wrappers_hand_a_native_launch_to_the_supervisor_and_keep_the_plain_one(
     env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp_path), "WOLTSPACE_WOLT_HOME": str(tmp_path / "none")}
     run = lambda **extra: subprocess.run(["bash", str(bin_dir / wrapper), "a", "b c"], capture_output=True,
                                          text=True, env={**env, **extra}, cwd=tmp_path).stdout.strip()
-    assert run() == f"{engine} a b c"
-    assert run(WOLTSPACE_NATIVE_DIR="/d") == f"supervisor {tmp_path}/bin/../lib/native/launch.py {engine} a b c"
+    for isolation in ("external", "host"):
+        assert run(WOLTSPACE_ISOLATION=isolation) == f"{engine} a b c"
+        assert run(WOLTSPACE_ISOLATION=isolation, WOLTSPACE_NATIVE_DIR="/d") == \
+            f"supervisor {bin_dir}/../lib/native/launch.py {engine} a b c"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux-only")
+def test_a_killed_supervisor_takes_its_own_backend_with_it(lodge, tmp_path):
+    wolts, _ = lodge
+    native = na.prepare(wolts, "pal-x", "codex", "a1")
+    fake_bin(tmp_path, "codex", f"""if [ "$1" = app-server ]; then
+  echo $$ > {tmp_path}/backend.pid; for a; do last=$a; done; : > "${{last#unix://}}"; exec sleep 60
+fi
+exec sleep 60
+""")
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", **na.launch_env(native)}
+    supervisor = subprocess.Popen([sys.executable, str(na.ASSETS / "launch.py"), "codex", "hi"], env=env,
+                                  stdin=subprocess.DEVNULL)
+    pid_file = tmp_path / "backend.pid"
+    deadline = time.monotonic() + 10
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    pid = int(pid_file.read_text())
+    supervisor.kill()
+    supervisor.wait(5)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and Path(f"/proc/{pid}").exists() and \
+            Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z":
+        time.sleep(0.05)
+    assert not Path(f"/proc/{pid}").exists() or Path(f"/proc/{pid}/stat").read_text().split()[2] == "Z"

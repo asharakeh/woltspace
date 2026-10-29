@@ -32,7 +32,7 @@ REASONS = {
     "busy": "it was busy starting or stopping",
     "error": "the lodge hit an error while waking it",
 }
-REACHED = ("hinted", "resumed", "started")
+REACHED = ("hinted", "resumed", "started", "busy")
 
 
 def plain(reason: str) -> str:
@@ -49,7 +49,8 @@ def outcome(wolts_dir, wolt: str, *, seqs, how: str, session: str | None = None,
     wolt cannot wake. "Notified" never claims the body was read. Never raises."""
     try:
         if how in REACHED:
-            line = f"🪵 {session} notified\n{_link(session)}"
+            line = (f"🪵 {session} is busy; it gets your message when its current turn ends\n{_link(session)}"
+                    if how == "busy" else f"🪵 {session} notified\n{_link(session)}")
             if chat:
                 _follow(wolts_dir, wolt, chat, session)
         else:

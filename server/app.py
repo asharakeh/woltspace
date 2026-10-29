@@ -959,8 +959,9 @@ async def _terminal_mail(request: Request, wolt: str, session: str = ""):
         facts = await run_in_threadpool(store.wake_facts, wolt)
         got = next((o for o in (facts or {}).get("wake", {}).get("outcomes", []) if o.get("seq") == status.seq), None)
         if got:
-            if got.get("how") in ("hinted", "resumed", "started"):
-                return {"ok": True, "status": "notified", "session": got.get("session"), **answer}
+            if got.get("how") in ("hinted", "resumed", "started", "busy"):
+                status = "busy" if got.get("how") == "busy" else "notified"
+                return {"ok": True, "status": status, "session": got.get("session"), **answer}
             return JSONResponse({"ok": False, "status": "cant_wake", "reason": got.get("reason") or got.get("how"),
                                  **answer}, status_code=409)
         await asyncio.sleep(OUTCOME_POLL)

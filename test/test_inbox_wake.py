@@ -1054,3 +1054,15 @@ def test_a_turn_end_after_the_session_took_its_mail_hints_nothing(lodge, wake, n
     sys.modules["native_adapters"].deliver = lambda record_, hint: placed.append(hint) or ("submitted", "queued")
     inbox_wake._wake(str(lodge.root), "pal")  # its turn end
     assert placed == [] and [line[0] for line in notices.lines] == ["busy"]
+
+
+def test_a_pickup_that_finds_its_new_session_busy_sends_the_owner_no_second_line(lodge, wake, notices,
+                                                                                  monkeypatch):
+    monkeypatch.setattr(inbox_wake, "_schedule", lambda *a, **k: None)
+    mail(lodge)
+    inbox_wake._wake(str(lodge.root), "pal")  # started: the message's one line
+    (kw, _), = wake.starts
+    wake.live = kw["name"]
+    sys.modules["native_adapters"].deliver = lambda record_, hint: ("pending", "busy")  # its START turn runs
+    inbox_wake._wake(str(lodge.root), "pal", once=True)  # the post-publication pickup
+    assert [line[0] for line in notices.lines] == ["started"]

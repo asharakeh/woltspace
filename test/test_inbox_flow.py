@@ -28,6 +28,7 @@ OWNER, CHAT = "111", "4242"
 @pytest.fixture
 def flow(tmp_path, monkeypatch, store, server):
     monkeypatch.setenv("WOLTSPACE_WOLTS_DIR", str(tmp_path))
+    monkeypatch.setenv("WOLTSPACE_ISOLATION", "external")  # auto policy, whatever ran before
     import chat_lodge
     import connector_registry
     (tmp_path / ".space").mkdir(exist_ok=True)

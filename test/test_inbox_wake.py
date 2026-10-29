@@ -33,6 +33,7 @@ def held(root, name="pal"):
 def lodge(tmp_path, monkeypatch):
     """A lodge with the inbox on, the wolt pal (auto policy), a fake tmux and transport."""
     (tmp_path / ".space").mkdir()
+    monkeypatch.setenv("WOLTSPACE_ISOLATION", "external")  # auto policy, whatever ran before
     (tmp_path / "woltspace.json").write_text(json.dumps({"inbox": {"enabled": True}}))
     wolt(tmp_path, "pal")
     for module, attr in ((sessions, "WOLTS_DIR"),):

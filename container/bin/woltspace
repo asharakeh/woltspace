@@ -286,13 +286,26 @@ def cmd_session_send(args):
         if not result.get("ok"):
             sys.exit(1)
         return
+    # With the inbox on, the lodge takes this as mail under this key (an older lodge ignores
+    # it): re-running with the same --key and text is the same message, never a second one.
+    payload["key"] = key = args.key or f"iwcl-{uuid.uuid4().hex}"
     if _SESSION_RE.search(target):
         path = f"/sessions/{target}/message"
     else:
         path = f"/wolts/{target}/message"
-    status, result = _req("POST", path, payload)
+    status, result = _req("POST", path, payload, hint=f"; re-run with --key {key} to see its outcome")
     if args.json:
         print(json.dumps(result, indent=2))
+    elif result.get("status") == "notified":
+        print(f"notified {result.get('session')}")
+    elif result.get("status") == "pending":
+        print(f"queued for {result.get('wolt')}; outcome pending: re-run with --key {key} to see it")
+    elif result.get("status") == "cant_wake":
+        print(f"{result.get('wolt')} can't wake: {result.get('reason')}", file=sys.stderr)
+        sys.exit(1)
+    elif result.get("status") == "not_queued":
+        print(f"not queued ({result.get('error')})", file=sys.stderr)
+        sys.exit(1)
     elif result.get("ok"):
         dest = result.get("session", target)
         print(f"delivered → {dest}" + (f" ({result['harness']})" if result.get("harness") else ""))
@@ -650,6 +663,7 @@ def main():
     ss.add_argument("--from", dest="from_", default="",
                     help="sender identity (default: $WOLTSPACE_WOLT_NAME); use --from jerpint as a human")
     ss.add_argument("--json", action="store_true", help="raw JSON output")
+    ss.add_argument("--key", default="", help="this message's id: re-running with it shows its outcome")
     ss.set_defaults(func=cmd_session_send)
 
     sp = ssub.add_parser("spawn", help="spawn a new session for a wolt")

@@ -641,15 +641,21 @@ def test_a_failed_or_unknown_resume_never_falls_back_to_a_new_session(lodge, res
 
 
 
-@pytest.mark.parametrize("ending", ["stopped", "archived"])
-def test_an_owners_stop_in_the_gap_before_the_relaunch_is_never_revived(lodge, resting, monkeypatch, ending):
+@pytest.mark.parametrize("gap", ["stopped", "archived", "other_stopped", "other_launching"])
+def test_an_owners_stop_in_the_gap_before_the_relaunch_is_never_revived(lodge, resting, monkeypatch, gap):
     real = sessions.resume_session
+    lodge.registry.create("pal-other", wolt="pal")
 
-    def stop_first(name, prompt="", **kw):  # the owner's stop lands after the wake chose the session
-        lodge.registry.update(name, status=ending, wake_inhibit=True)
+    def stop_first(name, prompt="", **kw):  # lands after the wake chose the session, before the relaunch
+        if gap in ("stopped", "archived"):
+            lodge.registry.update(name, status=gap, wake_inhibit=True)
+        elif gap == "other_stopped":  # another session of the agent, stopped by the owner
+            lodge.registry.update("pal-other", status="stopped", wake_inhibit=True)
+        else:  # a manual launch of the agent elsewhere
+            lodge.registry.update("pal-other", launching={"attempt": "m1"})
         return real(name, prompt, **kw)
     monkeypatch.setattr(sessions, "resume_session", stop_first)
     mail(lodge, human=False)
     inbox_wake._wake(str(lodge.root), "pal")
-    assert resting.spawned == [] and record(lodge, "pal-rest")["status"] == ending
-    assert "launching" not in record(lodge, "pal-rest")
+    assert resting.spawned == [] and "launching" not in record(lodge, "pal-rest")
+    assert record(lodge, "pal-rest")["status"] == (gap if gap in ("stopped", "archived") else "resting")

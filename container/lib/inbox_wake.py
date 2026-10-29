@@ -13,9 +13,10 @@ lifecycle lock, never the caller's seq or state:
   inhibited: an inhibition only ever stops a start. submitted, pending, unknown,
   unavailable and failed are transport facts; none changes custody, and none
   is retried here. Mail waits for the agent's own fetch and ack.
-- no live session: one fresh session, reserved by name first and started with
-  the fixed fetch instruction (auto policy only for agent mail; human mail
-  starts the wolt in its own mode). The owner's explicit stop or
+- no live session: the wolt's newest resting session is resumed without a
+  prompt (the post-publication pickup and its backend's ready call hint it);
+  with none, one fresh session, reserved by name first and started with the
+  fixed fetch instruction. Either runs in the wolt's own recorded mode. The owner's explicit stop or
   archive of any of the agent's sessions, whoever started it, marks that record
   (wake_inhibit) and inhibits the wake until rearm clears the marks it sees; so does a reserved session that ended without a first ack
   ("no_progress"). New mail never clears an inhibition. While any launch of
@@ -149,17 +150,21 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         inhibited = facts["wake"].get("inhibited")
         if inhibited == "not_startable" and facts["human"]:
             inhibited = None
-        why = None if live else (inhibited or _start(store, registry, wolt, facts))
-        if why:
-            why = _reserve_notice(store, wolt, why)
+        why, resume = (None, None) if live else ((inhibited, None) if inhibited else _start(store, registry, wolt, facts))
+        owner = bool(why) and _reserve_notice(store, wolt, why) is not None
         if live:
             record = registry.get(live, wolt=wolt, check_alive=False) or {}
             hinted = {"session": live, "attempt": record.get("attempt")}
             if once and facts["wake"].get("hinted") == hinted:
                 return
+    if resume:  # outside the lock: resume relaunches under its own lock and waits after it
+        try:
+            sessions.resume_session(resume, "")  # no prompt: nothing is pasted; the pickup hints
+        except Exception as exc:  # the reservation lets the next wake judge it
+            log.warning("inbox wake could not resume %s: %s", resume, exc)
     if not live:
         if why:  # neither a hint nor a start: outside the lock and any Store write
-            _notice(root, wolt, why)
+            _notice(root, wolt, why, owner)
         return
     status, code = _deliver(record, HINT.format(nonce=uuid.uuid4().hex[:8]))
     log.info("inbox hint for %s via %s: %s (%s)", wolt, live, status, code)
@@ -170,36 +175,45 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
                 store.set_wake(wolt, {**facts["wake"], "hinted": hinted})
 
 
-def _start(store, registry, wolt: str, facts: dict) -> None:
-    """No live session: respect an explicit stop, judge the earlier reservation,
-    then reserve and start one. Returns why nothing was started (the owner is told
-    when their mail waits): launch_unknown, or the inhibition it set just now."""
+def _start(store, registry, wolt: str, facts: dict) -> tuple[str | None, str | None]:
+    """No live session: respect an explicit stop, judge the earlier reservation, then
+    reserve the wolt's newest resting session to resume, or start one, in the wolt's own
+    mode. Returns (why nothing was started, the session to resume after the lock);
+    why is launch_unknown or the inhibition it set just now (the owner is told)."""
     wake, reserved = facts["wake"], facts["wake"].get("reserved")
     records = registry.records(wolt=wolt)
     if any(r.get("launching") for r in records):
-        return "launch_unknown"  # an unresolved launch of this agent, whoever made it, may still start
+        return "launch_unknown", None  # an unresolved launch of this agent, whoever made it, may still start
     if any(r.get("wake_inhibit") for r in records):  # an owner's stop
-        return _inhibit(store, wolt, wake, "stopped")
+        return _inhibit(store, wolt, wake, "stopped"), None
     if reserved:
         record = registry.get(reserved["session"], wolt=wolt, check_alive=False) or {}
         if record.get("status") in ("running", sessions.STOPPING):
-            return None  # still settling: kept as it is
+            return None, None  # still settling: kept as it is
         if facts["acks"] <= reserved.get("acks", 0):
-            return _inhibit(store, wolt, wake, "no_progress")
-    name = sessions.session_name(wolt)
+            return _inhibit(store, wolt, wake, "no_progress"), None
     keep = {"noticed": wake["noticed"]} if "noticed" in wake else {}  # the owner was told about this mail
+    resting = [r for r in records if r.get("status") == "resting" and sessions.stored_resume_id(r)]
+    if resting:  # its own conversation, in its own mode: resumed after the lock, without a prompt
+        name = max(resting, key=lambda r: r.get("last_activity") or 0)["name"]
+        store.set_wake(wolt, {**keep, "reserved": {"session": name, "acks": 0, "at": int(time.time())}})
+        acks = store.wake_facts(wolt)["acks"]  # what it acked before: progress means a new ack
+        store.set_wake(wolt, {**keep, "reserved": {"session": name, "acks": acks, "at": int(time.time())}})
+        return None, name
+    name = sessions.session_name(wolt)
     store.set_wake(wolt, {**keep, "reserved": {"session": name, "acks": 0, "at": int(time.time())}})
-    try:  # the owner's own mail starts the wolt in its own mode, as Telegram did before the inbox
-        sessions.start_session(wolt=wolt, prompt=START, name=name, require_auto=not facts["human"])
+    try:  # any mail starts the wolt in its own recorded mode, as Telegram did before the inbox
+        sessions.start_session(wolt=wolt, prompt=START, name=name)
     except (PermissionError, ValueError, sessions.HarnessNotInstalled) as exc:
-        return _inhibit(store, wolt, {**keep, "detail": str(exc)[:200]}, "not_startable")
-    return None
+        return _inhibit(store, wolt, {**keep, "detail": str(exc)[:200]}, "not_startable"), None
+    return None, None
 
 
 def _reserve_notice(store, wolt: str, reason: str) -> str | None:
     """One owner notice per newest queued human message and reason, reserved under the
     lock before it is sent: a repeat wake, a resend or a ready call adds none; new human
-    mail or a changed reason gets one. Recorded as attempted, never retried. None: skip."""
+    mail or a changed reason gets one. Recorded as attempted, never retried. None: the
+    owner is not told this time (the senders' notices are inbox_notice's own)."""
     facts = store.wake_facts(wolt)
     noticed = {"seq": (facts or {}).get("human_seq"), "reason": reason}
     if not facts or noticed["seq"] is None or facts["wake"].get("noticed") == noticed:
@@ -213,12 +227,12 @@ def _inhibit(store, wolt: str, wake: dict, reason: str) -> str:
     return reason
 
 
-def _notice(root, wolt: str, reason: str) -> None:
-    """Tell the owner their mail cannot wake the wolt; inbox_notice stays silent
-    unless human mail is queued. Never raises."""
+def _notice(root, wolt: str, reason: str, owner: bool) -> None:
+    """Mail cannot wake the wolt: inbox_notice tells the owner (owner: once per newest
+    human message and reason, reserved above) and the agents whose mail waits. Never raises."""
     try:
         import inbox_notice
-        inbox_notice.owner_notice(root, wolt, reason)
+        inbox_notice.notice(root, wolt, reason, owner=owner)
     except Exception:
         log.exception("inbox owner notice for %s failed", wolt)
 

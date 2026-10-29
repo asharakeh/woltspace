@@ -12,6 +12,20 @@ function writeReady() {
   const tmp = path.join(dir, `.ready.json.${process.pid}.tmp`);
   fs.writeFileSync(tmp, JSON.stringify({ kind: "pi-extension", attempt, pid: process.pid }), { mode: 0o600 });
   fs.renameSync(tmp, path.join(dir, "ready.json"));
+  announceReady();
+}
+
+// One bounded, reader-authenticated call so mail that waited gets its hint; a failure is ignored.
+function announceReady() {
+  const token = process.env.WOLTSPACE_INBOX_TOKEN;
+  const session = process.env.WOLTSPACE_WOLT_SESSION;
+  if (!token || !session) return;
+  const api = process.env.WOLTSPACE_API || "http://localhost:7777";
+  fetch(`${api}/inbox/ready`, {
+    method: "POST", signal: AbortSignal.timeout(2000),
+    headers: { "Content-Type": "application/json", "X-Woltspace-Inbox-Token": token },
+    body: JSON.stringify({ session, attempt }),
+  }).catch(() => {});
 }
 
 export default function (pi) {

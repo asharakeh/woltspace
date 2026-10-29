@@ -94,6 +94,18 @@ def test_a_reply_to_a_notification_is_queued_with_its_quote(lodge):
     assert lodge.calls["pasted"] == lodge.calls["spawned"] == []
 
 
+def test_the_next_plain_message_goes_to_the_wolt_last_written_to(lodge):
+    wolt(lodge.root, "nunu")
+    lodge._save_chat_state(CHAT, {"active_wolt": "nunu", "active_session": "nunu-old-grove-000002"})
+    notification = ("🦫 pal: done?\n\n---\n↩️ reply to this message to talk to this session directly\n"
+                    "https://lodge.invalid/tui?session=pal-other-marsh-abc123")
+    handle(lodge, body={"text": "yes", "reply_to": {"from_bot": True, "text": notification}})
+    assert lodge._load_chat_state(CHAT) == {"active_wolt": "pal"}
+    handle(lodge, event_id="e2", body={"text": "and one more"})
+    assert [r[1] for r in rows(lodge.root, "SELECT seq, b.wolt FROM inbox_messages m JOIN inbox_mailboxes b"
+                                           " ON b.id = m.mailbox ORDER BY seq")] == ["pal", "pal"]
+
+
 def test_a_non_owner_queues_nothing_and_wakes_nobody(lodge):
     assert handle(lodge, sender="999") == []
     assert not (lodge.root / ".space" / "lodge.db").exists() or queued(lodge) == []

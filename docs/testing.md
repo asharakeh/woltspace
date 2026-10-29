@@ -23,7 +23,7 @@ python -m pytest -q test/test_release_workflow.py test/test_lodge_skills.py test
   test/test_inbox_wake.py test/test_inbox_flow.py test/test_inbox_flow_independent.py \
   test/test_inbox_stop_independent.py test/test_inbox_rearm_order_independent.py \
   test/test_inbox_unknown_independent.py test/test_inbox_summary.py test/test_native_adapters.py \
-  test/test_iwcl_inbox.py test/test_chat_lodge_inbox.py \
+  test/test_iwcl_inbox.py test/test_chat_lodge_inbox.py test/test_inbox_notice.py \
   test/test_restore_guard.py test/test_restore_guard_independent.py \
   test/test_native_doctor.py \
   test/test_outbox.py test/test_notification_types.py test/test_notify_file_core.py \

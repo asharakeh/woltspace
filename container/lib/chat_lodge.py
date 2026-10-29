@@ -506,6 +506,11 @@ class ChatLodge:
             return
         _bot_log(f"{self.name}_inbox_admitted", {"wolt": wolt, "seq": status.seq, "key": key})
         self._append_history(chat, "user", text)
+        # The next plain message goes to the wolt last written to; mail binds no session.
+        state = self._load_chat_state(chat)
+        state["active_wolt"] = wolt
+        state.pop("active_session", None)
+        self._save_chat_state(chat, state)
         await out.say(Reply(f"🪵 queued for {self._creature_emoji(wolt)} {self._shown(wolt)}"))
         try:
             await asyncio.to_thread(notify_admitted, self.wolts_dir, status)

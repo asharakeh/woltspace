@@ -250,8 +250,19 @@ class Store:
             return {"open": row["state"] == "open", "wake": wake,
                     "queued": conn.execute("SELECT count(*) FROM inbox_messages WHERE mailbox=?"
                                            " AND state='queued'", (row["id"],)).fetchone()[0],
+                    "human": conn.execute("SELECT count(*) FROM inbox_messages WHERE mailbox=?"
+                                          " AND state='queued' AND priority=?", (row["id"], HUMAN)).fetchone()[0],
+                    "human_seq": conn.execute("SELECT max(seq) FROM inbox_messages WHERE mailbox=?"
+                                              " AND state='queued' AND priority=?", (row["id"], HUMAN)).fetchone()[0],
                     "acks": conn.execute("SELECT coalesce(sum(acks), 0) FROM inbox_readers"
                                          " WHERE session=?", (session,)).fetchone()[0]}
+
+    def reader_session(self, token: str) -> tuple[str, str] | None:
+        """(session, wolt) of a valid reader, or None."""
+        with self._read() as conn:
+            row = conn.execute(_VALID.replace("SELECT r.mailbox, b.wolt", "SELECT r.session, b.wolt"),
+                               (_hash(token),)).fetchone()
+            return (row[0], row[1]) if row else None
 
     def queued_wolts(self) -> list[str]:
         with self._read() as conn:

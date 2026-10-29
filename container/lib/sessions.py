@@ -2124,6 +2124,7 @@ def start_session(
             thread_ts=str((routing or {}).get("thread_ts", "")),
             session_url=session_url,
         ))
+    _schedule_pickup(wolt)  # after publication: whichever of this and the backend's ready call comes later hints
 
     result = {
         "name": name,
@@ -2314,6 +2315,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
         if booting and not prompt:
             # Nothing to paste, and nothing to relaunch: the agent is on its way.
             registry.update(name, wolt=wolt, status="running", runtime=target.to_record())
+            _schedule_pickup(wolt)
             return {"name": name, "url": session_url, "status": "delivered",
                     "detail": "agent booting, nothing to send"}
         # Wait for the agent to take input before any write, never inside one:
@@ -2327,6 +2329,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
             )
         if _paste_into_live_agent(registry, wolt, name, data.get("status"), harness,
                                   prompt.replace("\n", " ")):
+            _schedule_pickup(wolt)
             return {"name": name, "url": session_url, "status": "delivered",
                     "detail": "agent running, message sent"}
         # A rest (or a stop) took the lock between our look and the paste and
@@ -2396,6 +2399,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
                     _launch_failed(registry, name, wolt, attempt, settle=False)
                     raise ResumeFailed(f"session '{name}': the resume command could not be pasted ({exc})") from exc
                 publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
+            _schedule_pickup(wolt)
             detail = "agent exited, restarted with --resume in existing pane"
         else:
             # The session survived only because unrelated user panes/windows
@@ -2408,6 +2412,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
                     _launch_failed(registry, name, wolt, attempt, settle=False)
                     raise ResumeFailed(f"session '{name}': no window could be opened for the resume ({exc})") from exc
                 publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
+            _schedule_pickup(wolt)
             # The pane on disk just moved. Keep the in-memory record in step so
             # nothing below this line addresses the pane we already replaced.
             data = {**data, "runtime": target.to_record()}
@@ -2449,6 +2454,7 @@ def resume_session(name: str, prompt: str = "") -> dict:
             _launch_failed(registry, name, wolt, attempt, settle=True)  # a fresh new-session never started
             raise
         publish_runtime(registry, name, wolt, attempt, handle.to_record(), status="running")
+    _schedule_pickup(wolt)
     if not _await_agent(handle, harness):
         # run-session.sh may have exited before an agent appeared: a prepare
         # failure, a missing harness binary, an auth wall. Reporting
@@ -2488,6 +2494,16 @@ def _ending(registry: "SessionRegistry", data: dict):
             _tmux_stop(data)
         refuse_unresolved(data)
         yield wolt, tmux_alive
+
+
+def _schedule_pickup(wolt: str) -> None:
+    """A resume that reused a running agent (and its ready backend): mail that waited
+    gets one hint. Outside any lock; never fails the resume."""
+    try:
+        import inbox_wake
+        inbox_wake.schedule_pickup(WOLTS_DIR, wolt)
+    except Exception as exc:
+        print(f"[inbox] pickup not scheduled for {wolt}: {exc}", file=sys.stderr)
 
 
 def stop_session(name: str) -> dict:

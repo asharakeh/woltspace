@@ -610,7 +610,7 @@ def test_a_turn_ended_by_an_api_error_clears_busy_and_announces_its_end(lodge):
         stand_in.server.shutdown()
 
 
-def test_stop_failure_after_a_hint_turn_rearms_a_claiming_listener(lodge):  # Novo's probe, StopFailure as Claude runs it
+def test_stop_failure_after_a_hint_turn_rearms_a_claiming_listener(lodge):  # reviewer's probe, StopFailure as Claude runs it
     _, live = lodge
     record = live("claude", ready={"armed_at": time.time()})
     directory = Path(record["native"]["addr"])

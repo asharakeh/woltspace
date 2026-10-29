@@ -82,6 +82,18 @@ def test_an_owner_message_is_queued_at_human_priority_instead_of_pasted(lodge):
     assert lodge.calls["pasted"] == lodge.calls["spawned"] == []
 
 
+def test_a_reply_to_a_notification_is_queued_with_its_quote(lodge):
+    notification = ("🦫 pal: shall I ship it?\n\n---\n"
+                    "↩️ reply to this message to talk to this session directly\n"
+                    "https://lodge.invalid/tui?session=pal-other-marsh-abc123")
+    handle(lodge, body={"text": "yes ship it", "reply_to": {"from_bot": True, "text": notification}})
+    [(_, _, priority, body, _)] = queued(lodge)
+    assert priority == inbox.HUMAN
+    assert "]: [replying to: 🦫 pal: shall I ship it?\n]\nyes ship it\n" in body.decode()
+    assert "↩️" not in body.decode()
+    assert lodge.calls["pasted"] == lodge.calls["spawned"] == []
+
+
 def test_a_non_owner_queues_nothing_and_wakes_nobody(lodge):
     assert handle(lodge, sender="999") == []
     assert not (lodge.root / ".space" / "lodge.db").exists() or queued(lodge) == []

@@ -46,6 +46,21 @@ def lodge(tmp_path):
     shutil.rmtree(wolts, ignore_errors=True)
 
 
+def _gone(pid):
+    """Exited: no /proc entry, or a zombie (PID 1 here may never reap it). It can vanish while we look."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split()[2] == "Z"
+    except OSError:  # FileNotFoundError or ProcessLookupError: already gone
+        return True
+
+
+def _ends(pid, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while not _gone(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return _gone(pid)
+
+
 def fake_bin(tmp_path, name, body):
     path = tmp_path / "bin" / name
     path.parent.mkdir(exist_ok=True)
@@ -275,11 +290,7 @@ exit 7
             signal.signal(sig, handler)
     pid = int((tmp_path / "backend.pid").read_text())
     assert (Path(native["addr"]) / "retired").exists() and not (tmp_path / "tui.saw").exists()
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and Path(f"/proc/{pid}").exists() and \
-            Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z":
-        time.sleep(0.05)
-    assert not Path(f"/proc/{pid}").exists() or Path(f"/proc/{pid}/stat").read_text().split()[2] == "Z"
+    assert _ends(pid)
 
 
 def _listener(directory, attempt="a1", session="s1"):
@@ -377,8 +388,4 @@ exec sleep 60
     pid = int(pid_file.read_text())
     supervisor.kill()
     supervisor.wait(5)
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and Path(f"/proc/{pid}").exists() and \
-            Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z":
-        time.sleep(0.05)
-    assert not Path(f"/proc/{pid}").exists() or Path(f"/proc/{pid}/stat").read_text().split()[2] == "Z"
+    assert _ends(pid)

@@ -1195,6 +1195,8 @@ def _disarm_session(record: dict, source: str, wolts_dir: Path, report: dict) ->
         record["finished_at"] = record.get("finished_at") or int(datetime.now(timezone.utc).timestamp())
         report["sessions_stopped"] += 1
     record.pop("runtime", None)  # tmux name and pane belong to the source's tmux
+    record.pop("launching", None)  # the source's launches and native wiring are not this copy's
+    record.pop("native", None)
     rebased = _rebase_strings(record, source, wolts_dir)
     if rebased != record:
         report["sessions_rebased"] += 1

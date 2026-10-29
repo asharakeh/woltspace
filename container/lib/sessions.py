@@ -1780,8 +1780,10 @@ def prepare_session_command(name: str, mode: str, prompt: str = "") -> str:
     harness = resolve_harness(data.get("harness"))
     wolt = data.get("wolt", "")
     model = data.get("model", "")
-    # The marked attempt's locator: the builders add its native wiring; none = the original command
-    locator = (data.get("launching") or {}).get("native")
+    # The attempt's locator: the marker's while it is still marked, else the one publish_runtime
+    # copied onto the row (the child reads it after the parent may already have published).
+    # The builders add its native wiring; none = the original command.
+    locator = data["launching"].get("native") if data.get("launching") else data.get("native")
     native = {"native": locator} if locator else {}
 
     if wolt and (WOLTS_DIR / wolt / "wolt" / "wolt.json").is_file():
@@ -2169,8 +2171,30 @@ def _create_and_launch(registry, name, wolt, harness, target, prompt, fields) ->
     registry.create(name, wolt=wolt, harness=harness, dir=str(target.canonical_workdir),
                     target=target, prompt=prompt, **fields)
     attempt = mark_launching(registry, name, wolt, harness)
-    handle = _tmux_spawn(name, str(target.canonical_workdir), build_session_command(name, prompt))
+    try:
+        handle = _tmux_spawn(name, str(target.canonical_workdir), build_session_command(name, prompt))
+    except subprocess.CalledProcessError:
+        _launch_failed(registry, name, wolt, attempt, settle=True)
+        raise
     publish_runtime(registry, name, wolt, attempt, handle.to_record())
+
+
+def _launch_failed(registry, name: str, wolt: str, attempt: str, *, settle: bool) -> None:
+    """A tmux call that exited non-zero is a reaped client, a definite failure (a
+    timeout is not: it stays UNKNOWN). Under the held lock, clear exactly this
+    attempt and retire its locator. settle: a fresh new-session never started, so
+    the row is stopped (launch_failed); a failed paste or new-window keeps the
+    session's prior runtime and status untouched."""
+    with registry.edit(name, wolt=wolt) as current:
+        marker = (current or {}).get("launching") or {}
+        if marker.get("attempt") != attempt:
+            return
+        current.pop("launching")
+        if settle:
+            current.update(status="stopped", finished_at=int(time.time()), stop_reason="launch_failed")
+    adapters = _native_adapters()
+    if adapters and marker.get("native"):
+        adapters.retire(marker["native"])
 
 
 # ---------------------------------------------------------------------------
@@ -2365,8 +2389,12 @@ def resume_session(name: str, prompt: str = "") -> dict:
             # The exact dedicated pane survived; reuse it rather than creating
             # a new window on every ordinary agent exit.
             with _relaunch(registry, name, wolt, harness) as attempt:
-                with _paste_lock(name, registry.db_dir):
-                    _tmux_paste(target, resume_cmd)
+                try:
+                    with _paste_lock(name, registry.db_dir):
+                        _tmux_paste(target, resume_cmd)
+                except subprocess.CalledProcessError as exc:
+                    _launch_failed(registry, name, wolt, attempt, settle=False)
+                    raise ResumeFailed(f"session '{name}': the resume command could not be pasted ({exc})") from exc
                 publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
             detail = "agent exited, restarted with --resume in existing pane"
         else:
@@ -2374,7 +2402,11 @@ def resume_session(name: str, prompt: str = "") -> dict:
             # remain. Never commandeer one: add a detached dedicated window and
             # persist the exact pane tmux returns.
             with _relaunch(registry, name, wolt, harness) as attempt:
-                target = _tmux_spawn_in_session(target, work_dir or "/workspace", resume_cmd)
+                try:
+                    target = _tmux_spawn_in_session(target, work_dir or "/workspace", resume_cmd)
+                except subprocess.CalledProcessError as exc:
+                    _launch_failed(registry, name, wolt, attempt, settle=False)
+                    raise ResumeFailed(f"session '{name}': no window could be opened for the resume ({exc})") from exc
                 publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
             # The pane on disk just moved. Keep the in-memory record in step so
             # nothing below this line addresses the pane we already replaced.
@@ -2411,7 +2443,11 @@ def resume_session(name: str, prompt: str = "") -> dict:
     # Tmux is dead (or was just cleared out from under a stale, agentless
     # session) — create a fresh tmux session running the wrapper.
     with _relaunch(registry, name, wolt, harness) as attempt:
-        handle = _tmux_spawn(name, work_dir or "/workspace", resume_cmd)
+        try:
+            handle = _tmux_spawn(name, work_dir or "/workspace", resume_cmd)
+        except subprocess.CalledProcessError:
+            _launch_failed(registry, name, wolt, attempt, settle=True)  # a fresh new-session never started
+            raise
         publish_runtime(registry, name, wolt, attempt, handle.to_record(), status="running")
     if not _await_agent(handle, harness):
         # run-session.sh may have exited before an agent appeared: a prepare

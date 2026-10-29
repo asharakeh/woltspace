@@ -359,3 +359,56 @@ def test_rearm_is_refused_while_any_launch_of_the_agent_is_unresolved(lodge, unr
     with pytest.raises(lifecycle.LifecycleUnknown):
         inbox_wake.rearm(lodge.root, "pal")
     assert record(lodge, unresolved)["launching"]
+
+
+# -- native wiring after publication, and definite launch failures ----------------
+
+def test_the_child_prepares_after_publication_and_the_engine_gets_the_attempt(lodge, monkeypatch, tmp_path):
+    """run-session.sh prepares in the child, after publish_runtime cleared the marker."""
+    monkeypatch.delitem(sys.modules, "native_adapters")
+    sessions.start_session(wolt="pal", name="pal-a-b-c")
+    row = record(lodge, "pal-a-b-c")
+    assert "launching" not in row and row["native"]["attempt"] == row["attempt"]
+    command = sessions.prepare_session_command("pal-a-b-c", "spawn", "hi")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "claude").write_text('#!/bin/sh\nenv | grep ^WOLTSPACE_NATIVE_ > "$OUT"; printf "%s\\n" "$@" >> "$OUT"\n')
+    (fake / "claude").chmod(0o755)
+    out = tmp_path / "engine.txt"
+    subprocess.run(["bash", "-c", command], env={"PATH": f"{fake}:/usr/bin:/bin", "OUT": str(out)},
+                   check=True, timeout=30)
+    seen = out.read_text().splitlines()
+    assert f"WOLTSPACE_NATIVE_ATTEMPT={row['attempt']}" in seen
+    assert f"WOLTSPACE_NATIVE_DIR={row['native']['addr']}" in seen
+    settings = Path(seen[seen.index("--settings") + 1])
+    assert settings.parent == Path(row["native"]["addr"]) and settings.is_file()
+
+
+def test_a_failed_new_session_is_a_definite_non_start(lodge, monkeypatch):
+    def refused(name, cwd, command):
+        raise subprocess.CalledProcessError(1, ["tmux", "new-session"])
+    monkeypatch.setattr(sessions, "_tmux_spawn", refused)
+    with pytest.raises(subprocess.CalledProcessError):
+        sessions.start_session(wolt="pal", name="pal-a-b-c")
+    row = record(lodge, "pal-a-b-c")
+    assert "launching" not in row and (row["status"], row["stop_reason"]) == ("stopped", "launch_failed")
+    assert lodge.calls.retired == lodge.calls.prepared  # its attempt is retired
+    sessions.delete_session("pal-a-b-c")  # settles normally: nothing UNKNOWN left
+
+
+def test_a_failed_resume_paste_keeps_the_prior_runtime_and_raises(lodge, monkeypatch):
+    sessions.start_session(wolt="pal", name="pal-a-b-c")
+    lodge.registry.update("pal-a-b-c", harness_session_id="conv-1")
+    before = record(lodge, "pal-a-b-c")
+    monkeypatch.setattr(sessions, "resolve_agent_handle", lambda *a, **k: None)
+    monkeypatch.setattr(sessions, "_runtime", lambda: types.SimpleNamespace(handle_is_alive=lambda h: True))
+
+    def broken(target, text, settle=0.0):
+        raise subprocess.CalledProcessError(1, ["tmux", "paste-buffer"])
+    monkeypatch.setattr(sessions, "_tmux_paste", broken)
+    with pytest.raises(sessions.ResumeFailed, match="could not be pasted"):
+        sessions.resume_session("pal-a-b-c")
+    after = record(lodge, "pal-a-b-c")
+    assert "launching" not in after and after["runtime"] == before["runtime"]
+    assert after["status"] == before["status"] == "running" and "stop_reason" not in after
+    assert len(lodge.calls.retired) == 2  # the old attempt before the paste, the failed one after

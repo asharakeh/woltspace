@@ -111,6 +111,7 @@ from apps import (
     unshare_app,
 )
 from sites import ensure_site, site_dir
+import inbox
 import wolfcore
 import wolt_archive
 from site_shell import inject_shell, load_site_config, memory_payload, shell_manifest, shell_tags, shell_wanted
@@ -906,6 +907,13 @@ async def memory_read(request: Request):
 
 # --- Session messaging ---
 
+# With the lodge inbox on, messages are mail (`woltspace session send` with the
+# session's inbox reader), never pasted into a live session.
+def _inbox_on():
+    return JSONResponse({"ok": False, "status": "inbox", "error":
+                         "inbox is on; this session has no inbox token (start a new session)"}, status_code=409)
+
+
 async def _deliver_or_resume(safe: str, text: str, body: dict):
     result = await asyncio.to_thread(
         deliver_message,
@@ -1059,6 +1067,8 @@ async def release_hold(session_id: str):
 @app.post("/sessions/{session_id}/message")
 async def session_message(session_id: str, request: Request):
     """Deliver to a running session, or resume a resting one on contact."""
+    if inbox.enabled(WOLTS_DIR):
+        return _inbox_on()
     safe = sanitize_session(session_id)
     body = await request.json()
     text = body.get("text")
@@ -1148,6 +1158,8 @@ async def wolt_message(name: str, request: Request):
     Same body as /sessions/{id}/message. 404 if the wolt has no live session.
     This is the ergonomic entry point: senders address `codexw`, not a slug.
     """
+    if inbox.enabled(WOLTS_DIR):
+        return _inbox_on()
     safe_wolt = "".join(c for c in name if c.isalnum() or c in "-_")
     from sessions import SessionRegistry
     registry = SessionRegistry(WOLTS_DIR)

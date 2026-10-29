@@ -27,6 +27,7 @@ import shutil
 import sys
 import urllib.request
 import urllib.error
+import uuid
 from urllib.parse import quote
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from notify_prompt import (  # noqa: E402
     MessageInputError,
     read_message_input,
     session_send_argv,
+    session_send_reply_instruction,
     session_spawn_argv,
 )
 
@@ -261,6 +263,24 @@ def cmd_session_send(args):
     from_session = get_env("WOLTSPACE_WOLT_SESSION", "") if not args.from_ else "human"
     payload = {"text": message, "from_wolt": from_wolt, "from_session": from_session}
     target = args.target
+    token = os.environ.get("WOLTSPACE_INBOX_TOKEN", "")
+    if token:
+        # The inbox is on: mail for the target's wolt, never a paste. A session
+        # names its wolt's mailbox; the reader who reads it is the wolt's choice.
+        wolt = target.rsplit("-", 3)[0] if _SESSION_RE.search(target) and target.count("-") >= 3 else target
+        header = f"[message from {from_wolt}" + (f", session={from_session}" if from_session else "") + "]"
+        reply = f"\n{session_send_reply_instruction(from_session)}" if from_session else ""
+        body = {"to": wolt, "key": f"iwcl-{uuid.uuid4().hex}", "text": f"{header}\n{message}{reply}"}
+        status, result = _req("POST", "/inbox/send", body, headers={"X-Woltspace-Inbox-Token": token})
+        if args.json:
+            print(json.dumps(result, indent=2))
+        elif result.get("ok"):
+            print(f"queued → {wolt} (seq {result['result']['seq']})")
+        else:
+            print(f"not queued ({result.get('error', status)})", file=sys.stderr)
+        if not result.get("ok"):
+            sys.exit(1)
+        return
     if _SESSION_RE.search(target):
         path = f"/sessions/{target}/message"
     else:

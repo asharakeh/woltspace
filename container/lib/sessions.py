@@ -762,10 +762,11 @@ class SessionRegistry:
         """Check all 'running' sessions against tmux. Mark dead ones as orphaned."""
         live_sessions = _tmux_sessions()
         orphaned = []
+        markers = _markers_on(self.wolts_dir)
         with self._tx() as conn:
             for data in self._rows(conn):
                 if (data.get("status") == "running" and data.get("name") not in live_sessions
-                        and not data.get("launching")):  # an unresolved launch stays unknown
+                        and not (markers and data.get("launching"))):  # an unresolved launch stays unknown
                     data["status"] = "orphaned"
                     data["orphaned_reason"] = ORPHAN_TMUX_MISSING
                     data["last_activity"] = int(time.time())
@@ -806,7 +807,7 @@ class SessionRegistry:
 
                 name = data.get("name") or row["name"]
                 previous = data.get("status") or ""
-                if data.get("launching"):  # may still start: never settled or adopted here
+                if unresolved_launch(data, self.wolts_dir):  # may still start: never settled or adopted here
                     report["unchanged"].append({"session": name, "wolt": wolt,
                                                 "reason": "unresolved launch"})
                     continue
@@ -1650,8 +1651,11 @@ def still_as_seen(record: dict | None, seen: dict) -> bool:
 
 
 def mark_launching(registry: "SessionRegistry", name: str, wolt: str, harness: str) -> str:
-    """Commit a new launch attempt (and its native locator, when the inbox is on)
-    before the external launch. Call under the agent's lifecycle lock."""
+    """Commit a new launch attempt (and its native locator) before the external
+    launch. Call under the agent's lifecycle lock. With the inbox off nothing is
+    written and the attempt is "": the launch runs as it did before markers."""
+    if not _markers_on(registry.wolts_dir):
+        return ""
     attempt = lifecycle.new_attempt()
     native = _native_adapters()
     registry.update(name, wolt=wolt, launching={
@@ -1667,6 +1671,11 @@ def publish_runtime(registry: "SessionRegistry", name: str, wolt: str, attempt: 
     """The one writer of runtime + native + marker clear: a single write, and only
     for the exact attempt still marked. Waits for readiness belong after it."""
     with lifecycle.agent_lock(registry.wolts_dir, wolt), registry.edit(name, wolt=wolt) as current:
+        if not attempt:  # inbox off: no marker to match; one left from inbox-on days goes
+            if current is not None:
+                current.update(fields, runtime=runtime, last_activity=int(time.time()))
+                current.pop("launching", None)
+            return current is not None
         marker = (current or {}).get("launching") or {}
         if marker.get("attempt") != attempt:
             return False
@@ -1691,9 +1700,19 @@ def invalidate_native(registry: "SessionRegistry", name: str, wolt: str, seen: d
         adapters.retire(native)  # marks the attempt dir retired: a late child write is refused
 
 
+def _markers_on(root=None) -> bool:
+    """Launch markers are the inbox's: with it off none is written and none holds anything."""
+    import inbox
+    return inbox.enabled(root or WOLTS_DIR)
+
+
+def unresolved_launch(data: dict | None, root=None) -> bool:
+    return bool(data and data.get("launching")) and _markers_on(root)
+
+
 def refuse_unresolved(data: dict | None) -> None:
     """An unresolved launch may still start: nothing may settle or relaunch it."""
-    if data and data.get("launching"):
+    if unresolved_launch(data):
         raise lifecycle.LifecycleUnknown(
             f"session '{data.get('name')}' has an unresolved launch "
             f"(attempt {data['launching'].get('attempt')}); it is left as is")
@@ -1726,7 +1745,7 @@ def stop_and_settle(registry: "SessionRegistry", name: str, seen: dict, stop, se
     """
     try:
         with lifecycle.agent_lock(WOLTS_DIR, wolt or seen.get("wolt") or ""):
-            if seen.get("launching") or not registry.claim(name, seen, STOPPING, wolt=wolt):
+            if unresolved_launch(seen) or not registry.claim(name, seen, STOPPING, wolt=wolt):
                 return None
             invalidate_native(registry, name, wolt or seen.get("wolt") or "", seen)
             stopped = bool(stop(seen))
@@ -2168,17 +2187,32 @@ def _create_and_launch(registry, name, wolt, harness, target, prompt, fields) ->
     registry.create(name, wolt=wolt, harness=harness, dir=str(target.canonical_workdir),
                     target=target, prompt=prompt, **fields)
     attempt = mark_launching(registry, name, wolt, harness)
-    try:
+    with _launch_step(registry, name, wolt, attempt, name, settle=True):
         handle = _tmux_spawn(name, str(target.canonical_workdir), build_session_command(name, prompt))
-    except subprocess.CalledProcessError:
-        _launch_failed(registry, name, wolt, attempt, settle=True)
-        raise
     publish_runtime(registry, name, wolt, attempt, handle.to_record())
 
 
+def _tmux_exists(where) -> bool | None:
+    """True/False when tmux answered whether the session exists; None when it did not."""
+    probe = getattr(_runtime(), "session_exists", None)
+    return probe(_runtime_handle(where)) if probe else None
+
+
+@contextmanager
+def _launch_step(registry, name: str, wolt: str, attempt: str, where, *, settle: bool):
+    """One external launch step (spawn, paste, new window) of a marked attempt. A tmux
+    call that exited non-zero, or any failure after which tmux provably has no such
+    session, is a definite non-start (_launch_failed); anything else stays UNKNOWN."""
+    try:
+        yield
+    except Exception as exc:
+        if attempt and (isinstance(exc, subprocess.CalledProcessError) or _tmux_exists(where) is False):
+            _launch_failed(registry, name, wolt, attempt, settle=settle)
+        raise
+
+
 def _launch_failed(registry, name: str, wolt: str, attempt: str, *, settle: bool) -> None:
-    """A tmux call that exited non-zero is a reaped client, a definite failure (a
-    timeout is not: it stays UNKNOWN). Under the held lock, clear exactly this
+    """A definite failure (see _launch_step). Under the held lock, clear exactly this
     attempt and retire its locator. settle: a fresh new-session never started, so
     the row is stopped (launch_failed); a failed paste or new-window keeps the
     session's prior runtime and status untouched."""
@@ -2242,10 +2276,10 @@ def _relaunch(registry: "SessionRegistry", name: str, wolt: str, harness: str, o
     the wake's own admission checks, since the wake chose it."""
     with lifecycle.agent_lock(WOLTS_DIR, wolt):
         current = registry.get(name, wolt=wolt, check_alive=False)
-        if current is None or current.get("launching"):
+        if current is None or unresolved_launch(current):
             raise ResumeFailed(f"session '{name}' has an unresolved launch; nothing was relaunched")
         if only_resting and (current.get("status") != "resting" or current.get("wake_inhibit")
-                             or any(r.get("launching") for r in registry.records(wolt=wolt))):
+                             or any(unresolved_launch(r) for r in registry.records(wolt=wolt))):
             raise ResumeFailed(f"session '{name}' is no longer resting, was stopped by the owner, or the agent"
                                " is launching; the wake does not revive it")
         invalidate_native(registry, name, wolt, current)
@@ -2396,10 +2430,10 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
             # a new window on every ordinary agent exit.
             with _relaunch(registry, name, wolt, harness, only_resting) as attempt:
                 try:
-                    with _paste_lock(name, registry.db_dir):
+                    with _launch_step(registry, name, wolt, attempt, target, settle=False), \
+                            _paste_lock(name, registry.db_dir):
                         _tmux_paste(target, resume_cmd)
                 except subprocess.CalledProcessError as exc:
-                    _launch_failed(registry, name, wolt, attempt, settle=False)
                     raise ResumeFailed(f"session '{name}': the resume command could not be pasted ({exc})") from exc
                 publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
             _schedule_pickup(wolt)
@@ -2410,9 +2444,9 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
             # persist the exact pane tmux returns.
             with _relaunch(registry, name, wolt, harness, only_resting) as attempt:
                 try:
-                    target = _tmux_spawn_in_session(target, work_dir or "/workspace", resume_cmd)
+                    with _launch_step(registry, name, wolt, attempt, target, settle=False):
+                        target = _tmux_spawn_in_session(target, work_dir or "/workspace", resume_cmd)
                 except subprocess.CalledProcessError as exc:
-                    _launch_failed(registry, name, wolt, attempt, settle=False)
                     raise ResumeFailed(f"session '{name}': no window could be opened for the resume ({exc})") from exc
                 publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
             _schedule_pickup(wolt)
@@ -2451,11 +2485,8 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
     # Tmux is dead (or was just cleared out from under a stale, agentless
     # session) — create a fresh tmux session running the wrapper.
     with _relaunch(registry, name, wolt, harness, only_resting) as attempt:
-        try:
+        with _launch_step(registry, name, wolt, attempt, name, settle=True):  # a fresh new-session
             handle = _tmux_spawn(name, work_dir or "/workspace", resume_cmd)
-        except subprocess.CalledProcessError:
-            _launch_failed(registry, name, wolt, attempt, settle=True)  # a fresh new-session never started
-            raise
         publish_runtime(registry, name, wolt, attempt, handle.to_record(), status="running")
     _schedule_pickup(wolt)
     if not _await_agent(handle, harness):

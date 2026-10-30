@@ -369,6 +369,18 @@ class TmuxSessionRuntime:
         """
         return bool(self.panes_for_session(handle.tmux_session_name))
 
+    def session_exists(self, handle: RuntimeHandle) -> bool | None:
+        """Like is_alive, but only a tmux that answered says False (no such session, or
+        no server): a timeout or a missing binary is None, unknown."""
+        try:
+            self._run([self.tmux, "has-session", "-t", f"={handle.tmux_session_name}"],
+                      capture_output=True, text=True, check=True, timeout=_TMUX_TIMEOUT)
+        except subprocess.CalledProcessError:
+            return False
+        except (subprocess.SubprocessError, OSError):
+            return None
+        return True
+
     def handle_is_alive(self, handle: RuntimeHandle) -> bool:
         """Whether this handle's exact persisted execution surface exists."""
         if not handle.pane_id:

@@ -134,7 +134,7 @@ def test_publication_needs_the_exact_attempt(lodge):
 def test_with_the_inbox_off_there_is_no_locator_and_the_command_is_unchanged(lodge, monkeypatch):
     (lodge.root / "woltspace.json").write_text("{}")
     sessions.start_session(wolt="pal", name="pal-a-b-c")
-    assert lodge.calls.spawned[0][1]["native"] is None and "native" not in record(lodge, "pal-a-b-c")
+    assert lodge.calls.spawned[0][1] == {} and "native" not in record(lodge, "pal-a-b-c")  # no marker at all
     assert not lodge.calls.prepared
 
 
@@ -144,6 +144,7 @@ def unresolved(lodge, monkeypatch):
     def lost(name, cwd, command):
         raise subprocess.TimeoutExpired("tmux", 10)
     monkeypatch.setattr(sessions, "_tmux_spawn", lost)
+    monkeypatch.setattr(sessions, "_tmux_exists", lambda where: None)  # tmux did not answer either
     with pytest.raises(subprocess.TimeoutExpired):
         sessions.start_session(wolt="pal", name="pal-a-b-c")
     assert record(lodge, "pal-a-b-c")["launching"]
@@ -1072,14 +1073,100 @@ def test_a_hint_names_who_the_queued_mail_is_from_never_what_it_says(lodge, wake
     for key, sender, human in (("k1", "pal-a", False), ("k2", "telegram", True), ("k3", "pal-a", False),
                                ("k4", "pal-b", False), ("k5", "pal-c", False)):
         lodge.store.admit(sender, key, "pal", "secret body", human=human)
-    assert lodge.store.wake_facts("pal")["senders"] == ["pal-a", "your human", "pal-b", "pal-c"]  # oldest first, once each
+    assert lodge.store.wake_facts("pal")["senders"] == ["pal-a", "pal-b", "pal-c"]  # agents, oldest first, once each
     hints = []
     sys.modules["native_adapters"].deliver = lambda record, hint: hints.append(hint) or ("submitted", "queued")
     wake.live = "pal-live"
     lodge.registry.create("pal-live", wolt="pal")
     inbox_wake._wake(str(lodge.root), "pal")
-    assert hints[0].startswith("New inbox mail from pal-a, your human, pal-b and 1 more. Fetch your inbox")
+    assert hints[0].startswith("New inbox mail from your human, pal-a, pal-b, pal-c. Fetch your inbox")
     assert "secret body" not in hints[0]
+
+
+def test_your_human_comes_first_never_in_the_count_and_other_names_keep_the_wolt_charset(lodge, wake):
+    for n, sender in enumerate(("pal-a", "pal b\n`x`", "pal-c", "pal-d", "telegram")):
+        lodge.store.admit(sender, f"k{n}", "pal", "secret body", human=sender == "telegram")
+    hints = []
+    sys.modules["native_adapters"].deliver = lambda record, hint: hints.append(hint) or ("submitted", "queued")
+    wake.live = "pal-live"
+    lodge.registry.create("pal-live", wolt="pal")
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert hints[0].startswith("New inbox mail from your human, pal-a, pal-b--x-, pal-c and 1 more. Fetch")
+
+
+@pytest.mark.parametrize("change", ["attempt", "retired", "gone"])
+def test_a_hint_is_not_placed_when_the_session_changed_after_the_wake_read_it(lodge, wake, notices,
+                                                                             monkeypatch, change):
+    mail(lodge)
+    lodge.registry.create("pal-live", wolt="pal")
+    lodge.registry.update("pal-live", attempt="a1", native={"kind": "claude", "addr": "/x", "attempt": "a1"})
+    wake.live = "pal-live"
+    real = inbox_wake._sender
+
+    def meanwhile(facts):  # runs after the lock, before the hint is placed
+        if change == "attempt":
+            lodge.registry.update("pal-live", attempt="a2")
+        elif change == "retired":
+            sessions.invalidate_native(lodge.registry, "pal-live", "pal", record(lodge, "pal-live"))
+        else:
+            lodge.registry.delete("pal-live")
+        return real(facts)
+    monkeypatch.setattr(inbox_wake, "_sender", meanwhile)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert lodge.calls.delivered == [] and notices.lines == []  # nothing placed; the new attempt's pickup hints
+
+
+# -- #643 review: with the inbox off a launch is as on main; on, a provable non-start clears ------
+
+def test_with_the_inbox_off_a_lost_spawn_leaves_no_marker_and_ends_as_on_main(lodge, monkeypatch):
+    (lodge.root / "woltspace.json").write_text("{}")
+
+    def lost(name, cwd, command):
+        raise subprocess.TimeoutExpired("tmux", 10)
+    monkeypatch.setattr(sessions, "_tmux_spawn", lost)
+    monkeypatch.setattr(sessions, "_tmux_exists", lambda where: None)
+    with pytest.raises(subprocess.TimeoutExpired):
+        sessions.start_session(wolt="pal", name="pal-a-b-c")
+    assert "launching" not in record(lodge, "pal-a-b-c")
+    with sessions._relaunch(lodge.registry, "pal-a-b-c", "pal", "claude") as attempt:
+        assert attempt == ""
+    sessions.stop_session("pal-a-b-c")
+    assert record(lodge, "pal-a-b-c")["status"] == "stopped"
+
+
+def test_a_marker_left_from_inbox_on_days_holds_nothing_once_the_inbox_is_off(lodge, unresolved, monkeypatch):
+    (lodge.root / "woltspace.json").write_text("{}")
+    monkeypatch.setattr(sessions, "_tmux_sessions", lambda: set())
+    assert lodge.registry.reconcile() == [unresolved]
+    lodge.registry.update(unresolved, status="running")
+    sessions.stop_session(unresolved)
+    assert record(lodge, unresolved)["status"] == "stopped"
+
+
+@pytest.mark.parametrize("error", [subprocess.TimeoutExpired("tmux", 10), OSError("no tmux"), RuntimeError("x")])
+@pytest.mark.parametrize("exists", [False, None])
+def test_any_failed_spawn_clears_the_marker_only_when_tmux_provably_has_no_such_session(lodge, monkeypatch,
+                                                                                       error, exists):
+    def lost(name, cwd, command):
+        raise error
+    monkeypatch.setattr(sessions, "_tmux_spawn", lost)
+    monkeypatch.setattr(sessions, "_tmux_exists", lambda where: exists)
+    with pytest.raises(type(error)):
+        sessions.start_session(wolt="pal", name="pal-a-b-c")
+    row = record(lodge, "pal-a-b-c")
+    if exists is False:
+        assert "launching" not in row and (row["status"], row["stop_reason"]) == ("stopped", "launch_failed")
+        assert lodge.calls.retired == lodge.calls.prepared
+    else:
+        assert row["launching"] and row["status"] == "running" and not lodge.calls.retired
+
+
+def test_rearm_refuses_a_name_that_is_not_a_wolt_before_any_lock_file(lodge):
+    for bad in ("../x", "nobody", ""):
+        with pytest.raises(inbox.Refused):
+            inbox_wake.rearm(lodge.root, bad)
+    assert not (lodge.root / ".space" / "run" / "x.lock").exists()
+    assert not (lodge.root / ".space" / "run" / "lifecycle" / "nobody.lock").exists()
 
 
 def test_the_wake_texts_say_an_ack_confirms_receipt_not_completion():

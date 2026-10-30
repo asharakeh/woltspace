@@ -133,6 +133,12 @@ def _alive(pid: int) -> bool:
         return False if Path("/proc/self").exists() else True  # no procfs (macOS): trust the record
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A request that carries an inbox token never follows a redirect: the 3xx is an HTTPError."""
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 def announce_ready(attempt: str, kind: str = "ready") -> None:
     """Tell the lodge, once ready data is published, that this attempt takes input now, so
     mail that waited (a rest, a resume) gets its hint. Authenticated as the session's own
@@ -147,7 +153,7 @@ def announce_ready(attempt: str, kind: str = "ready") -> None:
         data=json.dumps({"session": session, "attempt": attempt, **({"kind": kind} if kind != "ready" else {})}).encode(),
         headers={"Content-Type": "application/json", "X-Woltspace-Inbox-Token": token})
     try:  # the lodge's own API: never through a proxy
-        urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=2).close()
+        urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect).open(request, timeout=2).close()
     except Exception:
         pass
 
@@ -214,7 +220,7 @@ def deliver(record: dict, hint: str) -> tuple[str, str]:
             if native["kind"] == KINDS["claude"]:
                 return _drop(Path(native["addr"]), hint, deadline)  # its next tool step's hook shows it
             if native["kind"] == KINDS["codex"]:
-                return _steer(ready, hint)
+                return _steer(ready, hint, deadline)
             return "pending", "busy"  # nothing placed: the turn_end announce brings the wake back
         if engine == "unknown" and native["kind"] == KINDS["codex"]:  # not yet (or no longer) observed
             return "pending", "not_ready"
@@ -253,19 +259,28 @@ def _codex(ready: dict, hint: str, deadline: float) -> tuple[str, str]:
     return ("submitted", "queued") if done.returncode == 0 else ("failed", f"rc{done.returncode}")
 
 
-def _steer(ready: dict, hint: str) -> tuple[str, str]:
+def _steer(ready: dict, hint: str, deadline: float) -> tuple[str, str]:
     """turn/steer into the thread's running turn, on the session's own app-server. Its newest turn
     is read first (no items): only one still in progress is steered. None, or a steer the turn
-    refuses (it just ended): pending/busy, so the turn's end hints instead."""
+    refuses (it just ended): pending/busy, so the turn's end hints instead. Both calls end at
+    deliver's deadline: before the steer was sent nothing is placed (pending/busy); after, it may
+    have been (unknown/timeout, as _codex)."""
     from native.launch import _codex_rpc
     try:
         [turns] = _codex_rpc(ready["sock"], [("thread/turns/list", {"threadId": ready["thread"], "limit": 1,
-                                                                    "itemsView": "notLoaded"})], strict=True)
+                                                                    "itemsView": "notLoaded"})],
+                             strict=True, deadline=deadline)
         newest = (turns.get("data") or [{}])[0]
         if newest.get("status") != "inProgress" or not newest.get("id"):
             return "pending", "busy"
+    except Exception:
+        return "pending", "busy"
+    try:
         _codex_rpc(ready["sock"], [("turn/steer", {"threadId": ready["thread"], "expectedTurnId": newest["id"],
-                                                   "input": [{"type": "text", "text": hint}]})], strict=True)
+                                                   "input": [{"type": "text", "text": hint}]})],
+                   strict=True, deadline=deadline)
+    except TimeoutError:
+        return "unknown", "timeout"
     except Exception:
         return "pending", "busy"
     return "submitted", "steered"

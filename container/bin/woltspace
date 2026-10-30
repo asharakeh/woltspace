@@ -51,6 +51,12 @@ API = os.environ.get("WOLTSPACE_API", "http://localhost:7777")
 _SESSION_RE = re.compile(r"-[0-9a-f]{6}$")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A call that carries a header (the inbox token) never follows a redirect: the 3xx is the answer."""
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 def _req(method, path, body=None, *, hint="", headers=None):
     url = f"{API}{path}"
     data = json.dumps(body).encode() if body is not None else None
@@ -58,7 +64,8 @@ def _req(method, path, body=None, *, hint="", headers=None):
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        opener = urllib.request.build_opener(_NoRedirect).open if headers else urllib.request.urlopen
+        with opener(req, timeout=15) as r:
             return r.status, json.loads(r.read().decode() or "{}")
     except urllib.error.HTTPError as e:
         try:

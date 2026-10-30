@@ -40,9 +40,11 @@ from __future__ import annotations
 
 import itertools
 import logging
+import re
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import inbox
 import lifecycle
@@ -108,7 +110,14 @@ def reconcile(wolts_dir) -> None:
 def rearm(wolts_dir, wolt: str) -> dict:
     """The operator's explicit clear of the wake state, then a wake. Refused while any
     of the agent's launches is unresolved. An owner's stop mark stays: that
-    conversation is never auto-resumed."""
+    conversation is never auto-resumed. A name that is not a wolt is refused before any lock."""
+    import wolt_archive
+    try:
+        wolt_archive.check_wolt_name(wolt)
+    except wolt_archive.ArchiveError:
+        raise inbox.Refused("unknown_wolt") from None
+    if not (Path(wolts_dir) / wolt / "wolt" / "wolt.json").is_file():
+        raise inbox.Refused("unknown_wolt")
     with lifecycle.agent_lock(wolts_dir, wolt):
         store = inbox.Store(wolts_dir, inbox.LIMITS)
         facts = store.wake_facts(wolt)
@@ -201,7 +210,12 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
         elif how:
             _answer(root, wolt, how, session=what)
         return
-    status, code = _deliver(record, HINT.format(sender=_sender(facts), nonce=uuid.uuid4().hex[:8]))
+    hint = HINT.format(sender=_sender(facts), nonce=uuid.uuid4().hex[:8])
+    fresh = registry.get(live, wolt=wolt, check_alive=False)  # the fence: re-read just before placing
+    if not fresh or any(fresh.get(k) != record.get(k) for k in ("attempt", "native", "launching")):
+        log.info("inbox hint for %s via %s: not placed, the session changed since the wake", wolt, live)
+        return  # a wait, unanswered: its new attempt's ready pickup hints
+    status, code = _deliver(fresh, hint)
     log.info("inbox hint for %s via %s: %s (%s)", wolt, live, status, code)
     if status == "submitted" or (status, code) == ("pending", "placed"):  # only a hint that reached the engine
         _answer(root, wolt, "hinted", session=live, hinted=hinted)
@@ -213,10 +227,12 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
 
 
 def _sender(facts: dict) -> str:
-    """" from pal-a, your human": who the queued mail is from, never what it says."""
-    names = facts.get("senders") or []
+    """" from your human, pal-a": who the queued mail is from, never what it says. The owner
+    always first and never counted in "and N more"; other names only in the wolt-name charset."""
+    names = [re.sub(r"[^A-Za-z0-9_-]", "-", name)[:64] for name in facts.get("senders") or []]
     more = f" and {len(names) - SENDERS} more" if len(names) > SENDERS else ""
-    return f" from {', '.join(names[:SENDERS])}{more}" if names else ""
+    names = (["your human"] if facts.get("human") else []) + names[:SENDERS]
+    return f" from {', '.join(names)}{more}" if names else ""
 
 
 def _resumable(record: dict | None) -> bool:

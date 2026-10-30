@@ -22,7 +22,7 @@ function announceReady() {
   if (!token || !session) return;
   const api = process.env.WOLTSPACE_API || "http://localhost:7777";
   fetch(`${api}/inbox/ready`, {
-    method: "POST", signal: AbortSignal.timeout(2000),
+    method: "POST", signal: AbortSignal.timeout(2000), redirect: "error", // the token never follows one
     headers: { "Content-Type": "application/json", "X-Woltspace-Inbox-Token": token },
     body: JSON.stringify({ session, attempt }),
   }).catch(() => {});

@@ -102,15 +102,24 @@ def plan_hermes(argv: list[str], directory: Path, attempt: str, python: str) -> 
             "tui_env": {"HERMES_TUI_GATEWAY_URL": f"ws://127.0.0.1:{port}/ws"}, "port": port}
 
 
-def _codex_rpc(sock: str, calls: list[tuple[str, dict]], strict: bool = False) -> list[dict]:
-    """strict: an error reply raises instead of reading as an empty result."""
+def _codex_rpc(sock: str, calls: list[tuple[str, dict]], strict: bool = False,
+               deadline: float | None = None) -> list[dict]:
+    """strict: an error reply raises instead of reading as an empty result. deadline (monotonic):
+    the whole exchange ends there, however many notifications arrive (TimeoutError)."""
     from websockets.sync.client import unix_connect
-    with unix_connect(sock, "ws://localhost/", open_timeout=5) as conn:
+
+    def left():
+        if deadline is None:
+            return 5
+        if (rest := deadline - time.monotonic()) <= 0:
+            raise TimeoutError("codex app-server: no reply before the deadline")
+        return min(5, rest)
+    with unix_connect(sock, "ws://localhost/", open_timeout=left()) as conn:
         out, n = [], 0
         for method, params in [("initialize", {"clientInfo": {"name": "woltspace-native", "version": "1"}}), *calls]:
             n += 1
             conn.send(json.dumps({"id": n, "method": method, "params": params}))
-            while (reply := json.loads(conn.recv(timeout=5))).get("id") != n:
+            while (reply := json.loads(conn.recv(timeout=left()))).get("id") != n:
                 pass
             if n == 1:
                 conn.send(json.dumps({"method": "initialized"}))

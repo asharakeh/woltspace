@@ -25,11 +25,31 @@ TOKEN_HEADER = "X-Woltspace-Inbox-Token"
 _FIELDS = {"send": {"to", "key", "text", "session"}, "fetch": set(), "ack": {"seq", "claim"},
            "release": {"seq", "claim"}, "status": {"key"}}
 _HTTP = {"inbox_disabled": 404, "unsupported": 404, "invalid": 400, "reader_invalid": 401,
-         "store_busy": 503, "store_failed": 503, "lifecycle_busy": 409, "launch_unknown": 409}
+         "store_busy": 503, "store_failed": 503, "lifecycle_busy": 409, "launch_unknown": 409,
+         "too_large": 413, "owner_only": 403, "unknown_wolt": 404}
+# No message can be larger than a whole mailbox; the rest is JSON's own room.
+MAX_BODY = inbox.LIMITS.mailbox_bytes + 64 * 1024
+
+
+class _TooLarge(Exception):
+    pass
 
 
 def _error(code: str) -> JSONResponse:
     return JSONResponse({"error": code}, status_code=_HTTP.get(code, 409))
+
+
+async def _body(request: Request):
+    """The request's JSON, read only up to MAX_BODY bytes (_TooLarge past it); {} when empty.
+    ValueError: not JSON."""
+    if int(request.headers.get("content-length") or 0) > MAX_BODY:
+        raise _TooLarge
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > MAX_BODY:
+            raise _TooLarge
+    return json.loads(bytes(raw) or b"{}")
 
 
 @router.get("/summary")
@@ -52,9 +72,11 @@ async def inbox_ready(request: Request):
     if not inbox.enabled(WOLTS_DIR):
         return _error("inbox_disabled")
     try:
-        body = json.loads(await request.body() or b"{}")
+        body = await _body(request)
         assert isinstance(body, dict) and {"session", "attempt"} <= set(body) <= {"session", "attempt", "kind"}
         assert all(isinstance(body[k], str) and body[k] for k in body)
+    except _TooLarge:
+        return _error("too_large")
     except (ValueError, AssertionError):
         return _error("invalid")
     try:
@@ -67,13 +89,19 @@ async def inbox_ready(request: Request):
 
 @router.post("/rearm")
 async def inbox_rearm(request: Request):
-    """The owner's explicit rearm of an agent's inhibited wake (inbox_wake.rearm)."""
+    """The owner's explicit rearm of an agent's inhibited wake (inbox_wake.rearm). Like every
+    owner route it trusts the localhost guard; a caller holding a session's inbox token is an
+    agent, never the owner."""
     if not inbox.enabled(WOLTS_DIR):
         return _error("inbox_disabled")
+    if TOKEN_HEADER in request.headers:
+        return _error("owner_only")
     try:
-        body = json.loads(await request.body() or b"{}")
+        body = await _body(request)
         wolt = body["wolt"]
         assert set(body) == {"wolt"} and isinstance(wolt, str)
+    except _TooLarge:
+        return _error("too_large")
     except (ValueError, KeyError, TypeError, AssertionError):
         return _error("invalid")
     try:
@@ -89,7 +117,9 @@ async def inbox_call(verb: str, request: Request):
     if not inbox.enabled(WOLTS_DIR):
         return _error("inbox_disabled")
     try:
-        body = json.loads(await request.body() or b"{}")
+        body = await _body(request)
+    except _TooLarge:
+        return _error("too_large")
     except ValueError:
         return _error("invalid")
     if not isinstance(body, dict) or not set(body) <= _FIELDS[verb]:

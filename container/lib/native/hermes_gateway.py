@@ -73,6 +73,10 @@ def _announce_ready():
     """As native_adapters.announce_ready (this runs on Hermes's own interpreter): one bounded,
     reader-authenticated POST so mail that waited gets its hint. A failure is ignored."""
     import urllib.request
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):  # the token never follows a redirect
+        def redirect_request(self, *args, **kwargs):
+            return None
     token, session = os.environ.get("WOLTSPACE_INBOX_TOKEN"), os.environ.get("WOLTSPACE_WOLT_SESSION")
     if token and session:
         request = urllib.request.Request(
@@ -80,7 +84,7 @@ def _announce_ready():
             data=json.dumps({"session": session, "attempt": attempt}).encode(),
             headers={"Content-Type": "application/json", "X-Woltspace-Inbox-Token": token})
         try:
-            urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=2).close()
+            urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect).open(request, timeout=2).close()
         except Exception:
             pass
 

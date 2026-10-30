@@ -260,10 +260,10 @@ class Store:
                     "prefer_queued": conn.execute(  # the preference's own message, still for its session
                         "SELECT 1 FROM inbox_messages WHERE seq=? AND state='queued'",
                         ((wake.get("prefer") or {}).get("seq"),)).fetchone() is not None,
-                    "senders": list(dict.fromkeys(  # who the queued mail is from, oldest first; the owner as "your human"
-                        "your human" if priority == HUMAN else name for name, priority in conn.execute(
-                            "SELECT sender_name, priority FROM inbox_messages WHERE mailbox=? AND state='queued'"
-                            " ORDER BY seq", (row["id"],)))),
+                    "senders": list(dict.fromkeys(  # who the queued agent mail is from, oldest first
+                        name for name, in conn.execute(
+                            "SELECT sender_name FROM inbox_messages WHERE mailbox=? AND state='queued'"
+                            " AND priority != ? ORDER BY seq", (row["id"], HUMAN)))),
                     "unanswered": [{"seq": seq, "human": priority == HUMAN, "session": taker}
                                    for seq, priority, taker in conn.execute(
                         "SELECT m.seq, m.priority, CASE WHEN m.state != 'queued' THEN r.session END"

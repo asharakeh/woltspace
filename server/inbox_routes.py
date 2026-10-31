@@ -65,6 +65,30 @@ async def inbox_summary():
     return {"ok": True, "now": time.time(), "wolts": wolts}
 
 
+@router.get("/messages")
+async def inbox_messages(request: Request):
+    """Retained mail with its text, a page at a time, for the owner's read-only viewer
+    (Store.messages): ?wolt= one receiver, ?before= the previous page's next, ?limit=. An owner
+    route, so a caller holding a session's inbox token is refused. Never cached, never logged;
+    viewing claims, acks, releases or purges nothing."""
+    if not inbox.enabled(WOLTS_DIR):
+        return _error("inbox_disabled")
+    if TOKEN_HEADER in request.headers:
+        return _error("owner_only")
+    query = request.query_params
+    try:
+        assert set(query) <= {"wolt", "before", "limit"} and len(query.multi_items()) == len(set(query))
+        args = {k: int(query[k]) for k in ("before", "limit") if k in query and query[k].isascii()
+                and query[k].isdigit()}
+        assert len(args) == len(set(query) - {"wolt"})
+        page = await run_in_threadpool(inbox.Store(WOLTS_DIR, inbox.LIMITS).messages, query.get("wolt"), **args)
+    except AssertionError:
+        return _error("invalid")
+    except inbox.InboxError as exc:
+        return _error(exc.code)
+    return JSONResponse({"ok": True, "now": time.time(), **page}, headers={"Cache-Control": "no-store"})
+
+
 @router.post("/ready")
 async def inbox_ready(request: Request):
     """A session's native backend announces its attempt ready (native_adapters.announce_ready).

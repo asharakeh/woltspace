@@ -26,6 +26,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from native_adapters import ASSETS, KINDS, RETIRED, announce_ready, clear_state, retire, write_ready, write_state  # noqa: E402
 
 CODEX_BYPASS = "--dangerously-bypass-approvals-and-sandbox"
+CODEX_SWITCHES = {  # a permission switch's app-server config
+    CODEX_BYPASS: ['approval_policy="never"', 'sandbox_mode="danger-full-access"'],
+    # From its help ("automatic review using the workspace-write sandbox") and
+    # the binary's config keys; not yet run against a backend.
+    "--approve-for-me": ['approval_policy="on-request"', 'approvals_reviewer="auto_review"',
+                         'sandbox_mode="workspace-write"'],
+}
+CODEX_OPTIONS = {"-a": "approval_policy", "-s": "sandbox_mode", "-c": None}  # None: already key=value
 
 
 def _value(argv: list[str], *flags: str) -> str | None:
@@ -33,6 +41,23 @@ def _value(argv: list[str], *flags: str) -> str | None:
         if word in flags:
             return argv[i + 1]
     return None
+
+
+def _codex_policy(argv: list[str]) -> tuple[list[str], set[int]]:
+    """The permission flags of a codex argv as app-server -c config, and their positions."""
+    config, used, i = [], set(), 0
+    while i < len(argv):
+        word = argv[i]
+        if word in CODEX_SWITCHES:
+            config += CODEX_SWITCHES[word]
+            used.add(i)
+        elif word in CODEX_OPTIONS and i + 1 < len(argv):
+            key, value = CODEX_OPTIONS[word], argv[i + 1]
+            config.append(value if key is None else f"{key}={json.dumps(value)}")
+            used |= {i, i + 1}
+            i += 1
+        i += 1
+    return [part for item in config for part in ("-c", item)], used
 
 
 def free_port() -> int:
@@ -47,12 +72,11 @@ def plan_codex(argv: list[str], directory: Path) -> dict:
     config = []
     if model := _value(argv, "-m", "--model"):
         config += ["-c", f"model={json.dumps(model)}"]
-    if CODEX_BYPASS in argv:
-        config += ["-c", 'approval_policy="never"', "-c", 'sandbox_mode="danger-full-access"']
-    tui = [word for word in argv if word != "--no-daemon"]
-    at = 2 if tui[:1] == ["resume"] else 0
-    if at:  # a remote resume refuses permission flags; the server's config above carries the policy
-        tui = [word for word in tui if word != CODEX_BYPASS]
+    policy, used = _codex_policy(argv)
+    config += policy
+    at = 2 if argv[:1] == ["resume"] else 0
+    # A remote resume refuses permission flags; the server's config above carries the policy.
+    tui = [word for i, word in enumerate(argv) if word != "--no-daemon" and not (at and i in used)]
     tui[at:at] = ["--remote", f"unix://{sock}"]
     return {"backend": ["codex", "app-server", *config, "--listen", f"unix://{sock}"], "backend_env": {},
             "tui": ["codex", *tui], "tui_env": {}, "sock": str(sock),

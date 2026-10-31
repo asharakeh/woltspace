@@ -46,6 +46,7 @@ from harnesses import (
     resolve_model,
     get_harness,
     get_default_harness,
+    get_default_level,
     harness_install_problem,
     build_command,
     policy_flags,
@@ -2156,6 +2157,7 @@ def start_session(
         isolation=isolation,
         target=target,
         grants=AutoGrantStore(WOLTS_DIR),
+        lodge_default=get_default_level(harness, isolation),
     )
     policy_flags(harness, policy)  # a level this engine does not offer is refused here
 

@@ -240,10 +240,10 @@ def test_codex_plan_runs_the_tui_remote_on_its_own_server_with_the_same_model_an
 
 
 def test_codex_ask_runs_on_the_server_and_a_remote_resume_carries_no_permission_flags(tmp_path):
-    ask = ["-a", "on-request", "-s", "danger-full-access"]
+    ask = ["-a", "on-request", "-s", "workspace-write"]
     plan = launch.plan_codex(["resume", "t1", "--no-daemon", *ask, "-m", "gpt-x"], tmp_path)
     assert plan["backend"][2:8] == ["-c", 'model="gpt-x"', "-c", 'approval_policy="on-request"',
-                                    "-c", 'sandbox_mode="danger-full-access"']
+                                    "-c", 'sandbox_mode="workspace-write"']
     assert plan["tui"] == ["codex", "resume", "t1", "--remote", f"unix://{tmp_path}/app.sock", "-m", "gpt-x"]
     assert launch.plan_codex([*ask, "hi"], tmp_path)["tui"][3:] == [*ask, "hi"]  # a fresh TUI keeps them
 

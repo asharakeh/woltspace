@@ -44,6 +44,7 @@ import lodge_db
 MAX_PAYLOAD_BYTES = 32 * 1024  # of UTF-8
 RETAIN_SECONDS = 30 * 86400    # acknowledged metadata, from the first ack
 HUMAN, AGENT = 0, 1            # priority: lower is fetched first
+MESSAGE_PAGE = 50              # rows per page of the owner's viewer (Store.messages)
 _MAX_INT = 2**63 - 1  # SQLite's INTEGER
 # A reader that may act now; binds ? to its hash.
 # Acknowledged metadata past its 30 days; binds ? to the cutoff. Absent to every read.
@@ -589,6 +590,30 @@ class Store:
                 (HUMAN, AGENT)).fetchall()
         return [{"wolt": r[0], "state": r[1], "queued_human": r[2], "queued_agent": r[3],
                  "claimed": r[4], "held": r[5], "oldest_queued_at": r[6]} for r in rows]
+
+    def messages(self, wolt: str | None = None, before: int | None = None, limit: int = MESSAGE_PAGE) -> dict:
+        """The owner's read-only view of retained mail, newest first: every queued, claimed or
+        held message (an acknowledged one has no text left) for one receiver, or all when wolt
+        is None. Each row: seq (the page cursor only), the sender's name, sender_wolt (set only
+        while the sending mailbox is open, so it names a real wolt), human, when it came, its
+        state and its text. Never a key, claim, reader or route. before: the previous page's
+        oldest seq; next: this page's, or None on the last page."""
+        if wolt is not None:
+            _text(wolt, self.limits.name_chars, "wolt")
+        cursor = _MAX_INT if before is None else _count(before, "before", 1)
+        limit = min(_count(limit, "limit", 1), MESSAGE_PAGE)
+        held = ("CASE WHEN m.state = 'claimed' AND NOT EXISTS ("
+                + _VALID.replace("r.hash = ?", "r.hash = m.reader") + ") THEN 'held' ELSE m.state END")
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT m.seq, m.sender_name, src.wolt, m.priority, m.created_at, " + held + ", m.body"
+                " FROM inbox_messages m JOIN inbox_mailboxes dest ON dest.id = m.mailbox"
+                " LEFT JOIN inbox_mailboxes src ON m.sender = 'mailbox:' || src.id AND src.state = 'open'"
+                " WHERE m.state != 'acknowledged' AND dest.state != 'closed' AND (? IS NULL OR dest.wolt = ?)"
+                " AND m.seq < ? ORDER BY m.seq DESC LIMIT ?", (wolt, wolt, cursor, limit + 1)).fetchall()
+        page = [{"seq": r[0], "sender": r[1], "sender_wolt": r[2], "human": r[3] == HUMAN, "at": r[4],
+                 "state": r[5], "text": (r[6] or b"").decode("utf-8", "replace")} for r in rows[:limit]]
+        return {"messages": page, "next": page[-1]["seq"] if len(rows) > limit else None}
 
     def unnoticed_agent_mail(self, wolt: str, reason: str) -> list[dict]:
         """Queued mail for the wolt from other agents (never a provider: a lodge

@@ -36,5 +36,5 @@
       if(messages)messages.setWolts(data.wolts.map(w=>w.wolt));
     }catch(e){root.replaceChildren(make('p','',`Could not load the inbox: ${e.message}`))}
   }
-  load();setInterval(load,15000);
+  load();setInterval(()=>{if(document.visibilityState==='visible')load()},15000);
 })();

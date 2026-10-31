@@ -95,7 +95,8 @@
     host.hidden = true;  // until the first count: an inbox that is off shows nothing
     document.body.appendChild(host);
     var root = host.attachShadow({ mode: 'open' });
-    root.append(el('style', { text: opts.shellVars || ':host{all:initial}' }),
+    // all:initial would undo [hidden]: keep hidden meaning hidden, from the first frame.
+    root.append(el('style', { text: (opts.shellVars || ':host{all:initial}') + ':host([hidden]){display:none}' }),
       el('link', { rel: 'stylesheet', href: '/static/design-system.css' + VER }),
       el('link', { rel: 'stylesheet', href: '/static/wolt-shell/shell.css' + VER }),
       el('link', { rel: 'stylesheet', href: '/static/wolt-shell/inbox-viewer.css' + VER }));

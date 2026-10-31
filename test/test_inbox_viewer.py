@@ -2,6 +2,8 @@
 two mounts (the site shell's right pill, the lodge Inbox page). Real SQL on a dummy root."""
 
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -118,3 +120,11 @@ def test_the_inbox_page_mounts_the_same_viewer(tmp_path, monkeypatch):
     page = TestClient(server_app.app, base_url="http://localhost:7777").get("/inbox")
     assert page.status_code == 200 and 'id="inbox-messages"' in page.text
     assert page.text.index("/static/wolt-shell/inbox-viewer.js") < page.text.index("/static/inbox.js")
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node is not installed")
+def test_the_viewer_renders_text_only_and_drops_stale_answers():
+    """test/inbox-viewer.test.mjs: the viewer's list on the repo's fake DOM."""
+    out = subprocess.run(["node", "--test", str(ROOT / "test" / "inbox-viewer.test.mjs")],
+                         capture_output=True, text=True, timeout=60, cwd=ROOT)
+    assert out.returncode == 0, out.stdout + out.stderr

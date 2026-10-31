@@ -239,6 +239,24 @@ def test_codex_plan_runs_the_tui_remote_on_its_own_server_with_the_same_model_an
     assert "-c" not in launch.plan_codex(["--no-daemon"], tmp_path)["backend"]
 
 
+def test_codex_ask_runs_on_the_server_and_a_remote_resume_carries_no_permission_flags(tmp_path):
+    ask = ["-a", "on-request", "-s", "workspace-write"]
+    plan = launch.plan_codex(["resume", "t1", "--no-daemon", *ask, "-m", "gpt-x"], tmp_path)
+    assert plan["backend"][2:8] == ["-c", 'model="gpt-x"', "-c", 'approval_policy="on-request"',
+                                    "-c", 'sandbox_mode="workspace-write"']
+    assert plan["tui"] == ["codex", "resume", "t1", "--remote", f"unix://{tmp_path}/app.sock", "-m", "gpt-x"]
+    assert launch.plan_codex([*ask, "hi"], tmp_path)["tui"][3:] == [*ask, "hi"]  # a fresh TUI keeps them
+
+
+def test_codex_auto_runs_on_the_server_with_automatic_review_and_its_network_key(tmp_path):
+    auto = ["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true"]
+    plan = launch.plan_codex(["resume", "t1", *auto], tmp_path)
+    assert plan["backend"][2:-2] == [
+        "-c", 'approval_policy="on-request"', "-c", 'approvals_reviewer="auto_review"',
+        "-c", 'sandbox_mode="workspace-write"', "-c", "sandbox_workspace_write.network_access=true"]
+    assert plan["tui"] == ["codex", "resume", "t1", "--remote", f"unix://{tmp_path}/app.sock"]
+
+
 def test_opencode_plan_moves_model_and_auto_to_the_server_and_keeps_its_password_private(tmp_path):
     plan = launch.plan_opencode(["--auto", "--session", "ses_1", "--model", "p/m"], tmp_path, "/work")
     assert json.loads(plan["backend_env"]["OPENCODE_CONFIG_CONTENT"]) == {"model": "p/m", "permission": {"*": "allow"}}

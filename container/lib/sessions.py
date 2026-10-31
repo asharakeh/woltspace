@@ -48,6 +48,7 @@ from harnesses import (
     get_default_harness,
     harness_install_problem,
     build_command,
+    policy_flags,
     session_has_agent_process,
     sessions_with_agent_process,
     platform_skill_invoke,
@@ -2117,6 +2118,7 @@ def start_session(
         target=target,
         grants=AutoGrantStore(WOLTS_DIR),
     )
+    policy_flags(harness, policy)  # a level this engine does not offer is refused here
 
     name = name or session_name(wolt)
     # pin wins if valid for the resolved harness, else the tier default (see resolve_model)

@@ -252,16 +252,16 @@ def test_an_evicted_attempt_is_not_brought_back_by_its_outcome(tmp_path):
 
 # -- backup and restore ----------------------------------------------------------
 
-def test_the_archive_restores_beside_mail_and_without_it(tmp_path, monkeypatch):
+def test_an_archive_restores_with_or_without_mail(tmp_path, monkeypatch):
     source = tmp_path / "wolts"
     store = lodge(source)
     (source / ".space" / "platform").mkdir(parents=True, exist_ok=True)
     token = reader(store, "s1")
     store.send(token, "pal", "k", "kept as history")
-    with_mail = backup.restore_backup(backup.create_backup(source, out_dir=tmp_path / "o1").archive,
-                                      to=tmp_path / "b1").wolts_dir  # queued mail restores as it is
-    assert archived(with_mail) == archived(source)
-    assert rows(with_mail, "SELECT count(*) FROM inbox_messages") == [(1,)]
+    queued = backup.restore_backup(backup.create_backup(source, out_dir=tmp_path / "o1").archive,
+                                   to=tmp_path / "b1").wolts_dir  # queued mail restores as it is
+    assert archived(queued) == archived(source)
+    assert rows(queued, "SELECT state FROM inbox_messages") == [("queued",)]
     acked(store, token)
     later = time.time() + inbox.RETAIN_SECONDS + 1
     monkeypatch.setattr(inbox.time, "time", lambda: later)

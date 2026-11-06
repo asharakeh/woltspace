@@ -4,7 +4,7 @@ on:
   workflow_call:
   pull_request:
   push:
-    branches: [main, 'release/**']
+    branches: [main, simulated-main, 'release/**']
   workflow_dispatch:
 
 permissions:

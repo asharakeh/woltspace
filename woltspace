@@ -47,6 +47,15 @@ WOLTS_DIR="${WOLTS_DIR/#\~/$HOME}"
 # the container, whose first process runs as root with that environment.
 ENV_FILE="${WOLTSPACE_ENV_FILE:-$WOLTS_DIR/.env}"
 ENV_FILE="${ENV_FILE/#\~/$HOME}"
+FEATURE_ISOLATION="${WOLTSPACE_FEATURE_ISOLATION:-false}"
+case "$FEATURE_ISOLATION" in
+  true|false) ;;
+  *) echo "error: WOLTSPACE_FEATURE_ISOLATION must be true or false" >&2; exit 1 ;;
+esac
+if [ "$FEATURE_ISOLATION" = true ] && [ "$ENV_FILE" != "$WOLTS_DIR/.env" ]; then
+  echo "error: isolation supports only the default lodge .env; WOLTSPACE_ENV_FILE override is unsupported" >&2
+  exit 1
+fi
 
 # Default name for default path, hash-suffixed for custom paths (avoids collisions)
 if [ -n "${WOLTSPACE_CONTAINER:-}" ]; then
@@ -361,8 +370,13 @@ _start_container() {
   fi
   # An image built without sudo says so in its label. Then no setuid binary
   # may hand a process root either.
-  local privilege_args=""
-  [ "$(docker image inspect -f '{{index .Config.Labels "woltspace.node_sudo"}}' "$IMAGE" 2>/dev/null)" = false ] \
+  local privilege_args="" env_args=(--env-file "$ENV_FILE")
+  local node_sudo=$(docker image inspect -f '{{index .Config.Labels "woltspace.node_sudo"}}' "$IMAGE" 2>/dev/null)
+  if [ "$FEATURE_ISOLATION" = true ]; then
+    [ "$node_sudo" = false ] || { echo "error: isolation requires a no-sudo image" >&2; exit 1; }
+    env_args=()  # never expose the shared dotenv to privileged startup
+  fi
+  [ "$node_sudo" = false ] \
     && privilege_args="--security-opt no-new-privileges"
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
@@ -382,7 +396,8 @@ _start_container() {
   mkdir -p "$WOLTS_DIR/.claude"
   docker run -d \
     --name "$CONTAINER_NAME" \
-    --env-file "$ENV_FILE" \
+    "${env_args[@]}" \
+    -e WOLTSPACE_FEATURE_ISOLATION="$FEATURE_ISOLATION" \
     -e HOST_UID=$(id -u) \
     -e HOST_GID=$(id -g) \
     -v "$WOLTS_DIR:/workspace/wolts:rw" \
@@ -402,6 +417,15 @@ _start_container() {
   fi
   echo "  ${_D}🏕️ container started${_R}"
   echo "  ${_L}   the lodge is open${_R}"
+}
+
+_check_existing_feature() {
+  local selected
+  selected=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_NAME" \
+    | sed -n 's/^WOLTSPACE_FEATURE_ISOLATION=//p')
+  [ "${selected:-false}" = "$FEATURE_ISOLATION" ] || {
+    echo "error: isolation selection differs from the existing container; rebuild it explicitly" >&2; exit 1;
+  }
 }
 
 # The native CLI, if the wheel is installed beside this launcher. The python
@@ -898,10 +922,12 @@ RESTORE
     fi
 
     if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+      _check_existing_feature
       echo "  ${_D}🦫 container running${_R}"
       echo "  ${_L}   already gnawing${_R}"
       _show_url
     elif docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+      _check_existing_feature
       echo "  ${_D}☀️ resuming container${_R}"
       echo "  ${_L}   waking up the lodge...${_R}"
       rm -f "$WOLTS_DIR/.space/platform/tunnel.json"

@@ -136,6 +136,7 @@ impl<R: CommandRunner> EngineController<R> {
             args.extend(["--env-file".to_owned(), env_file.display().to_string()]);
         }
         args.extend([
+            "-e".to_owned(), "WOLTSPACE_FEATURE_ISOLATION=false".to_owned(),
             "-v".to_owned(), mount, "-v".to_owned(), claude_mount,
             "-p".to_owned(), "127.0.0.1:7777:7777".to_owned(),
         ]);

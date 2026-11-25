@@ -124,7 +124,7 @@ container_id=$(docker inspect -f '{{.Id}}' "$name")
 docker kill --signal KILL "$name"
 [[ $(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$name") == 'exited 137' ]]
 docker diff "$name" | grep -Fx "A $store" >/dev/null
-./woltspace start
+docker start "$container_id"
 [[ $(docker inspect -f '{{.Id}}' "$name") == "$container_id" ]]
 check_isolation
 after=$(docker exec --user 990:990 "$name" sha256sum "$store")

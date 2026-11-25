@@ -6,7 +6,7 @@ failure_line=1
 annotate_failure() {
     local failed_phase=$1 source_line=$2
     case "$failed_phase" in
-        setup|image-build|flag-off|flag-on|forced-stop-resume|clean-stop|cleanup) ;;
+        setup|image-build|flag-off|flag-on|forced-stop-resume|clean-stop|cleanup|start-port-conflict|start-permission|start-id-init|start-oom|start-early-exit|start-docker-run|start-launcher-exit|start-unknown|start-missing-file|start-import-error|start-init-command) ;;
         *) failed_phase=setup ;;
     esac
     [[ $source_line =~ ^[1-9][0-9]{0,5}$ ]] || source_line=1
@@ -73,9 +73,54 @@ health() {
     return 1
 }
 
+# Raw launcher output and xtrace stay in the private run root, then cleanup removes them.
+# Categories are evidence hints, not a claim that the underlying cause is proven.
+start_diagnostic() {
+    local state category source_line
+    state=$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}} {{.State.OOMKilled}}' "$name" 2>/dev/null) || state=''
+    read -r category source_line < <(python3 - "$root/start.out" "$root/start.trace" "$state" <<'PYDIAG'
+import pathlib, re, sys
+output = pathlib.Path(sys.argv[1]).read_text(errors="replace").lower()
+trace = pathlib.Path(sys.argv[2]).read_text(errors="replace")
+state = sys.argv[3].split()
+commands = re.findall(r"^\++broker-launcher:([1-9][0-9]{0,5}): (.*)$", trace, re.M)
+line, last = commands[-1] if commands else ("1", "")
+category = "start-unknown"
+if len(state) == 3 and state[2] == "true":
+    category = "start-oom"
+elif any(text in output for text in ("port is already allocated", "address already in use")):
+    category = "start-port-conflict"
+elif any(text in output for text in ("invalid user", "invalid group", "usermod:", "groupmod:", "uid_map", "gid_map")):
+    category = "start-id-init"
+elif any(text in output for text in ("permission denied", "operation not permitted", "permissionerror:", "cannot connect to the docker daemon")):
+    category = "start-permission"
+elif "filenotfounderror:" in output:
+    category = "start-missing-file"
+elif "modulenotfounderror:" in output or "importerror:" in output:
+    category = "start-import-error"
+elif "container_entrypoint.py" in output and "subprocess.calledprocesserror:" in output:
+    category = "start-init-command"
+elif len(state) == 3 and state[0] == "false" and state[1].isdigit():
+    category = "start-early-exit"
+elif last.startswith("docker run "):
+    category = "start-docker-run"
+elif len(state) == 3 and state[0] == "true":
+    category = "start-launcher-exit"
+print(category, line)
+PYDIAG
+    ) || { category=start-unknown; source_line=1; }
+    annotate_failure "${category:-start-unknown}" "${source_line:-1}"
+}
+
 phase=flag-off
 printf 'DEV_MODE=false\nWOLTSPACE_PUBLIC_TUNNEL=false\n' >"$WOLTSPACE_WOLTS_DIR/.env"
-./woltspace start
+start_line=$((LINENO + 1))
+(umask 077; PS4='+broker-launcher:${LINENO}: ' BASH_XTRACEFD=4 bash -x ./woltspace start 4>"$root/start.trace" >"$root/start.out" 2>&1) || {
+    status=$?
+    failure_line=$start_line
+    start_diagnostic
+    exit "$status"
+}
 health
 ./woltspace stop
 [[ -z $(docker ps -aq --filter "name=^/${name}$") ]]

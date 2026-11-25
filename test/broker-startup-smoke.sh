@@ -115,7 +115,7 @@ PYDIAG
 phase=flag-off
 printf 'DEV_MODE=false\nWOLTSPACE_PUBLIC_TUNNEL=false\n' >"$WOLTSPACE_WOLTS_DIR/.env"
 start_line=$((LINENO + 1))
-(umask 077; PS4='+broker-launcher:${LINENO}: ' BASH_XTRACEFD=4 bash -x ./woltspace start 4>"$root/start.trace" >"$root/start.out" 2>&1) || {
+(umask 077; env SHELLOPTS=xtrace PS4='+broker-launcher:${LINENO}: ' BASH_XTRACEFD=4 bash -x ./woltspace start 4>"$root/start.trace" >"$root/start.out" 2>&1) || {
     status=$?
     failure_line=$start_line
     start_diagnostic

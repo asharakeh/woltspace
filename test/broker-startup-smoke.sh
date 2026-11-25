@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 exec 3>&1 >/dev/null 2>&1
-root=$(mktemp -d) || { echo 'FAIL setup' >&3; exit 1; }
+failure_line=1
+annotate_failure() {
+    local failed_phase=$1 source_line=$2
+    case "$failed_phase" in
+        setup|image-build|flag-off|flag-on|forced-stop-resume|clean-stop|cleanup) ;;
+        *) failed_phase=setup ;;
+    esac
+    [[ $source_line =~ ^[1-9][0-9]{0,5}$ ]] || source_line=1
+    printf '::error::broker-smoke phase=%s line=%s\n' "$failed_phase" "$source_line" >&3
+}
+trap 'failure_line=$LINENO' ERR
+root=$(mktemp -d) || { annotate_failure setup "$LINENO"; echo 'FAIL setup' >&3; exit 1; }
 export WOLTSPACE_CONTAINER="broker-smoke-${root##*.}"
 export WOLTSPACE_IMAGE="broker-smoke:${root##*.}"
 export HOME="$root/home" XDG_CONFIG_HOME="$root/config" XDG_DATA_HOME="$root/data"
@@ -26,17 +37,23 @@ cleanup() {
         fi
     fi
     rm -rf -- "$root" || cleaned=1
-    if (( status != 0 )); then printf 'FAIL %s\n' "$phase" >&3; fi
-    if (( cleaned != 0 )); then echo 'FAIL cleanup' >&3; exit 1; fi
+    if (( status != 0 )); then
+        annotate_failure "$phase" "$failure_line"
+        printf 'FAIL %s\n' "$phase" >&3
+    fi
+    if (( cleaned != 0 )); then
+        if (( status == 0 )); then annotate_failure cleanup "$LINENO"; fi
+        echo 'FAIL cleanup' >&3; exit 1
+    fi
     echo 'PASS cleanup' >&3
     exit "$status"
 }
 trap cleanup EXIT
-trap 'exit 1' INT TERM
+trap 'failure_line=$LINENO; exit 1' INT TERM
 
 mkdir -p "$HOME" "$WOLTSPACE_WOLTS_DIR"
 docker info
-if docker container inspect "$name" || docker image inspect "$WOLTSPACE_IMAGE"; then exit 1; fi
+if docker container inspect "$name" || docker image inspect "$WOLTSPACE_IMAGE"; then failure_line=$LINENO; exit 1; fi
 owned=true
 phase=image-build
 ./woltspace build --local

@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 exec 3>&1 >/dev/null 2>&1
+export PATH="$(pwd -P):$PATH"
 failure_line=1
 annotate_failure() {
     local failed_phase=$1 source_line=$2

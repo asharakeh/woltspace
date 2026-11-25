@@ -12,6 +12,7 @@ from contextlib import closing
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -412,18 +413,44 @@ class TestAppsRestore:
 needs_procfs = pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs procfs (Linux)")
 
 
+@pytest.mark.parametrize("procfs", [True, False])
+def test_an_old_record_never_adopts_a_stranger_running_the_same_command(wolts_dir, tmp_path, monkeypatch, procfs):
+    import subprocess
+    if procfs and not Path("/proc/self/stat").exists():
+        pytest.skip("needs procfs (Linux)")
+    monkeypatch.setattr(apps, "_PROCFS", procfs)
+    _make_app(wolts_dir, "alpha", start="sleep 30", port=4216)
+    elsewhere = tmp_path / "other"
+    elsewhere.mkdir()
+    stranger = subprocess.Popen(["sleep", "30"], cwd=elsewhere, start_new_session=True)  # same command, a group leader
+    try:
+        old = {"name": "alpha", "pid": stranger.pid, "start_command": "sleep 30", "port": 4216}
+        apps._write_state("alpha", old)
+        assert apps._is_own_app("alpha", old) is None  # unverified: never signalled, never adopted
+        assert "started" not in (apps._read_state("alpha") or {})
+        with pytest.raises(RuntimeError, match="Can't confirm"):
+            apps.stop_app("alpha")  # refused, as for any unverified record
+        assert apps._read_state("alpha") == old and stranger.poll() is None
+    finally:
+        stranger.terminate()
+        stranger.wait(timeout=5)
+
+
 def _spawn(cwd, command="exec sleep 30"):
     import subprocess
     return subprocess.Popen(command, shell=True, cwd=str(cwd), start_new_session=True,
                             stdout=subprocess.PIPE, text=True)
 
 
-def _gone_within(pid, seconds=5):
-    import time
+def _gone_within(pid, seconds=5, started=None):
+    """Like the server: reap it if it is our app (by start time), then check it is gone."""
     deadline = time.monotonic() + seconds
-    while apps._is_pid_alive(pid) and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        apps._reap_own(pid, started)
+        if not apps._is_pid_alive(pid):
+            return True
         time.sleep(0.02)
-    return not apps._is_pid_alive(pid)
+    return False
 
 
 @needs_procfs
@@ -469,7 +496,21 @@ class TestProcessIdentity:
             apps._write_state("notes", state)
         assert apps.stop_app("notes") is True
         assert _gone_within(state["pid"])
+        zombie = {"pid": state["pid"], "started": apps._proc_stat(state["pid"])[19]}  # its own start time
+        assert apps._is_own_app("notes", zombie) is False
         assert not Path(f"/proc/{state['pid']}").exists()  # reaped by us, its parent: no zombie left
+
+    def test_only_a_zombie_with_the_recorded_start_time_is_reaped(self, tmp_path):
+        import subprocess
+        child = subprocess.Popen("exit 3", shell=True, cwd=str(tmp_path))  # our child, not an app
+        try:
+            deadline = time.monotonic() + 5
+            while (apps._proc_stat(child.pid) or ["?"])[0] != "Z" and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert apps._is_own_app("notes", {"pid": child.pid, "started": "1"}) is False
+            assert child.wait(timeout=5) == 3  # its own exit status, not taken by us
+        finally:
+            child.kill() if child.poll() is None else None
 
     @pytest.mark.parametrize("record", ["new", "old"])
     def test_restore_respawns_only_over_a_proven_stranger(self, wolts_dir, record):
@@ -538,6 +579,20 @@ class TestProcessIdentity:
 class TestProcessIdentityWithoutProcfs:
     """The macOS path: no /proc, identity comes from `ps -o pgid=,lstart=` (real ps here)."""
 
+    def test_start_time_does_not_depend_on_the_servers_zone(self, wolts_dir, monkeypatch):
+        import signal
+        monkeypatch.setattr(apps, "_PROCFS", False)
+        _make_app(wolts_dir, "notes", start="sleep 30", port=4214)
+        monkeypatch.setenv("TZ", "Asia/Tokyo")
+        state = apps.start_app("notes")
+        try:
+            monkeypatch.setenv("TZ", "Europe/Berlin")
+            assert apps._is_own_app("notes", state) is True
+        finally:
+            os.killpg(state["pid"], signal.SIGTERM)
+            assert _gone_within(state["pid"], started=state["started"])
+
+
     def test_ps_start_time_tells_the_app_from_a_stranger(self, wolts_dir, monkeypatch):
         monkeypatch.setattr(apps, "_PROCFS", False)
         _make_app(wolts_dir, "notes", start="sleep 30", port=4210)
@@ -552,7 +607,7 @@ class TestProcessIdentityWithoutProcfs:
             assert apps.stop_app("other") is True
             assert stranger.poll() is None
             assert apps.stop_app("notes") is True
-            assert _gone_within(state["pid"])
+            assert _gone_within(state["pid"], started=state.get("started") or started)
         finally:
             stranger.kill()
             stranger.wait()
@@ -582,7 +637,7 @@ class TestProcessIdentityWithoutProcfs:
         _make_app(wolts_dir, "notes", start="sleep 30", port=4213)
         state = apps.start_app("notes")
         try:
-            state.pop("started")
+            started = state.pop("started")
             apps._write_state("notes", state)
             assert apps.apps_restore() == [{"name": "notes", "action": "unverified", "pid": state["pid"]}]
             assert apps.start_app("notes") == state  # no second copy
@@ -593,4 +648,4 @@ class TestProcessIdentityWithoutProcfs:
             assert apps._read_state("notes") == state
         finally:
             os.killpg(state["pid"], signal.SIGTERM)
-            assert _gone_within(state["pid"])
+            assert _gone_within(state["pid"], started=state.get("started") or started)

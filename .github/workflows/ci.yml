@@ -68,6 +68,7 @@ jobs:
           test/test_inbox_summary.py
           test/test_native_adapters.py
           test/test_broker_startup.py
+          test/test_dummy_broker.py
           test/test_iwcl_inbox.py
           test/test_chat_lodge_inbox.py
           test/test_chat_lodge_hold.py

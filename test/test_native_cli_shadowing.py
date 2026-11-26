@@ -464,6 +464,13 @@ def test_host_selects_broker_feature_and_excludes_shared_dotenv(tmp_path, enable
     [argv] = runs
     assert f"WOLTSPACE_FEATURE_ISOLATION={enabled}" in argv
     assert ("--env-file" in argv) == (enabled == "false")
+    assert ("lodge-test-secrets:/var/lib/woltspace-secrets" in argv) == (enabled == "true")
+
+
+def test_secrets_admin_runs_as_root_inside_the_container(tmp_path):
+    result, calls, _ = _docker_calls(tmp_path, "secrets grant wolt-a dummy.ping")
+    assert calls == [["exec", "-u", "0", "lodge-test", "/usr/local/bin/woltspace-python", "-I", "-m",
+                      "woltspace.dummy_broker", "admin", "grant", "wolt-a", "dummy.ping"]]
 
 
 @pytest.mark.parametrize("flag,label", [("bogus", "false"), ("true", "true")])

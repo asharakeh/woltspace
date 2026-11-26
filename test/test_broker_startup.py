@@ -5,6 +5,7 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -66,10 +67,13 @@ def test_real_trusted_path_and_untrusted_fixture(tmp_path):
 
 
 def test_actual_core_action_and_executable(tmp_path):
-    store = tmp_path / "dummy"
+    store, policy = tmp_path / "dummy", tmp_path / "policy"
     store.write_text("synthetic-only")
+    policy.mkdir(mode=0o700)
     assert dummy_broker.action(store) == {"result": "accepted"}
-    child = subprocess.Popen([sys.executable, "-I", "-S", dummy_broker.__file__, str(store)],
+    short = Path(tempfile.mkdtemp(dir="/tmp", prefix="wsb."))  # AF_UNIX path limit; removed below
+    child = subprocess.Popen([sys.executable, "-I", "-S", dummy_broker.__file__, str(store), str(policy),
+                              str(short / "admin.sock")],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={"PATH": "/usr/bin:/bin"}, close_fds=True)
     assert child.stdout is not None and child.stderr is not None
     try:
@@ -80,6 +84,8 @@ def test_actual_core_action_and_executable(tmp_path):
         child.wait(timeout=3)
         child.stdout.close()
         child.stderr.close()
+        (short / "admin.sock").unlink(missing_ok=True)
+        short.rmdir()
     store.write_text("")
     with pytest.raises(ValueError):
         dummy_broker.action(store)
@@ -131,6 +137,8 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, mode):
         boot.STORE.parent.mkdir(mode=0o700)
         boot.STORE.write_text("stale-dummy")
     monkeypatch.setattr(boot, "protected", lambda path: None)
+    monkeypatch.setattr(dummy_broker, "SOCKET", tmp_path / "run" / "admin.sock")
+    monkeypatch.setattr(boot, "prepare_policy", lambda: dummy_broker.SOCKET.parent.mkdir() or dummy_broker.SOCKET.touch())
     monkeypatch.setattr(boot.subprocess, "Popen", spawn)
     def handler(sig, fn):
         old = handlers.get(sig, signal.SIG_DFL)
@@ -159,7 +167,7 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, mode):
         assert events.index(("node", "wait")) < events.index(("broker", "wait"))
     if mode == "cleanup-failure":
         assert ("node", "kill") in events and ("broker", "wait") in events
-    assert not boot.STORE.parent.exists()
+    assert not boot.STORE.parent.exists() and not dummy_broker.SOCKET.parent.exists()
     assert handlers == {signal.SIGTERM: signal.SIG_DFL, signal.SIGINT: signal.SIG_DFL}
 
 
@@ -239,3 +247,33 @@ def test_root_flag_on_and_flag_off_keep_distinct_owners(monkeypatch):
     monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
     assert entry.run_root_phase() == 7
     assert events == ["validate", ["/root-bin/gosu", "node", "/usr/local/bin/woltspace", "container-entrypoint"]]
+
+
+
+@pytest.mark.parametrize("state", ["ready", "fresh", "not-mount", "link", "mode", "owner", "run-mode"])
+def test_policy_volume_must_be_a_private_mount(tmp_path, monkeypatch, state):
+    volume, run, chowned = tmp_path / "volume", tmp_path / "run", []
+    monkeypatch.setattr(dummy_broker, "POLICY_DIR", volume)
+    monkeypatch.setattr(dummy_broker, "SOCKET", run / "admin.sock")
+    monkeypatch.setattr(boot, "protected", lambda path: None)
+    monkeypatch.setattr(boot.os.path, "ismount", lambda path: state != "not-mount")
+    monkeypatch.setattr(boot.os, "chown", lambda path, uid, gid: chowned.append((Path(path), uid, gid)))
+    real_lstat = Path.lstat
+    def lstat(self):  # mock only ownership: Docker's fresh mount is root's, a used one the service's
+        ids = (0, 0) if state == "fresh" and self == volume and not chowned else (1234, 990) if state == "owner" else (990, 990)
+        return SimpleNamespace(st_mode=real_lstat(self).st_mode, st_uid=ids[0], st_gid=ids[1])
+    monkeypatch.setattr(Path, "lstat", lstat)
+    if state == "link":
+        (tmp_path / "elsewhere").mkdir(mode=0o700)
+        volume.symlink_to(tmp_path / "elsewhere")
+    else:
+        volume.mkdir(mode=0o755 if state == "mode" else 0o700)
+    if state == "run-mode":
+        run.mkdir(mode=0o755)
+    if state in {"ready", "fresh"}:
+        boot.prepare_policy()
+        assert [c[0] for c in chowned] == ([volume, run] if state == "fresh" else [run]) and run.is_dir()
+        assert {c[1:] for c in chowned} == {(990, 990)}
+    else:
+        with pytest.raises(ValueError):
+            boot.prepare_policy()

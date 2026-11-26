@@ -72,6 +72,27 @@ def fresh_store() -> None:
     os.chown(STORE.parent, SERVICE, SERVICE)
 
 
+def prepare_policy() -> None:
+    """The opt-in policy volume: a real mount, root-owned and empty on first use, then service-only."""
+    path, run = dummy_broker.POLICY_DIR, dummy_broker.SOCKET.parent
+    protected(path.parent)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or not os.path.ismount(path):
+        raise ValueError("broker policy volume missing")
+    if (info.st_uid, info.st_gid) == (0, 0) and not any(path.iterdir()):
+        os.chown(path, SERVICE, SERVICE)
+        os.chmod(path, 0o700)
+    info = path.lstat()
+    if (info.st_uid, info.st_gid) != (SERVICE, SERVICE) or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError("unsafe broker policy volume")
+    protected(run.parent)
+    run.mkdir(mode=0o700, exist_ok=True)
+    info = run.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700 or not owned(info):
+        raise ValueError("unsafe broker socket directory")
+    os.chown(run, SERVICE, SERVICE)
+
+
 def supervise(node_argv: list[str]) -> int:
     children = []
     stopping = False
@@ -81,12 +102,15 @@ def supervise(node_argv: list[str]) -> int:
         stopping = True
 
     previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
-    created = False
+    created = served = False
     try:
         fresh_store()
         created = True
+        prepare_policy()
+        served = True
 
-        broker = subprocess.Popen([sys.executable, "-I", "-S", dummy_broker.__file__, str(STORE)],
+        broker = subprocess.Popen([sys.executable, "-I", "-S", dummy_broker.__file__, str(STORE),
+                                   str(dummy_broker.POLICY_DIR), str(dummy_broker.SOCKET)],
             env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, cwd="/",
             user=SERVICE, group=SERVICE, extra_groups=[],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=True)
@@ -133,6 +157,9 @@ def supervise(node_argv: list[str]) -> int:
             try:
                 STORE.unlink(missing_ok=True)
                 STORE.parent.rmdir()  # unexpected contents refuse; no recursive deletion
+                if served:  # only the socket directory this start validated
+                    dummy_broker.SOCKET.unlink(missing_ok=True)
+                    dummy_broker.SOCKET.parent.rmdir()
             except OSError:
                 cleanup_failed = True
         for sig, handler in previous.items():

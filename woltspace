@@ -370,11 +370,13 @@ _start_container() {
   fi
   # An image built without sudo says so in its label. Then no setuid binary
   # may hand a process root either.
-  local privilege_args="" env_args=(--env-file "$ENV_FILE")
+  local privilege_args="" env_args=(--env-file "$ENV_FILE") volume_args=()
   local node_sudo=$(docker image inspect -f '{{index .Config.Labels "woltspace.node_sudo"}}' "$IMAGE" 2>/dev/null)
   if [ "$FEATURE_ISOLATION" = true ]; then
     [ "$node_sudo" = false ] || { echo "error: isolation requires a no-sudo image" >&2; exit 1; }
     env_args=()  # never expose the shared dotenv to privileged startup
+    # Broker policy on its own named volume, outside the wolts mount; `stop` keeps it.
+    volume_args=(-v "${CONTAINER_NAME}-secrets:/var/lib/woltspace-secrets")
   fi
   [ "$node_sudo" = false ] \
     && privilege_args="--security-opt no-new-privileges"
@@ -397,6 +399,7 @@ _start_container() {
   docker run -d \
     --name "$CONTAINER_NAME" \
     "${env_args[@]}" \
+    "${volume_args[@]}" \
     -e WOLTSPACE_FEATURE_ISOLATION="$FEATURE_ISOLATION" \
     -e HOST_UID=$(id -u) \
     -e HOST_GID=$(id -g) \
@@ -699,6 +702,12 @@ case "$cmd" in
       -e "WOLT_NAME=${HUMAN_NAME:-$(whoami)}" "$CONTAINER_NAME" \
       /workspace/woltspace/container/bin/woltspace "$@"
     ;;
+  secrets)
+    # Owner-only broker administration. Root inside the container is reached only
+    # through the host's Docker access; the broker checks the caller's uid itself.
+    shift
+    exec docker exec -u 0 "$CONTAINER_NAME" /usr/local/bin/woltspace-python -I -m woltspace.dummy_broker admin "$@"
+    ;;
   tui)
     # Terminal cockpit — runs HOST-SIDE (talks to the API on localhost:7777,
     # attaches via docker exec). Needs node >= 22 or bun on the host.
@@ -948,7 +957,7 @@ RESTORE
     exit 2
     ;;
   *)
-    echo "usage: woltspace <init|start|stop|build|rebuild|backup|shell|chat|logs|update>"
+    echo "usage: woltspace <init|start|stop|build|rebuild|backup|shell|chat|logs|update|secrets>"
     echo "       woltspace build|rebuild [--latest|--version X|--nightly|--branch X|--no-cache]"
     echo "       woltspace backup [tag] [--bundle]"
     exit 1

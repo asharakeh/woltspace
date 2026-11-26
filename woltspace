@@ -705,8 +705,9 @@ case "$cmd" in
   secrets)
     # Owner-only broker administration. Root inside the container is reached only
     # through the host's Docker access; the broker checks the caller's uid itself.
+    # The venv's own interpreter: a symlink to it elsewhere starts the bare base Python.
     shift
-    exec docker exec -u 0 "$CONTAINER_NAME" /usr/local/bin/woltspace-python -I -m woltspace.dummy_broker admin "$@"
+    exec docker exec -u 0 "$CONTAINER_NAME" /opt/woltspace/tools/woltspace/bin/python -I -m woltspace.dummy_broker admin "$@"
     ;;
   tui)
     # Terminal cockpit — runs HOST-SIDE (talks to the API on localhost:7777,

@@ -5,7 +5,7 @@ exec 3>&1 >/dev/null 2>&1
 export PATH="$(pwd -P):$PATH"
 failure_line=1
 annotate_failure() {
-    local failed_phase=$1 source_line=$2 status=${3:-0} suffix= bucket
+    local failed_phase=$1 source_line=$2 status=${3:-0} bucket
     case "$failed_phase" in
         setup|image-build|flag-off|flag-on|admin|forced-stop-resume|recreate|clean-stop|backup-restore|crash-reconcile|cleanup) ;;
         *) failed_phase=setup ;;
@@ -22,10 +22,10 @@ annotate_failure() {
                 13[0-9]|14[0-9]) bucket=signal-range ;;
                 *) bucket=other ;;
             esac
-            suffix=" step=$offline_step rc=$bucket"
+            failed_phase="$offline_step-$bucket"
             ;;
     esac
-    printf '::error::broker-smoke phase=%s line=%s%s\n' "$failed_phase" "$source_line" "$suffix" >&3
+    printf '::error::broker-smoke phase=%s line=%s\n' "$failed_phase" "$source_line" >&3
 }
 trap 'failure_line=$LINENO' ERR
 root=$(mktemp -d) || { annotate_failure setup "$LINENO"; echo 'FAIL setup' >&3; exit 1; }

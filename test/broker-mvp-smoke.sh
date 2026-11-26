@@ -12,7 +12,7 @@ annotate_failure() {
     esac
     [[ $source_line =~ ^[1-9][0-9]{0,5}$ ]] || source_line=1
     case "${offline_step:-}" in
-        fixture|archive-backup|archive-restore|quarantine|volume-snapshot|volume-extract|volume-modes|crash-probe)
+        fixture|archive-backup|archive-restore|tar-capability|quarantine|volume-snapshot|volume-extract|volume-modes|crash-probe)
             case "$status" in
                 125) bucket=docker ;;
                 126) bucket=entrypoint ;;
@@ -219,7 +219,7 @@ echo 'PASS clean-stop' >&3
 offline() {
     offline_step=$1
     shift
-    docker run --rm --name "$helper" --network none --log-driver none "$@"
+    docker run --rm --name "$helper" --network none --log-driver none "$@" || return "$?"
     unset offline_step
 }
 
@@ -234,9 +234,33 @@ archive_tool() {
     offline "archive-$1" --user "$(id -u):$(id -g)" -e HOME=/fixture -v "$fixture:/fixture" \
         --entrypoint /usr/local/bin/woltspace "$WOLTSPACE_IMAGE" "$@"
 }
+restore_archive() {
+    local status host_python
+    if offline tar-capability --entrypoint "$venv_python" "$WOLTSPACE_IMAGE" -IS -c '
+import inspect, tarfile
+raise SystemExit(0 if "filter" in inspect.signature(tarfile.TarFile.extractall).parameters else 42)
+'; then
+        archive_tool restore /fixture/woltspace-backup-before-cutover.tar.gz --to /fixture/restored
+    else
+        status=$?
+        (( status == 42 )) || return "$status"
+        unset offline_step
+        printf '::notice::broker-smoke phase=archive-host-python line=%s\n' "$LINENO" >&3
+        host_python=$(command -v python3)
+        env -i HOME="$fixture" PATH=/usr/bin:/bin "$host_python" -IS -c '
+import inspect, sys, tarfile
+if "filter" not in inspect.signature(tarfile.TarFile.extractall).parameters:
+    raise SystemExit(1)
+sys.path.insert(0, sys.argv.pop(1))
+from woltspace.cli import main
+raise SystemExit(main())
+' "$PWD/src" restore "$fixture/woltspace-backup-before-cutover.tar.gz" --to "$fixture/restored"
+    fi
+}
+
 probe fixture /fixture
 archive_tool backup --wolts-dir /fixture/old --out /fixture --tag before-cutover
-archive_tool restore /fixture/woltspace-backup-before-cutover.tar.gz --to /fixture/restored
+restore_archive
 probe quarantine /fixture
 restored="$fixture/restored/wolts"
 printf 'WOLTSPACE_CONFIG=/workspace/wolts/.space/legacy.json\nWOLTSPACE_PUBLIC_TUNNEL=false\n' >"$restored/.env"

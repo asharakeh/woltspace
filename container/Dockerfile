@@ -82,6 +82,10 @@ RUN case "$WOLTSPACE_NODE_SUDO" in \
       *) echo "WOLTSPACE_NODE_SUDO must be true or false" >&2; exit 1 ;; \
     esac
 
+# Admin-owned dummy opt-in configuration; never stored in the lodge or inherited environment.
+RUN mkdir -p /etc/woltspace && printf 'dummy\n' > /etc/woltspace/broker-dummy
+ENV WOLTSPACE_FEATURE_ISOLATION=false
+
 # Install uv (fast Python package manager)
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 

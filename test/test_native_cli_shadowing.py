@@ -293,6 +293,7 @@ def test_the_native_cli_hands_a_sessions_inbox_to_the_bundled_client(argv, tmp_p
     `woltspace inbox fetch` reaches this CLI, which hands it on, environment and all (the
     session's inbox token), as it does `session send`."""
     from types import SimpleNamespace
+
     from woltspace import cli
 
     client = tmp_path / "container" / "bin" / "woltspace"
@@ -454,6 +455,28 @@ def test_an_image_labelled_without_sudo_runs_with_no_new_privileges(tmp_path):
     assert argv[-1] == "woltspace"  # anything after the image is its command
     assert argv.count("no-new-privileges") == 1
     assert argv[argv.index("no-new-privileges") - 1] == "--security-opt"
+
+
+@pytest.mark.parametrize("enabled", ["true", "false"])
+def test_host_selects_broker_feature_and_excludes_shared_dotenv(tmp_path, enabled):
+    result, _, runs = _docker_calls(tmp_path, FAKE_IMAGE_LABEL="false", WOLTSPACE_FEATURE_ISOLATION=enabled)
+    assert result.returncode == 0, result.stderr
+    [argv] = runs
+    assert f"WOLTSPACE_FEATURE_ISOLATION={enabled}" in argv
+    assert ("--env-file" in argv) == (enabled == "false")
+
+
+@pytest.mark.parametrize("flag,label", [("bogus", "false"), ("true", "true")])
+def test_broker_host_refuses_bad_flag_or_sudo_image_before_removal(tmp_path, flag, label):
+    result, calls, _ = _docker_calls(tmp_path, FAKE_IMAGE_LABEL=label, WOLTSPACE_FEATURE_ISOLATION=flag)
+    assert result.returncode == 1
+    assert not [c for c in calls if c[0] in {"rm", "run"}]
+
+
+def test_opted_host_refuses_custom_env_file_before_docker(tmp_path):
+    result, calls, _ = _docker_calls(tmp_path, WOLTSPACE_FEATURE_ISOLATION="true",
+                                    WOLTSPACE_ENV_FILE=str(tmp_path / "benign-settings"))
+    assert result.returncode == 1 and "default lodge .env" in result.stderr and calls == []
 
 
 @pytest.mark.parametrize("label, shell", [("true", None), ("", None), ("true", "false")])

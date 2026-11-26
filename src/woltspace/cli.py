@@ -73,6 +73,7 @@ def _doctor(args) -> int:
 def serve(
     *, host: str = "", port: int = 0, isolation: str = "", reload: bool = False,
     no_doctor: bool = False, log_level: str = "info", instance_id: str = "",
+    env_file_keys: set[str] | None = None,
 ) -> int:
     """Run the control plane in this process.
 
@@ -105,9 +106,9 @@ def serve(
         json=False,
     )):
         return 1
-    from .supervisor import Supervisor
-    from .instance import InstanceConflict
     from .doctor import DataRootConflict, MountError
+    from .instance import InstanceConflict
+    from .supervisor import Supervisor
 
     supervisor = Supervisor(
         layout,
@@ -115,6 +116,8 @@ def serve(
         log_level=log_level,
         **({"instance_id": instance_id} if instance_id else {}),
     )
+    if env_file_keys is not None:
+        supervisor._env_file_keys = set(env_file_keys)
     try:
         supervisor.run()
     except (InstanceConflict, MountError, DataRootConflict) as exc:

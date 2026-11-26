@@ -33,6 +33,17 @@ def _note_signal(signum, frame) -> None:
     """Swallow the SIGTERM uvicorn re-raises after shutdown; see Supervisor.run."""
 
 
+def load_environment(env_file) -> set[str]:
+    """Read lodge settings only after privilege drop; return keys that came from dotenv."""
+    loaded = set()
+    if env_file.is_file():
+        for key, value in dotenv_values(env_file).items():
+            if value is not None and key not in os.environ:
+                os.environ[key] = value
+                loaded.add(key)
+    return loaded
+
+
 @dataclass
 class Supervisor:
     layout: RuntimeLayout
@@ -40,6 +51,7 @@ class Supervisor:
     log_level: str = "info"
     instance_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     probe_token: Callable[[str], bool] = staticmethod(telegram_token_is_busy)
+    _env_file_keys: set[str] = field(default_factory=set, init=False, repr=False)
 
     def prepare(self) -> None:
         ensure_container_mounts(self.layout)
@@ -54,14 +66,9 @@ class Supervisor:
         # (config.json, applied in channel_supervisor) > .env. The keys loaded
         # here are remembered so connector config can override a stale .env
         # value without ever clobbering an explicit shell export. In the
-        # container this is a no-op: PID1 already carries every .env key.
-        self._env_file_keys: set[str] = set()
-        env_file = self.layout.wolts_dir / ".env"
-        if env_file.is_file():
-            for key, value in dotenv_values(env_file).items():
-                if value is not None and key not in os.environ:
-                    os.environ[key] = value
-                    self._env_file_keys.add(key)
+        # legacy container this is a no-op. Opted-in node boot loads early and
+        # explicitly hands its provenance here; privileged startup never reads it.
+        self._env_file_keys = set(self._env_file_keys) | load_environment(self.layout.wolts_dir / ".env")
         self.layout.platform_state.mkdir(parents=True, exist_ok=True)
         self.layout.logs_dir.mkdir(parents=True, exist_ok=True)
         os.environ["WOLTSPACE_INSTANCE_ID"] = self.instance_id

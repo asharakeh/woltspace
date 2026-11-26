@@ -136,7 +136,7 @@ admin() { ./woltspace secrets "$@" 3>&-; }  # host Docker authority -> uid 0 in 
 [[ $(admin run wolt-c dummy.ping) == '{"result": "unknown-wolt"}' ]]
 [[ $(admin run wolt-a other.send) == '{"result": "unknown-action"}' ]]
 # The ordinary worker: same admin client, no socket access, no store access.
-out=$(docker exec --user node "$name" /usr/local/bin/woltspace-python -I -m woltspace.dummy_broker admin grant wolt-b dummy.ping) && exit 1
+out=$(docker exec --user node "$name" /opt/woltspace/tools/woltspace/bin/python -I -m woltspace.dummy_broker admin grant wolt-b dummy.ping) && exit 1
 [[ $out == '{"result": "unavailable"}' ]]
 docker exec --user node "$name" test ! -r "$policy/policy.json"
 docker exec --user node "$name" sh -c "ls $policy" && exit 1

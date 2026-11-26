@@ -201,9 +201,9 @@ changes=$(docker diff "$name")
 [[ -z $(docker ps -aq --filter "name=^/${name}$") ]]
 echo 'PASS clean-stop' >&3
 
-# The helper never boots a lodge. Every invocation is offline and auto-removed.
+# The helper is offline and auto-removed; its archive stream is not logged.
 offline() {
-    docker run --rm --name "$helper" --network none "$@"
+    docker run --rm --name "$helper" --network none --log-driver none "$@"
 }
 
 phase=backup-restore
@@ -224,18 +224,50 @@ probe quarantine /fixture
 restored="$fixture/restored/wolts"
 printf 'WOLTSPACE_CONFIG=/workspace/wolts/.space/legacy.json\nWOLTSPACE_PUBLIC_TUNNEL=false\n' >"$restored/.env"
 
-# The trusted volume is independent of the old lodge archive.
+# Lodge archives exclude this separate trusted volume. Snapshot it with the broker stopped.
 ./woltspace start
 check_isolation
 [[ $(admin grant wolt-b dummy.ping) == '{"result": "ok"}' ]]
 trusted_policy=$(docker exec -u 0 "$name" sha256sum "$policy/policy.json")
 docker stop --time 15 "$name"
+[[ $(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$name") == 'exited 0' ]]
 ./woltspace stop
+[[ -z $(docker ps -aq --filter "name=^/${name}$") ]]
+[[ $(docker volume inspect -f '{{.Name}}' "$volume") == "$volume" ]]
+snapshot="$fixture/broker-volume.tar"
+(
+    umask 077
+    offline --user 0:0 -v "$volume:$policy:ro" --entrypoint tar "$WOLTSPACE_IMAGE" \
+        --numeric-owner -C "$policy" -cpf - . >"$snapshot"
+)
+[[ -s $snapshot && $(stat -c %a "$snapshot") == 600 ]]
+docker volume rm "$volume"
+[[ -z $(docker volume ls -q --filter "name=^${volume}$") ]]
+[[ $(docker volume create "$volume") == "$volume" ]]
+offline -i --user 0:0 -v "$volume:$policy" --entrypoint tar "$WOLTSPACE_IMAGE" \
+    --numeric-owner --same-owner --same-permissions -C "$policy" -xpf - <"$snapshot"
+offline --user 0:0 -v "$volume:$policy:ro" --entrypoint sh "$WOLTSPACE_IMAGE" -ec '
+    dir=$1
+    [ "$(stat -c "%u:%g %a" "$dir")" = "990:990 700" ]
+    [ "$(stat -c "%u:%g %a" "$dir/policy.json")" = "990:990 600" ]
+    [ "$(stat -c "%u:%g %a" "$dir/action.key")" = "990:990 400" ]
+    [ "$(stat -c "%u:%g %a" "$dir/audit.log")" = "990:990 600" ]
+' sh "$policy"
 export WOLTSPACE_WOLTS_DIR="$restored"
 ./woltspace start
 check_isolation
 cmp "$fixture/old/.space/marker.txt" "$restored/.space/marker.txt"
+python3 - "$restored/.space/platform/connectors.json" <<'PYTHON'
+import json
+import sys
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text())
+legacy, = (entry for entry in report["connectors"] if entry["name"] == "legacy")
+assert legacy["state"] == "disabled" and legacy["pid"] is None
+PYTHON
 [[ $(docker exec -u 0 "$name" sha256sum "$policy/policy.json") == "$trusted_policy" ]]
+[[ $(docker exec -u 0 "$name" cat "$policy/action.key") == "$key" ]]
 [[ $(admin run wolt-b dummy.ping) == '{"result": "ok"}' ]]
 [[ $(admin run wolt-a dummy.ping) == '{"result": "not-granted"}' ]]
 leak

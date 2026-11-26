@@ -250,7 +250,7 @@ def test_root_flag_on_and_flag_off_keep_distinct_owners(monkeypatch):
 
 
 
-@pytest.mark.parametrize("state", ["ready", "fresh", "not-mount", "link", "mode", "owner", "run-mode"])
+@pytest.mark.parametrize("state", ["ready", "fresh", "interrupted", "not-mount", "link", "mode", "owner", "run-mode"])
 def test_policy_volume_must_be_a_private_mount(tmp_path, monkeypatch, state):
     volume, run, chowned = tmp_path / "volume", tmp_path / "run", []
     monkeypatch.setattr(dummy_broker, "POLICY_DIR", volume)
@@ -258,21 +258,25 @@ def test_policy_volume_must_be_a_private_mount(tmp_path, monkeypatch, state):
     monkeypatch.setattr(boot, "protected", lambda path: None)
     monkeypatch.setattr(boot.os.path, "ismount", lambda path: state != "not-mount")
     monkeypatch.setattr(boot.os, "chown", lambda path, uid, gid: chowned.append((Path(path), uid, gid)))
+    real_chmod, steps = os.chmod, []
+    monkeypatch.setattr(boot.os, "chmod", lambda path, mode: steps.append(("chmod", bool(chowned))) or real_chmod(path, mode))
     real_lstat = Path.lstat
     def lstat(self):  # mock only ownership: Docker's fresh mount is root's, a used one the service's
-        ids = (0, 0) if state == "fresh" and self == volume and not chowned else (1234, 990) if state == "owner" else (990, 990)
+        ids = (0, 0) if state in {"fresh", "interrupted"} and self == volume and not chowned else (1234, 990) if state == "owner" else (990, 990)
         return SimpleNamespace(st_mode=real_lstat(self).st_mode, st_uid=ids[0], st_gid=ids[1])
     monkeypatch.setattr(Path, "lstat", lstat)
     if state == "link":
         (tmp_path / "elsewhere").mkdir(mode=0o700)
         volume.symlink_to(tmp_path / "elsewhere")
     else:
-        volume.mkdir(mode=0o755 if state == "mode" else 0o700)
+        volume.mkdir(mode=0o755 if state in {"mode", "fresh"} else 0o700)  # Docker's fresh mount is 0755
     if state == "run-mode":
         run.mkdir(mode=0o755)
-    if state in {"ready", "fresh"}:
+    if state in {"ready", "fresh", "interrupted"}:  # interrupted: chmod done, chown not, so retry works
         boot.prepare_policy()
-        assert [c[0] for c in chowned] == ([volume, run] if state == "fresh" else [run]) and run.is_dir()
+        assert [c[0] for c in chowned] == ([run] if state == "ready" else [volume, run]) and run.is_dir()
+        assert steps == ([] if state == "ready" else [("chmod", False)])  # private before it changes owner
+        assert volume.stat().st_mode & 0o777 == 0o700
         assert {c[1:] for c in chowned} == {(990, 990)}
     else:
         with pytest.raises(ValueError):

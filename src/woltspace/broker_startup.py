@@ -80,8 +80,8 @@ def prepare_policy() -> None:
     if not stat.S_ISDIR(info.st_mode) or not os.path.ismount(path):
         raise ValueError("broker policy volume missing")
     if (info.st_uid, info.st_gid) == (0, 0) and not any(path.iterdir()):
+        os.chmod(path, 0o700)  # tighten first: an interrupted start stays root's, private and retryable
         os.chown(path, SERVICE, SERVICE)
-        os.chmod(path, 0o700)
     info = path.lstat()
     if (info.st_uid, info.st_gid) != (SERVICE, SERVICE) or stat.S_IMODE(info.st_mode) != 0o700:
         raise ValueError("unsafe broker policy volume")

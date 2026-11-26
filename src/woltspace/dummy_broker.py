@@ -21,6 +21,7 @@ FIELDS = {"enroll": ("wolt",), "register": ("action",), "grant": ("wolt", "actio
           "revoke": ("wolt", "action"), "run": ("wolt", "action")}
 NAME = re.compile(r"[a-z][a-z0-9-]{0,39}")
 FILES = {"policy.json": 0o600, "action.key": 0o400, "audit.log": 0o600}
+AUDIT = os.O_WRONLY | os.O_APPEND | os.O_CREAT
 
 
 def action(store: Path) -> dict:
@@ -29,19 +30,34 @@ def action(store: Path) -> dict:
     return {"result": "accepted"}
 
 
+def _open(path: Path, flags: int = os.O_RDONLY) -> int:
+    """Open without following a link or blocking on a FIFO; the descriptor must be our private file."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, FILES[path.name])
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != FILES[path.name]):
+        os.close(fd)
+        raise ValueError("unsafe broker file")
+    return fd
+
+
 def _read(path: Path) -> bytes | None:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # a FIFO never blocks
+        fd = _open(path)
     except FileNotFoundError:
         return None
     try:
-        info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid()
-                or stat.S_IMODE(info.st_mode) != FILES[path.name] or info.st_size > 8192):
-            raise ValueError("unsafe broker file")
+        if os.fstat(fd).st_size > 8192:
+            raise ValueError("oversized broker file")
         return os.read(fd, 8192)  # 64 longest names twice fit
     finally:
         os.close(fd)
+
+
+def _unique(pairs: list) -> dict:
+    if len({key for key, _ in pairs}) != len(pairs):
+        raise ValueError("duplicate request key")
+    return dict(pairs)
 
 
 def _write(path: Path, data: bytes) -> None:
@@ -117,13 +133,18 @@ def apply(policy_dir: Path, request) -> str:
 def answer(conn: socket.socket, policy_dir: Path) -> None:
     _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
     caller, request, result = ("host-admin" if uid == ADMIN_UID else "worker"), None, "invalid"
+    try:
+        audit = _open(policy_dir / "audit.log", AUDIT)  # no request is served that cannot be audited
+    except (OSError, ValueError):
+        conn.sendall(b'{"result": "error"}\n')
+        return
     conn.settimeout(2)
     try:
         raw = b""
         while b"\n" not in raw and len(raw) <= MAX_REQUEST and (chunk := conn.recv(MAX_REQUEST + 1)):
             raw += chunk
-        if len(raw) <= MAX_REQUEST:
-            request = json.loads(raw)
+        if len(raw) <= MAX_REQUEST and raw.endswith(b"\n") and raw.count(b"\n") == 1:  # one framed object
+            request = json.loads(raw, object_pairs_hook=_unique)
         result = "denied" if caller != "host-admin" else apply(policy_dir, request) if request else result
     except (ValueError, UnicodeDecodeError, TimeoutError):
         pass  # a silent or slow caller is malformed too
@@ -133,11 +154,10 @@ def answer(conn: socket.socket, policy_dir: Path) -> None:
     op = op if isinstance(op, str) and op in FIELDS else "other"
     name = ACTION if isinstance(request, dict) and request.get("action") == ACTION else "other"
     line = json.dumps({"caller": caller, "op": op, "action": name, "result": result}) + "\n"
-    fd = os.open(policy_dir / "audit.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        os.write(fd, line.encode())  # caller category, op, action and result only
+        os.write(audit, line.encode())  # caller category, op, action and result only
     finally:
-        os.close(fd)
+        os.close(audit)
     conn.sendall(json.dumps({"result": result}).encode() + b"\n")
 
 
@@ -175,6 +195,7 @@ if __name__ == "__main__":
     try:
         action(store)
         load(policy_dir)
+        os.close(_open(policy_dir / "audit.log", AUDIT))
         server = listen(path)
         print(json.dumps({"result": "accepted"}), flush=True)
     except (OSError, ValueError):

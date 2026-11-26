@@ -24,6 +24,7 @@ def ask(store, request, admin=True, monkeypatch=None):
     ours, theirs = socket.socketpair()  # the kernel reports this process as the peer
     with ours, theirs:
         theirs.sendall(request if isinstance(request, bytes) else json.dumps(request).encode() + b"\n")
+        theirs.shutdown(socket.SHUT_WR)
         broker.answer(ours, store)
         return json.loads(theirs.recv(256))["result"]
 
@@ -64,7 +65,8 @@ def test_worker_is_denied_every_operation_and_changes_nothing(store, op):
 
 @pytest.mark.parametrize("raw", [b"not json\n", b"[]\n", b'{"op": "grant", "wolt": "wolt-a"}\n',
     b'{"op": "enroll", "wolt": "wolt-a", "extra": 1}\n', b'{"op": "enroll", "wolt": "Wolt A"}\n',
-    b'{"op": "enroll", "wolt": 7}\n', b'{"op": ["enroll"], "wolt": "wolt-a"}\n', b'{"op": {}}\n', b'{"op": "shell", "wolt": "wolt-a"}\n',
+    b'{"op": "enroll", "wolt": 7}\n', b'{"op": ["enroll"], "wolt": "wolt-a"}\n', b'{"op": {}}\n', b'{"op": "enroll", "wolt": "wolt-a"}',
+    b'{"op": "enroll", "wolt": "wolt-a", "wolt": "wolt-b"}\n', b'{"op": "enroll", "wolt": "wolt-a"}\n{}\n', b'{"op": "shell", "wolt": "wolt-a"}\n',
     b'{"op": "enroll", "wolt": "' + b"a" * 600 + b'"}\n', b"\xff\n", b""])
 def test_malformed_requests_are_refused_without_effect(store, monkeypatch, raw):
     assert ask(store, raw, monkeypatch=monkeypatch) == "invalid"
@@ -108,6 +110,28 @@ def test_damaged_store_fails_closed(store, monkeypatch, damage, tmp_path):
     with pytest.raises((ValueError, OSError)):
         broker.load(store)
     assert ask(store, {"op": "run", "wolt": "wolt-a", "action": broker.ACTION}, monkeypatch=monkeypatch) in {"invalid", "error"}
+
+
+@pytest.mark.parametrize("damage", ["symlink", "fifo", "mode", "hardlink", "dir"])
+def test_an_unauditable_volume_refuses_before_any_change(store, monkeypatch, damage, tmp_path):
+    assert ask(store, {"op": "enroll", "wolt": "wolt-a"}, monkeypatch=monkeypatch) == "ok"
+    audit, before = store / "audit.log", (store / "policy.json").read_bytes()
+    audit.unlink()
+    if damage == "symlink":
+        (tmp_path / "decoy.log").touch(mode=0o600)
+        audit.symlink_to(tmp_path / "decoy.log")
+    elif damage == "fifo":
+        os.mkfifo(audit, 0o600)
+    elif damage == "mode":
+        audit.touch(mode=0o600)
+        audit.chmod(0o644)
+    elif damage == "hardlink":
+        audit.touch(mode=0o600)
+        os.link(audit, tmp_path / "second-name")
+    else:
+        audit.mkdir()
+    assert ask(store, {"op": "enroll", "wolt": "wolt-b"}, monkeypatch=monkeypatch) == "error"
+    assert (store / "policy.json").read_bytes() == before
 
 
 def test_capacity_is_a_fixed_refusal_that_keeps_the_policy_loadable(store, monkeypatch):

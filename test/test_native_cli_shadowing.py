@@ -478,7 +478,9 @@ def test_secrets_admin_runs_as_root_inside_the_container(tmp_path, wolts):
         calls = [c.split() for c in log.read_text().splitlines()] if log.exists() else []
         assert list((tmp_path / "wolts").iterdir()) == []  # nothing written, no init or prompt
     assert result.returncode == 0, result.stdout + result.stderr
-    assert calls == [["exec", "-u", "0", "lodge-test", "/usr/local/bin/woltspace-python", "-I", "-m",
+    venv_python = "/opt/woltspace/tools/woltspace/bin/python"  # the image's uv tool venv, not a symlink to it
+    assert "ENV UV_TOOL_DIR=/opt/woltspace/tools" in (ROOT / "container" / "Dockerfile").read_text()
+    assert calls == [["exec", "-u", "0", "lodge-test", venv_python, "-I", "-m",
                       "woltspace.dummy_broker", "admin", "grant", "wolt-a", "dummy.ping"]]
 
 

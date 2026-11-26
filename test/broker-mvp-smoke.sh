@@ -5,13 +5,27 @@ exec 3>&1 >/dev/null 2>&1
 export PATH="$(pwd -P):$PATH"
 failure_line=1
 annotate_failure() {
-    local failed_phase=$1 source_line=$2
+    local failed_phase=$1 source_line=$2 status=${3:-0} suffix= bucket
     case "$failed_phase" in
         setup|image-build|flag-off|flag-on|admin|forced-stop-resume|recreate|clean-stop|backup-restore|crash-reconcile|cleanup) ;;
         *) failed_phase=setup ;;
     esac
     [[ $source_line =~ ^[1-9][0-9]{0,5}$ ]] || source_line=1
-    printf '::error::broker-smoke phase=%s line=%s\n' "$failed_phase" "$source_line" >&3
+    case "${offline_step:-}" in
+        fixture|archive-backup|archive-restore|quarantine|volume-snapshot|volume-extract|volume-modes|crash-probe)
+            case "$status" in
+                125) bucket=docker ;;
+                126) bucket=entrypoint ;;
+                127) bucket=missing ;;
+                1) bucket=process ;;
+                2) bucket=usage-or-process ;;
+                13[0-9]|14[0-9]) bucket=signal-range ;;
+                *) bucket=other ;;
+            esac
+            suffix=" step=$offline_step rc=$bucket"
+            ;;
+    esac
+    printf '::error::broker-smoke phase=%s line=%s%s\n' "$failed_phase" "$source_line" "$suffix" >&3
 }
 trap 'failure_line=$LINENO' ERR
 root=$(mktemp -d) || { annotate_failure setup "$LINENO"; echo 'FAIL setup' >&3; exit 1; }
@@ -48,7 +62,7 @@ cleanup() {
     fi
     rm -rf -- "$root" || cleaned=1
     if (( status != 0 )); then
-        annotate_failure "$phase" "$failure_line"
+        annotate_failure "$phase" "$failure_line" "$status"
         printf 'FAIL %s\n' "$phase" >&3
     fi
     if (( cleaned != 0 )); then
@@ -203,18 +217,21 @@ echo 'PASS clean-stop' >&3
 
 # The helper is offline and auto-removed; its archive stream is not logged.
 offline() {
+    offline_step=$1
+    shift
     docker run --rm --name "$helper" --network none --log-driver none "$@"
+    unset offline_step
 }
 
 phase=backup-restore
 mkdir -m 700 "$root/recovery"
 fixture="$root/recovery"
 probe() {
-    offline -i --user "$(id -u):$(id -g)" -v "$fixture:/fixture" \
+    offline "$1" -i --user "$(id -u):$(id -g)" -v "$fixture:/fixture" \
         --entrypoint "$venv_python" "$WOLTSPACE_IMAGE" -I - "$@" <test/test_broker_recovery_probe.py
 }
 archive_tool() {
-    offline --user "$(id -u):$(id -g)" -e HOME=/fixture -v "$fixture:/fixture" \
+    offline "archive-$1" --user "$(id -u):$(id -g)" -e HOME=/fixture -v "$fixture:/fixture" \
         --entrypoint /usr/local/bin/woltspace "$WOLTSPACE_IMAGE" "$@"
 }
 probe fixture /fixture
@@ -235,18 +252,21 @@ docker stop --time 15 "$name"
 [[ -z $(docker ps -aq --filter "name=^/${name}$") ]]
 [[ $(docker volume inspect -f '{{.Name}}' "$volume") == "$volume" ]]
 snapshot="$fixture/broker-volume.tar"
+# Also retain the step in the parent if the private-umask subshell fails.
+offline_step=volume-snapshot
 (
     umask 077
-    offline --user 0:0 -v "$volume:$policy:ro" --entrypoint tar "$WOLTSPACE_IMAGE" \
+    offline volume-snapshot --user 0:0 -v "$volume:$policy:ro" --entrypoint tar "$WOLTSPACE_IMAGE" \
         --numeric-owner -C "$policy" -cpf - . >"$snapshot"
 )
+unset offline_step
 [[ -s $snapshot && $(stat -c %a "$snapshot") == 600 ]]
 docker volume rm "$volume"
 [[ -z $(docker volume ls -q --filter "name=^${volume}$") ]]
 [[ $(docker volume create "$volume") == "$volume" ]]
-offline -i --user 0:0 -v "$volume:$policy" --entrypoint tar "$WOLTSPACE_IMAGE" \
+offline volume-extract -i --user 0:0 -v "$volume:$policy" --entrypoint tar "$WOLTSPACE_IMAGE" \
     --numeric-owner --same-owner --same-permissions -C "$policy" -xpf - <"$snapshot"
-offline --user 0:0 -v "$volume:$policy:ro" --entrypoint sh "$WOLTSPACE_IMAGE" -ec '
+offline volume-modes --user 0:0 -v "$volume:$policy:ro" --entrypoint sh "$WOLTSPACE_IMAGE" -ec '
     dir=$1
     [ "$(stat -c "%u:%g %a" "$dir")" = "990:990 700" ]
     [ "$(stat -c "%u:%g %a" "$dir/policy.json")" = "990:990 600" ]
@@ -276,7 +296,7 @@ echo 'PASS backup-restore' >&3
 phase=crash-reconcile
 audit_before=$(docker exec -u 0 "$name" sha256sum "$policy/audit.log")
 docker stop --time 15 "$name"
-offline -i -v "$volume:$policy" --entrypoint "$venv_python" "$WOLTSPACE_IMAGE" \
+offline crash-probe -i -v "$volume:$policy" --entrypoint "$venv_python" "$WOLTSPACE_IMAGE" \
     -I - crash "$policy" <test/test_broker_recovery_probe.py
 docker start "$name"
 check_isolation

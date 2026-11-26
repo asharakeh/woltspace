@@ -664,7 +664,7 @@ if [ ! -d "$WOLTS_DIR" ] || [ "$(_count_wolts)" -eq 0 ]; then
   fi
   # Allow container-management commands even with no wolts (onboarding)
   case "$cmd" in
-    logs|shell|stop|chat|build) ;;  # fall through to subcommands
+    logs|shell|stop|chat|build|secrets) ;;  # fall through to subcommands
     *)
       echo ""
       echo "  🦫 no wolts found at $WOLTS_DIR"

@@ -7,7 +7,7 @@ failure_line=1
 annotate_failure() {
     local failed_phase=$1 source_line=$2
     case "$failed_phase" in
-        setup|image-build|flag-off|flag-on|admin|forced-stop-resume|recreate|clean-stop|cleanup) ;;
+        setup|image-build|flag-off|flag-on|admin|forced-stop-resume|recreate|clean-stop|backup-restore|crash-reconcile|cleanup) ;;
         *) failed_phase=setup ;;
     esac
     [[ $source_line =~ ^[1-9][0-9]{0,5}$ ]] || source_line=1
@@ -24,6 +24,8 @@ export WOLTSPACE_PORT=17777 WOLTSPACE_FEATURE_ISOLATION=false
 name=$WOLTSPACE_CONTAINER
 store=/var/lib/woltspace-broker/store
 volume="$name-secrets" policy=/var/lib/woltspace-secrets
+helper="$name-recovery"
+venv_python=/opt/woltspace/tools/woltspace/bin/python
 phase=setup
 
 cleanup() {
@@ -31,6 +33,9 @@ cleanup() {
     trap - EXIT
     # Only remove the container and image that this run attempted to create.
     if [[ ${owned:-false} == true ]]; then
+        if docker container inspect "$helper" >/dev/null; then
+            docker rm -f "$helper" || cleaned=1
+        fi
         if docker container inspect "$name" >/dev/null; then
             docker rm -f "$name" || cleaned=1
         fi
@@ -58,7 +63,7 @@ trap 'failure_line=$LINENO; exit 1' INT TERM
 
 mkdir -p "$HOME" "$WOLTSPACE_WOLTS_DIR"
 docker info
-if docker container inspect "$name" || docker image inspect "$WOLTSPACE_IMAGE" || docker volume inspect "$volume"; then failure_line=$LINENO; exit 1; fi
+if docker container inspect "$name" || docker container inspect "$helper" || docker image inspect "$WOLTSPACE_IMAGE" || docker volume inspect "$volume"; then failure_line=$LINENO; exit 1; fi
 owned=true
 phase=image-build
 ./woltspace build --local
@@ -195,3 +200,68 @@ changes=$(docker diff "$name")
 ./woltspace stop
 [[ -z $(docker ps -aq --filter "name=^/${name}$") ]]
 echo 'PASS clean-stop' >&3
+
+# The helper never boots a lodge. Every invocation is offline and auto-removed.
+offline() {
+    docker run --rm --name "$helper" --network none "$@"
+}
+
+phase=backup-restore
+mkdir -m 700 "$root/recovery"
+fixture="$root/recovery"
+probe() {
+    offline -i --user "$(id -u):$(id -g)" -v "$fixture:/fixture" \
+        --entrypoint "$venv_python" "$WOLTSPACE_IMAGE" -I - "$@" <test/test_broker_recovery_probe.py
+}
+archive_tool() {
+    offline --user "$(id -u):$(id -g)" -e HOME=/fixture -v "$fixture:/fixture" \
+        --entrypoint /usr/local/bin/woltspace "$WOLTSPACE_IMAGE" "$@"
+}
+probe fixture /fixture
+archive_tool backup --wolts-dir /fixture/old --out /fixture --tag before-cutover
+archive_tool restore /fixture/woltspace-backup-before-cutover.tar.gz --to /fixture/restored
+probe quarantine /fixture
+restored="$fixture/restored/wolts"
+printf 'WOLTSPACE_CONFIG=/workspace/wolts/.space/legacy.json\nWOLTSPACE_PUBLIC_TUNNEL=false\n' >"$restored/.env"
+
+# The trusted volume is independent of the old lodge archive.
+./woltspace start
+check_isolation
+[[ $(admin grant wolt-b dummy.ping) == '{"result": "ok"}' ]]
+trusted_policy=$(docker exec -u 0 "$name" sha256sum "$policy/policy.json")
+docker stop --time 15 "$name"
+./woltspace stop
+export WOLTSPACE_WOLTS_DIR="$restored"
+./woltspace start
+check_isolation
+cmp "$fixture/old/.space/marker.txt" "$restored/.space/marker.txt"
+[[ $(docker exec -u 0 "$name" sha256sum "$policy/policy.json") == "$trusted_policy" ]]
+[[ $(admin run wolt-b dummy.ping) == '{"result": "ok"}' ]]
+[[ $(admin run wolt-a dummy.ping) == '{"result": "not-granted"}' ]]
+leak
+echo 'PASS backup-restore' >&3
+
+phase=crash-reconcile
+audit_before=$(docker exec -u 0 "$name" sha256sum "$policy/audit.log")
+docker stop --time 15 "$name"
+offline -i -v "$volume:$policy" --entrypoint "$venv_python" "$WOLTSPACE_IMAGE" \
+    -I - crash "$policy" <test/test_broker_recovery_probe.py
+docker start "$name"
+check_isolation
+[[ $(docker exec -u 0 "$name" sha256sum "$policy/audit.log") == "$audit_before" ]]
+reconciled_policy=$(docker exec -u 0 "$name" sha256sum "$policy/policy.json")
+[[ $reconciled_policy != "$trusted_policy" ]]
+# Read-only owner action confirms the authoritative policy after restart.
+[[ $(admin run wolt-a dummy.ping) == '{"result": "ok"}' ]]
+[[ $(docker exec -u 0 "$name" sha256sum "$policy/policy.json") == "$reconciled_policy" ]]
+docker exec -u 0 "$name" "$venv_python" -I -c '
+import json, sys
+rows = [json.loads(row) for row in open(sys.argv[1])]
+assert all(set(row) == {"caller", "op", "action", "result"} for row in rows)
+assert rows[-1] == {"caller": "host-admin", "op": "run", "action": "dummy.ping", "result": "ok"}
+assert sum(row["op"] == "grant" and row["result"] == "ok" for row in rows) == 2
+' "$policy/audit.log"
+leak
+docker stop --time 15 "$name"
+[[ $(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$name") == 'exited 0' ]]
+echo 'PASS crash-reconcile' >&3

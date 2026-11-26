@@ -467,8 +467,17 @@ def test_host_selects_broker_feature_and_excludes_shared_dotenv(tmp_path, enable
     assert ("lodge-test-secrets:/var/lib/woltspace-secrets" in argv) == (enabled == "true")
 
 
-def test_secrets_admin_runs_as_root_inside_the_container(tmp_path):
-    result, calls, _ = _docker_calls(tmp_path, "secrets grant wolt-a dummy.ping")
+@pytest.mark.parametrize("wolts", [True, False])  # an onboarding lodge has no wolt yet
+def test_secrets_admin_runs_as_root_inside_the_container(tmp_path, wolts):
+    if wolts:
+        result, calls, _ = _docker_calls(tmp_path, "secrets grant wolt-a dummy.ping")
+    else:
+        (tmp_path / "wolts").mkdir()
+        result = _launch(tmp_path / "wolts", "secrets grant wolt-a dummy.ping", WOLTSPACE_NONINTERACTIVE="true")
+        log = tmp_path / "fake-bin" / "docker.log"
+        calls = [c.split() for c in log.read_text().splitlines()] if log.exists() else []
+        assert list((tmp_path / "wolts").iterdir()) == []  # nothing written, no init or prompt
+    assert result.returncode == 0, result.stdout + result.stderr
     assert calls == [["exec", "-u", "0", "lodge-test", "/usr/local/bin/woltspace-python", "-I", "-m",
                       "woltspace.dummy_broker", "admin", "grant", "wolt-a", "dummy.ping"]]
 

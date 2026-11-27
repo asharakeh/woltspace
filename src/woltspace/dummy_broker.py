@@ -8,6 +8,7 @@ one writer thread commits every mutation together with its audit row. Stored gra
 on every broker start until the owner grants them again, so restored or old media revives nothing.
 Intake stays the serial admin socket: the writer and the lookup are separate, not yet concurrent.
 """
+from array import array
 from collections import deque
 from concurrent.futures import Future
 import json
@@ -15,6 +16,7 @@ import os
 import queue
 import re
 import secrets
+import select
 import socket
 import sqlite3
 import stat
@@ -29,11 +31,12 @@ POLICY_DIR = Path("/var/lib/woltspace-secrets")
 SOCKET = Path("/run/woltspace-broker/admin.sock")
 ACTION, ADMIN_UID, MAX_REQUEST, CAPACITY, PENDING, GROUP = "dummy.ping", 0, 512, 64, 16, 8
 WORKERS, WAITING, PER_WOLT, BINDINGS = 2, 6, 3, 128
-DUMMY_DELAY = 0.025
+DUMMY_DELAY = 0.25
 ACTIONS = {ACTION: ("secret", "dummy", "ping")}  # allowlisted action -> (resource type, resource, operation)
 FIELDS = {"enroll": ("wolt",), "rename": ("wolt", "to"), "retire": ("wolt",), "register": ("action",),
           "grant": ("wolt", "action"), "revoke": ("wolt", "action"), "run": ("wolt", "action")}
 NAME = re.compile(r"[a-z][a-z0-9-]{0,39}")
+PRINCIPAL = re.compile(r"p-[0-9a-f]{32}")
 FILES = {"registry.db": 0o600, "registry.db-journal": 0o600, "action.key": 0o400}
 SCHEMA = """
 CREATE TABLE principals (id TEXT PRIMARY KEY, name TEXT UNIQUE, retired INTEGER NOT NULL DEFAULT 0);
@@ -316,7 +319,7 @@ class Dispatcher:
             if self.authz.bindings.get(binding.session) == binding:
                 del self.authz.bindings[binding.session]
 
-    def submit(self, binding: WorkerBinding, name: str) -> Future:
+    def submit(self, binding: WorkerBinding, name: str, alive=None) -> Future:
         future = Future()
         future.set_running_or_notify_cancel()  # the adapter owns completion
         with self.ready:
@@ -328,7 +331,7 @@ class Dispatcher:
                   or sum(map(len, self.waiting.values())) >= WAITING):
                 future.set_result("busy")
             else:
-                self.waiting.setdefault(binding.principal, deque()).append((binding, future))
+                self.waiting.setdefault(binding.principal, deque()).append((binding, future, alive))
                 if not self.started:
                     self.started = True
                     for _ in range(WORKERS):
@@ -342,19 +345,19 @@ class Dispatcher:
                 self.ready.wait_for(lambda: self.waiting.keys() - self.running)
                 principal = next(pid for pid in self.waiting if pid not in self.running)
                 queue_for_wolt = self.waiting.pop(principal)
-                binding, future = queue_for_wolt.popleft()
+                binding, future, alive = queue_for_wolt.popleft()
                 if queue_for_wolt:
                     self.waiting[principal] = queue_for_wolt
                 self.running.add(principal)
             try:
-                result = self._dispatch(binding)
+                result = self._dispatch(binding, alive)
             finally:
                 with self.ready:
                     self.running.remove(principal)
                     self.ready.notify()
             future.set_result(result)
 
-    def _dispatch(self, binding: WorkerBinding) -> str:
+    def _dispatch(self, binding: WorkerBinding, alive) -> str:
         # At most two pool threads submit audit work. The serial owner route
         # has writer capacity even if every dispatch queue is full.
         def intent(db):
@@ -369,7 +372,8 @@ class Dispatcher:
             return reply["result"]
         with self.ready:
             admitted = (self.authz.bindings.get(binding.session) == binding
-                        and (binding.principal, ACTION) in self.authz.active)
+                        and (binding.principal, ACTION) in self.authz.active
+                        and (alive is None or alive()))
         result = self._dummy() if admitted else "denied"
 
         def outcome(db):
@@ -389,6 +393,128 @@ class Dispatcher:
         return "ok"
 
 
+class WorkerChannels:
+    """A root-authorized launcher transfers one end of an unnamed socketpair."""
+
+    def __init__(self, dispatch: Dispatcher):
+        self.dispatch = dispatch
+        self.lock = threading.Lock()
+        self.channels = {}
+        self.inodes = set()
+        # Reserve replacement capacity while previously admitted calls finish.
+        self.readers = threading.BoundedSemaphore(BINDINGS + WORKERS)
+
+    def attach(self, principal: str, session: str, descriptor: int) -> dict:
+        if not self.readers.acquire(blocking=False):
+            return {"result": "busy"}
+        channel = None
+        handed_off = False
+        duplicate = None
+        try:
+            duplicate = os.dup(descriptor)
+            channel = socket.socket(fileno=duplicate)
+            duplicate = None
+            if (channel.family != socket.AF_UNIX or channel.type != socket.SOCK_SEQPACKET
+                    or channel.getsockname() or channel.getpeername()):
+                return {"result": "invalid"}
+            channel.setblocking(True)
+            inode = os.fstat(channel.fileno()).st_ino
+            with self.lock:
+                if inode in self.inodes:
+                    return {"result": "invalid"}
+                binding = self.dispatch.bind(principal, session)
+                if binding is None:
+                    return {"result": "denied"}
+                previous = self.channels.get(session)
+                self.channels[session] = channel
+                if previous is not None:
+                    try:
+                        previous.shutdown(socket.SHUT_RDWR)
+                    except OSError:  # the old worker may already have closed its end
+                        pass
+                reader = threading.Thread(target=self._serve, args=(channel, binding, inode), daemon=True)
+                try:
+                    reader.start()
+                except RuntimeError:
+                    del self.channels[session]
+                    self.dispatch.end(binding)
+                    return {"result": "busy"}
+                self.inodes.add(inode)
+                handed_off = True  # the reader owns it
+            return {"result": "ok"}
+        except OSError:
+            return {"result": "invalid"}
+        finally:
+            if not handed_off:
+                if channel is not None:
+                    channel.close()
+                if duplicate is not None:
+                    os.close(duplicate)
+                self.readers.release()
+
+    def _serve(self, channel: socket.socket, binding: WorkerBinding, inode: int) -> None:
+        closed = select.poll()
+        closed.register(channel, select.POLLHUP | select.POLLRDHUP | select.POLLERR)
+        try:
+            self._send(channel, {"result": "ok", "principal": binding.principal, "instance": binding.instance})
+            while raw := channel.recv(MAX_REQUEST + 1):
+                self._send(channel, {"result": self._request(binding, raw, lambda: not closed.poll(0))})
+        except OSError:
+            pass  # clean exit or explicit replacement
+        finally:
+            with self.lock:
+                if self.channels.get(binding.session) is channel:
+                    del self.channels[binding.session]
+                self.dispatch.end(binding)
+                self.inodes.remove(inode)
+                channel.close()
+            self.readers.release()
+
+    @staticmethod
+    def _send(channel: socket.socket, reply: dict) -> None:
+        channel.send(json.dumps(reply).encode(), socket.MSG_DONTWAIT)
+
+    def _request(self, binding: WorkerBinding, raw: bytes, alive) -> str:
+        if len(raw) > MAX_REQUEST:
+            return "invalid"
+        try:
+            request = json.loads(raw, object_pairs_hook=_unique)
+        except (ValueError, RecursionError):
+            return "invalid"
+        if (not isinstance(request, dict) or request.keys() != {"principal", "instance", "action"}
+                or not isinstance(request["action"], str)):
+            return "invalid"
+        if request["principal"] != binding.principal or request["instance"] != binding.instance:
+            return "denied"
+        return self.dispatch.submit(binding, request["action"], alive).result()
+
+
+def _receive_admin(conn: socket.socket, owner: bool, descriptors: list[int]):
+    """Keep the existing framed JSON route; only an owner may pass a descriptor."""
+    raw = b""
+    word = array("i").itemsize
+    while b"\n" not in raw and len(raw) <= MAX_REQUEST:
+        if owner:
+            chunk, ancillary, flags, _ = conn.recvmsg(
+                MAX_REQUEST + 1, socket.CMSG_SPACE(2 * word), socket.MSG_CMSG_CLOEXEC,
+            )
+            for level, kind, data in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    delivered = array("i")
+                    delivered.frombytes(data[:len(data) - len(data) % word])
+                    descriptors.extend(delivered)
+            if flags & socket.MSG_CTRUNC or len(descriptors) > 1:
+                return None
+        else:
+            chunk = conn.recv(MAX_REQUEST + 1)
+        if not chunk:
+            break
+        raw += chunk
+    if len(raw) <= MAX_REQUEST and raw.endswith(b"\n") and raw.count(b"\n") == 1:
+        return json.loads(raw, object_pairs_hook=_unique)
+    return None
+
+
 class Broker:
     def __init__(self, policy_dir: Path):
         self.policy_dir, db = policy_dir, open_registry(policy_dir)
@@ -403,6 +529,7 @@ class Broker:
         self.authz = Authz(db, policy_dir)
         self.writer = Writer(db, self.authz)
         self.dispatch = Dispatcher(self.authz, self.writer)
+        self.worker_channels = WorkerChannels(self.dispatch)
 
     def apply(self, request) -> dict:
         op = request.get("op") if isinstance(request, dict) else None
@@ -427,25 +554,37 @@ class Broker:
 
     def answer(self, conn: socket.socket) -> None:
         _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        caller, request = ("host-admin" if uid == ADMIN_UID else "worker"), None
+        owner = uid == ADMIN_UID
+        caller, request, descriptors = ("host-admin" if owner else "worker"), None, []
         conn.settimeout(2)
         try:
-            raw = b""
-            while b"\n" not in raw and len(raw) <= MAX_REQUEST and (chunk := conn.recv(MAX_REQUEST + 1)):
-                raw += chunk
-            if len(raw) <= MAX_REQUEST and raw.endswith(b"\n") and raw.count(b"\n") == 1:  # one framed object
-                request = json.loads(raw, object_pairs_hook=_unique)
-        except (ValueError, UnicodeDecodeError, TimeoutError):
-            pass  # a silent or slow caller is malformed too
-        op = request.get("op") if isinstance(request, dict) else None
-        op = op if isinstance(op, str) and op in FIELDS else "other"
-        if caller != "host-admin":
-            reply = self.record(caller, op, "denied")
-        else:
-            reply = self.apply(request)
-            if reply == {"result": "invalid"}:
-                reply = self.record(caller, op, "invalid")
+            try:
+                request = _receive_admin(conn, owner, descriptors)
+            except (ValueError, RecursionError, TimeoutError):
+                pass  # a silent or slow caller is malformed too
+            op = request.get("op") if isinstance(request, dict) else None
+            if not owner:
+                reply = self.record(caller, op if isinstance(op, str) and op in FIELDS else "other", "denied")
+            elif op == "attach":
+                reply = self.attach(request, descriptors)
+            else:
+                reply = self.apply(request) if not descriptors else {"result": "invalid"}
+                if reply == {"result": "invalid"}:
+                    reply = self.record(caller, op if isinstance(op, str) and op in FIELDS else "other", "invalid")
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
         conn.sendall(json.dumps(reply).encode() + b"\n")
+
+
+    def attach(self, request: dict, descriptors: list[int]) -> dict:
+        if request.keys() != {"op", "principal", "session"} or len(descriptors) != 1:
+            return {"result": "invalid"}
+        principal, session = request["principal"], request["session"]
+        if not (isinstance(principal, str) and PRINCIPAL.fullmatch(principal)
+                and isinstance(session, str) and NAME.fullmatch(session)):
+            return {"result": "invalid"}
+        return self.worker_channels.attach(principal, session, descriptors[0])
 
 
 def _unique(pairs: list) -> dict:

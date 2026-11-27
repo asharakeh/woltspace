@@ -1,4 +1,5 @@
 """Identity broker stage 1: real sockets, real SQLite files; only the admin uid is mocked to this test's uid."""
+from array import array
 import json
 import os
 import socket
@@ -489,7 +490,7 @@ def test_dispatch_limits_fairness_and_revoke_under_load(store, owner, monkeypatc
     latency = sorted(ticks)
     for label, index in (("p50_ms", 5), ("p95_ms", 10), ("p99_ms", 10)):
         record_property(label, round(latency[index] * 1000, 3))
-    record_property("workload", "11 submissions: 6 ok, 3 denied, 2 busy; fixed 25 ms plus controlled holds")
+    record_property("workload", "11 submissions: 6 ok, 3 denied, 2 busy; fixed 250 ms plus controlled holds")
     record_property("requests_per_second", round(11 / elapsed, 2))
     record_property("revoke_ms", round(revoke_latency * 1000, 3))
 
@@ -554,3 +555,103 @@ b.dispatch.submit(binding, "dummy.ping").result(5)
     assert b.dispatch.submit(current, A).result(5) == "ok"
     assert rows(store, "SELECT result FROM audit WHERE op = 'dispatch' ORDER BY seq") == [
         ("unknown",), ("denied",), ("ok",)]
+
+
+def attach_channel(b, principal, session, *channels):
+    request = {"op": "attach", "principal": principal, "session": session}
+    client, server = socket.socketpair()
+    with client, server:
+        payload = json.dumps(request).encode() + b"\n"
+        if channels:
+            descriptors = array("i", (channel.fileno() for channel in channels))
+            client.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors)])
+        else:
+            client.sendall(payload)
+        client.shutdown(socket.SHUT_WR)
+        b.answer(server)
+        return json.loads(client.recv(256))["result"]
+
+
+def packet(channel, hello, **overrides):
+    request = {"principal": hello["principal"], "instance": hello["instance"], "action": A}
+    channel.send(json.dumps({**request, **overrides}).encode())
+    return json.loads(channel.recv(256))["result"]
+
+
+def test_unprivileged_attach_is_denied_before_descriptor_transfer(store, owner, monkeypatch):
+    b = broker.Broker(store)
+    principal = enrolled(b, "alpha")
+    monkeypatch.setattr(broker, "ADMIN_UID", os.getuid() + 1)
+    endpoint, worker = socket.socketpair(type=socket.SOCK_SEQPACKET)
+    with endpoint, worker:
+        assert attach_channel(b, principal, "alpha", endpoint) == "denied"
+        assert not b.authz.bindings and not b.worker_channels.channels
+
+
+def test_attached_channels_authorize_packets_and_replace_old_endpoint(store, owner):
+    b = broker.Broker(store)
+    alpha, beta = enrolled(b, "alpha"), enrolled(b, "beta")
+    assert op(b, "register") == "ok" and op(b, "grant", "alpha") == "ok"
+    a_end, a = socket.socketpair(type=socket.SOCK_SEQPACKET)
+    b_end, peer = socket.socketpair(type=socket.SOCK_SEQPACKET)
+    new_end, replacement = socket.socketpair(type=socket.SOCK_SEQPACKET)
+    stream, stream_peer = socket.socketpair()
+    with a_end, a, b_end, peer, new_end, replacement, stream, stream_peer:
+        for worker in (a, peer, replacement):
+            worker.settimeout(5)
+        assert attach_channel(b, alpha, "a") == "invalid"
+        assert attach_channel(b, alpha, "a", a_end, b_end) == "invalid"
+        assert attach_channel(b, alpha, "a", stream) == "invalid"
+        assert attach_channel(b, alpha, "a", a_end) == "ok"
+        first = json.loads(a.recv(256))
+        assert first["result"] == "ok" and first["principal"] == alpha
+        assert attach_channel(b, beta, "b", a_end) == "invalid"
+        assert attach_channel(b, beta, "a", b_end) == "denied"
+        assert attach_channel(b, beta, "b", b_end) == "ok"
+        second = json.loads(peer.recv(256))
+        a_end.close()
+        b_end.close()
+        assert packet(a, first, principal=beta) == "denied"
+        assert packet(a, first, instance=second["instance"]) == "denied"
+        assert packet(peer, second) == "denied"
+        assert packet(a, first) == "ok"
+        assert attach_channel(b, alpha, "a", new_end) == "ok"
+        new_end.close()
+        current = json.loads(replacement.recv(256))
+        assert current["principal"] == first["principal"] and current["instance"] != first["instance"]
+        assert a.recv(256) == b""
+        assert packet(replacement, current, instance=first["instance"]) == "denied"
+        assert packet(replacement, current) == "ok"
+    until(lambda: not b.authz.bindings and not b.worker_channels.channels)
+
+
+def test_attached_worker_eof_denies_queued_request(store, owner, monkeypatch):
+    b = broker.Broker(store)
+    alpha = enrolled(b, "alpha")
+    assert op(b, "register") == "ok" and op(b, "grant", "alpha") == "ok"
+    running, release = threading.Event(), threading.Event()
+
+    def hold():
+        running.set()
+        assert release.wait(5)
+        return "ok"
+
+    monkeypatch.setattr(b.dispatch, "_dummy", hold)
+    direct = b.dispatch.bind(alpha, "running")
+    first = b.dispatch.submit(direct, A)
+    try:
+        assert running.wait(5)
+        endpoint, worker = socket.socketpair(type=socket.SOCK_SEQPACKET)
+        with endpoint, worker:
+            worker.settimeout(5)
+            assert attach_channel(b, alpha, "a", endpoint) == "ok"
+            endpoint.close()
+            hello = json.loads(worker.recv(256))
+            worker.send(json.dumps({"principal": alpha, "instance": hello["instance"], "action": A}).encode())
+            until(lambda: bool(b.dispatch.waiting.get(alpha)))
+        worker.close()
+    finally:
+        release.set()
+    assert first.result(5) == "ok"
+    until(lambda: "a" not in b.authz.bindings)
+    assert rows(store, "SELECT result FROM audit WHERE op = 'dispatch' ORDER BY seq") == [("ok",), ("denied",)]

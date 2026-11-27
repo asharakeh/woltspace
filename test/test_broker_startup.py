@@ -66,7 +66,7 @@ def test_real_trusted_path_and_untrusted_fixture(tmp_path):
         boot.protected(tmp_path)
 
 
-def test_actual_core_action_and_executable(tmp_path):
+def test_actual_core_action_and_executable(tmp_path, capsys):
     store, policy = tmp_path / "dummy", tmp_path / "policy"
     store.write_text("synthetic-only")
     policy.mkdir(mode=0o700)
@@ -79,6 +79,10 @@ def test_actual_core_action_and_executable(tmp_path):
     try:
         assert select.select([child.stdout], [], [], 3)[0]
         assert json.loads(child.stdout.readline()) == {"result": "accepted"}
+        assert dummy_broker.admin(["enroll", "wolt-a"], short / "admin.sock") == 1  # this caller is not uid 0
+        assert capsys.readouterr().out == '{"result": "denied"}\n'
+        assert sorted(p.name for p in policy.iterdir()) == ["registry.db"]
+        assert oct(policy.joinpath("registry.db").stat().st_mode & 0o777) == "0o600"
     finally:
         child.terminate()
         child.wait(timeout=3)
@@ -86,6 +90,13 @@ def test_actual_core_action_and_executable(tmp_path):
         child.stderr.close()
         (short / "admin.sock").unlink(missing_ok=True)
         short.rmdir()
+    old = tmp_path / "s1"
+    old.mkdir(mode=0o700)
+    (old / "policy.json").write_text("{}")  # an earlier layout is refused at startup, never adopted
+    done = subprocess.run([sys.executable, "-I", "-S", dummy_broker.__file__, str(store), str(old),
+                           str(tmp_path / "x.sock")], capture_output=True, env={"PATH": "/usr/bin:/bin"}, timeout=10)
+    assert (done.returncode, done.stdout, done.stderr) == (1, b"", b"")
+    assert [p.name for p in old.iterdir()] == ["policy.json"]
     store.write_text("")
     with pytest.raises(ValueError):
         dummy_broker.action(store)

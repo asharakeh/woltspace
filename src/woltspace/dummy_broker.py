@@ -1,27 +1,43 @@
-"""Protected dummy broker: owner-only admin over a local socket. No provider or public API.
+"""Protected identity broker, stage 1: owner-only registry admin and one dummy action.
 
 The broker runs as the service uid. Only uid 0 in the container (reached from the host through
 `docker exec -u 0`, i.e. the host's Docker authority) may administer it; the kernel reports the
-caller (SO_PEERCRED). Policy lives on a dedicated volume and is re-read on every request.
+caller (SO_PEERCRED). A protected SQLite registry on the dedicated volume holds principals with
+opaque stable IDs, typed resources, grants and a redacted audit. Lookups use an in-memory snapshot;
+one writer thread commits every mutation together with its audit row. Stored grants start inactive
+on every broker start until the owner grants them again, so restored or old media revives nothing.
+Intake stays the serial admin socket: the writer and the lookup are separate, not yet concurrent.
 """
 import json
 import os
+import queue
 import re
 import secrets
 import socket
+import sqlite3
 import stat
 import struct
 import sys
+import threading
 from pathlib import Path
 
 POLICY_DIR = Path("/var/lib/woltspace-secrets")
 SOCKET = Path("/run/woltspace-broker/admin.sock")
-ACTION, ADMIN_UID, MAX_REQUEST = "dummy.ping", 0, 512
-FIELDS = {"enroll": ("wolt",), "register": ("action",), "grant": ("wolt", "action"),
-          "revoke": ("wolt", "action"), "run": ("wolt", "action")}
+ACTION, ADMIN_UID, MAX_REQUEST, CAPACITY, PENDING, GROUP = "dummy.ping", 0, 512, 64, 16, 8
+ACTIONS = {ACTION: ("secret", "dummy", "ping")}  # allowlisted action -> (resource type, resource, operation)
+FIELDS = {"enroll": ("wolt",), "rename": ("wolt", "to"), "retire": ("wolt",), "register": ("action",),
+          "grant": ("wolt", "action"), "revoke": ("wolt", "action"), "run": ("wolt", "action")}
 NAME = re.compile(r"[a-z][a-z0-9-]{0,39}")
-FILES = {"policy.json": 0o600, "action.key": 0o400, "audit.log": 0o600}
-AUDIT = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+FILES = {"registry.db": 0o600, "registry.db-journal": 0o600, "action.key": 0o400}
+SCHEMA = """
+CREATE TABLE principals (id TEXT PRIMARY KEY, name TEXT UNIQUE, retired INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE resources (id TEXT PRIMARY KEY, type TEXT NOT NULL, name TEXT NOT NULL UNIQUE);
+CREATE TABLE grants (principal TEXT NOT NULL REFERENCES principals, resource TEXT NOT NULL REFERENCES resources,
+                     operation TEXT NOT NULL, PRIMARY KEY (principal, resource, operation));
+CREATE TABLE audit (seq INTEGER PRIMARY KEY, caller TEXT NOT NULL, op TEXT NOT NULL, principal TEXT,
+                    action TEXT NOT NULL, result TEXT NOT NULL);
+PRAGMA user_version = 1;
+"""
 
 
 def action(store: Path) -> dict:
@@ -41,124 +57,255 @@ def _open(path: Path, flags: int = os.O_RDONLY) -> int:
     return fd
 
 
-def _read(path: Path) -> bytes | None:
+def _key(policy_dir: Path) -> bool:
+    """The dummy custody: a key file apart from the registry, checked but never returned."""
     try:
-        fd = _open(path)
+        fd = _open(policy_dir / "action.key")
     except FileNotFoundError:
-        return None
+        return False
     try:
-        if os.fstat(fd).st_size > 8192:
-            raise ValueError("oversized broker file")
-        return os.read(fd, 8192)  # 64 longest names twice fit
+        return re.fullmatch(rb"[0-9a-f]{64}", os.read(fd, 65)) is not None
     finally:
         os.close(fd)
 
 
-def _unique(pairs: list) -> dict:
-    if len({key for key, _ in pairs}) != len(pairs):
-        raise ValueError("duplicate request key")
-    return dict(pairs)
-
-
-def _write(path: Path, data: bytes) -> None:
+def _write_key(policy_dir: Path) -> None:
     """Atomic durable replace; a stale temp file from an unclean stop is dropped first."""
-    tmp = path.with_name(path.name + ".tmp")
+    path = policy_dir / "action.key"
+    tmp = path.with_name("action.key.tmp")
     tmp.unlink(missing_ok=True)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILES[path.name])
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
     with os.fdopen(fd, "wb") as stream:
-        stream.write(data)
+        stream.write(secrets.token_hex(32).encode())  # the synthetic secret is born here
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(tmp, path)
-    dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    dfd = os.open(policy_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(dfd)
     finally:
         os.close(dfd)
 
 
-def load(policy_dir: Path) -> dict:
-    """Validate the directory and the fixed schema; anything else fails closed."""
+def open_registry(policy_dir: Path) -> sqlite3.Connection:
+    """Open or create the protected registry; any other or older layout fails closed, untouched."""
     info = policy_dir.lstat()
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
             or stat.S_IMODE(info.st_mode) != 0o700):
         raise ValueError("unsafe broker policy directory")
-    if {p.name for p in policy_dir.iterdir()} - set(FILES) - {n + ".tmp" for n in FILES}:
-        raise ValueError("unexpected broker policy contents")
-    raw = _read(policy_dir / "policy.json")
-    policy = json.loads(raw) if raw is not None else {"version": 1, "wolts": [], "grants": []}
-    if not (isinstance(policy, dict) and set(policy) == {"version", "wolts", "grants"}
-            and policy["version"] == 1 and isinstance(policy["wolts"], list)
-            and isinstance(policy["grants"], list) and len(policy["wolts"]) <= 64
-            and all(isinstance(w, str) and NAME.fullmatch(w) for w in policy["wolts"] + policy["grants"])
-            and set(policy["grants"]) <= set(policy["wolts"])):
-        raise ValueError("malformed broker policy")
-    key = _read(policy_dir / "action.key")
-    if key is not None and not re.fullmatch(rb"[0-9a-f]{64}", key):
-        raise ValueError("malformed broker key")
-    policy["registered"] = key is not None
-    return policy
+    names = {p.name for p in policy_dir.iterdir()}
+    if names - set(FILES) - {"action.key.tmp"} or ("registry.db" not in names and names - {"action.key.tmp"}):
+        raise ValueError("incompatible broker volume")
+    path = policy_dir / "registry.db"
+    os.close(_open(path, os.O_RDWR | os.O_CREAT))
+    if "registry.db-journal" in names:
+        os.close(_open(policy_dir / "registry.db-journal"))  # a hot journal is recovered only if ours
+    db = sqlite3.connect(f"file:{path}?mode=rw", uri=True, isolation_level=None, check_same_thread=False)
+    try:
+        db.execute("PRAGMA journal_mode = DELETE")
+        db.execute("PRAGMA synchronous = FULL")
+        db.execute("PRAGMA foreign_keys = ON")
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if not tables and names <= {"registry.db"} and db.execute("PRAGMA user_version").fetchone()[0] == 0:
+            db.executescript(f"BEGIN IMMEDIATE; {SCHEMA} COMMIT;")  # first start, or one cut short
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if db.execute("PRAGMA user_version").fetchone()[0] != 1 or tables != {"principals", "resources", "grants", "audit"}:
+            raise ValueError("incompatible broker registry")
+        if db.execute("SELECT count(*) FROM principals WHERE name IS NOT NULL").fetchone()[0] > CAPACITY:
+            raise ValueError("malformed broker registry")
+    except (sqlite3.Error, ValueError):
+        db.close()
+        raise ValueError("incompatible broker registry")
+    return db
 
 
-def apply(policy_dir: Path, request) -> str:
-    op = request.get("op") if isinstance(request, dict) else None
-    if not isinstance(op, str) or op not in FIELDS or set(request) != {"op", *FIELDS[op]}:
-        return "invalid"
-    wolt, name = request.get("wolt", "a"), request.get("action", ACTION)
-    if not (isinstance(wolt, str) and NAME.fullmatch(wolt) and isinstance(name, str)):
-        return "invalid"
-    if name != ACTION:
-        return "unknown-action"
-    policy = load(policy_dir)
-    if op == "register":  # the synthetic secret is born here and never leaves the broker
-        _write(policy_dir / "action.key", secrets.token_hex(32).encode())
-        return "ok"
-    if op == "enroll" and wolt not in policy["wolts"] and len(policy["wolts"]) >= 64:
-        return "full"
-    if op == "enroll":
-        policy["wolts"] = sorted({*policy["wolts"], wolt})
-    elif wolt not in policy["wolts"]:
-        return "unknown-wolt"
-    elif op == "run":
-        return "ok" if wolt in policy["grants"] and load(policy_dir)["registered"] else "not-granted"
-    elif op == "grant" and not policy["registered"]:
-        return "not-registered"
+class Authz:
+    """In-memory snapshot for lookups. Narrowing applies before a change is durable, widening after."""
+
+    def __init__(self, db: sqlite3.Connection, policy_dir: Path):
+        self.lock, self.policy_dir, self.active = threading.Lock(), policy_dir, set()  # every start: none
+        self.names = dict(db.execute("SELECT name, id FROM principals WHERE name IS NOT NULL"))
+        self.stored = {(pid, f"{resource}.{operation}") for pid, resource, operation in db.execute(
+            "SELECT principal, resources.name, operation FROM grants JOIN resources ON resources.id = resource")}
+
+    def admit(self, wolt: str, name: str) -> str:
+        with self.lock:  # one decision point, ordered with narrowing
+            pid = self.names.get(wolt)
+            if pid is None:
+                return "unknown-wolt"
+            if (pid, name) not in self.active:  # a retained row alone confers no access
+                return "inactive" if (pid, name) in self.stored else "not-granted"
+        try:  # the dummy action runs outside the lock: it checks the custody and returns no secret
+            return "ok" if _key(self.policy_dir) else "not-registered"
+        except (OSError, ValueError):
+            return "storage-error"
+
+    def narrow(self, op: str, wolt: str, name: str) -> None:
+        with self.lock:
+            pid = self.names.pop(wolt, None) if op in {"rename", "retire"} else self.names.get(wolt)
+            for grants in (self.active, self.stored):
+                grants -= {g for g in grants if g[0] == pid and (op == "retire" or op == "revoke" and g[1] == name)}
+
+    def widen(self, names: dict, grant: tuple | None = None) -> None:
+        with self.lock:
+            self.names.update(names)
+            self.active |= {grant} if grant else set()
+
+
+class Writer:
+    """The one registry writer: bounded pending work, queued mutations grouped into one commit."""
+
+    def __init__(self, db: sqlite3.Connection, authz: Authz):
+        self.db, self.authz, self.queue = db, authz, queue.Queue(PENDING)
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def submit(self, work) -> dict:
+        """`work(db)` returns (reply, change applied to the snapshot after commit) in its own savepoint."""
+        slot = [threading.Event(), {"result": "storage-error"}]
+        try:
+            self.queue.put_nowait((work, slot))
+        except queue.Full:
+            return {"result": "busy"}
+        slot[0].wait()
+        return slot[1]
+
+    def commit(self) -> None:
+        self.db.execute("COMMIT")
+
+    def _loop(self) -> None:
+        while True:
+            batch = [self.queue.get()]
+            while len(batch) < GROUP and not self.queue.empty():
+                batch.append(self.queue.get_nowait())
+            results, changes = [], []
+            try:
+                self.db.execute("BEGIN IMMEDIATE")
+                for work, _ in batch:
+                    self.db.execute("SAVEPOINT one")
+                    try:
+                        result, change = work(self.db)
+                    except Exception:  # this mutation and its audit row go together or not at all
+                        self.db.execute("ROLLBACK TO one")
+                        result, change = {"result": "storage-error"}, None
+                    self.db.execute("RELEASE one")
+                    results.append(result)
+                    changes += [change] if change else []
+                self.commit()
+            except Exception:  # the writer outlives any failed batch
+                if self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
+                results, changes = [{"result": "storage-error"}] * len(batch), []  # early narrowing stays
+            for change in changes:  # in queue order; wider access is published only after the commit
+                change(self.authz)
+            for (_, slot), result in zip(batch, results):
+                slot[1] = result
+                slot[0].set()
+
+
+def audit(db, caller: str, op: str, principal, name: str, result: str, change=None) -> tuple:
+    db.execute("INSERT INTO audit (caller, op, principal, action, result) VALUES (?, ?, ?, ?, ?)",
+               (caller, op, principal, name, result))
+    return {"result": result}, change
+
+
+def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
+    """One policy mutation and its audit row, validated against the durable registry."""
+    row = db.execute("SELECT id FROM principals WHERE name = ?", (wolt,)).fetchone()
+    pid, change, label = row[0] if row else None, None, name if "action" in FIELDS[op] else "other"
+    resource = ACTIONS[name][:2]
+    rid = db.execute("SELECT id FROM resources WHERE type = ? AND name = ?", resource).fetchone()
+    if op == "enroll" and pid is None:
+        if db.execute("SELECT count(*) FROM principals WHERE name IS NOT NULL").fetchone()[0] >= CAPACITY:
+            return audit(db, "host-admin", op, None, label, "full")
+        pid = "p-" + secrets.token_hex(16)  # opaque, never derived from or reused for a name
+        db.execute("INSERT INTO principals (id, name) VALUES (?, ?)", (pid, wolt))
+        change = lambda authz: authz.widen({wolt: pid})
+    elif op == "register":
+        if rid is None:
+            db.execute("INSERT INTO resources VALUES (?, ?, ?)", ("r-" + secrets.token_hex(16), *resource))
+    elif op == "enroll":
+        pass
+    elif pid is None:
+        return audit(db, "host-admin", op, None, label, "unknown-wolt")
+    elif op == "rename":
+        if db.execute("SELECT 1 FROM principals WHERE name = ?", (to,)).fetchone():  # keep the old name
+            return audit(db, "host-admin", op, pid, label, "exists", lambda authz: authz.widen({wolt: pid}))
+        db.execute("UPDATE principals SET name = ? WHERE id = ?", (to, pid))
+        change = lambda authz: authz.widen({to: pid})
+    elif op == "retire":
+        db.execute("DELETE FROM grants WHERE principal = ?", (pid,))
+        db.execute("UPDATE principals SET name = NULL, retired = 1 WHERE id = ?", (pid,))
+    elif rid is None:
+        return audit(db, "host-admin", op, pid, label, "not-registered")
+    elif op == "grant":
+        db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?, ?)", (pid, rid[0], ACTIONS[name][2]))
+        change = lambda authz: authz.widen({}, (pid, name))
     else:
-        policy["grants"] = sorted({*policy["grants"], wolt} - ({wolt} if op == "revoke" else set()))
-    _write(policy_dir / "policy.json", json.dumps(
-        {"version": 1, "wolts": policy["wolts"], "grants": policy["grants"]}).encode())
-    return "ok"
+        db.execute("DELETE FROM grants WHERE principal = ? AND resource = ? AND operation = ?",
+                   (pid, rid[0], ACTIONS[name][2]))
+        change = lambda authz: authz.narrow(op, wolt, name)  # again, in order after any queued grant
+    reply, _ = audit(db, "host-admin", op, pid, label, "ok")
+    return ({**reply, "id": pid} if op == "enroll" else reply), change
 
 
-def answer(conn: socket.socket, policy_dir: Path) -> None:
-    _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-    caller, request, result = ("host-admin" if uid == ADMIN_UID else "worker"), None, "invalid"
-    try:
-        audit = _open(policy_dir / "audit.log", AUDIT)  # no request is served that cannot be audited
-    except (OSError, ValueError):
-        conn.sendall(b'{"result": "error"}\n')
-        return
-    conn.settimeout(2)
-    try:
-        raw = b""
-        while b"\n" not in raw and len(raw) <= MAX_REQUEST and (chunk := conn.recv(MAX_REQUEST + 1)):
-            raw += chunk
-        if len(raw) <= MAX_REQUEST and raw.endswith(b"\n") and raw.count(b"\n") == 1:  # one framed object
-            request = json.loads(raw, object_pairs_hook=_unique)
-        result = "denied" if caller != "host-admin" else apply(policy_dir, request) if request else result
-    except (ValueError, UnicodeDecodeError, TimeoutError):
-        pass  # a silent or slow caller is malformed too
-    except OSError:
-        result = "error"
-    op = request.get("op") if isinstance(request, dict) else None
-    op = op if isinstance(op, str) and op in FIELDS else "other"
-    name = ACTION if isinstance(request, dict) and request.get("action") == ACTION else "other"
-    line = json.dumps({"caller": caller, "op": op, "action": name, "result": result}) + "\n"
-    try:
-        os.write(audit, line.encode())  # caller category, op, action and result only
-    finally:
-        os.close(audit)
-    conn.sendall(json.dumps({"result": result}).encode() + b"\n")
+class Broker:
+    def __init__(self, policy_dir: Path):
+        self.policy_dir, db = policy_dir, open_registry(policy_dir)
+        self.authz = Authz(db, policy_dir)
+        self.writer = Writer(db, self.authz)
+
+    def apply(self, request) -> dict:
+        op = request.get("op") if isinstance(request, dict) else None
+        if not isinstance(op, str) or op not in FIELDS or set(request) != {"op", *FIELDS[op]}:
+            return {"result": "invalid"}
+        wolt, to, name = request.get("wolt", "a"), request.get("to", "a"), request.get("action", ACTION)
+        if not all(isinstance(v, str) and NAME.fullmatch(v) for v in (wolt, to)) or not isinstance(name, str):
+            return {"result": "invalid"}
+        if name not in ACTIONS:
+            return self.record("host-admin", op, "unknown-action")
+        if op == "run":
+            return self.record("host-admin", op, self.authz.admit(wolt, name), wolt)
+        if op in {"revoke", "retire", "rename"}:
+            self.authz.narrow(op, wolt, name)  # before it is durable or acknowledged
+        if op == "register":
+            try:
+                _write_key(self.policy_dir)
+            except OSError:
+                return self.record("host-admin", op, "storage-error")
+        return self.writer.submit(lambda db: mutate(db, op, wolt, name, to))
+
+    def record(self, caller: str, op: str, result: str, wolt: str | None = None) -> dict:
+        pid = self.authz.names.get(wolt) if wolt else None
+        name = ACTION if op in {"register", "grant", "revoke", "run"} and result != "unknown-action" else "other"
+        return self.writer.submit(lambda db: audit(db, caller, op, pid, name, result))  # none unaudited
+
+    def answer(self, conn: socket.socket) -> None:
+        _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        caller, request = ("host-admin" if uid == ADMIN_UID else "worker"), None
+        conn.settimeout(2)
+        try:
+            raw = b""
+            while b"\n" not in raw and len(raw) <= MAX_REQUEST and (chunk := conn.recv(MAX_REQUEST + 1)):
+                raw += chunk
+            if len(raw) <= MAX_REQUEST and raw.endswith(b"\n") and raw.count(b"\n") == 1:  # one framed object
+                request = json.loads(raw, object_pairs_hook=_unique)
+        except (ValueError, UnicodeDecodeError, TimeoutError):
+            pass  # a silent or slow caller is malformed too
+        op = request.get("op") if isinstance(request, dict) else None
+        op = op if isinstance(op, str) and op in FIELDS else "other"
+        if caller != "host-admin":
+            reply = self.record(caller, op, "denied")
+        else:
+            reply = self.apply(request)
+            if reply == {"result": "invalid"}:
+                reply = self.record(caller, op, "invalid")
+        conn.sendall(json.dumps(reply).encode() + b"\n")
+
+
+def _unique(pairs: list) -> dict:
+    if len({key for key, _ in pairs}) != len(pairs):
+        raise ValueError("duplicate request key")
+    return dict(pairs)
 
 
 def listen(path: Path = SOCKET) -> socket.socket:
@@ -173,8 +320,8 @@ def listen(path: Path = SOCKET) -> socket.socket:
 def admin(argv: list[str], path: Path = SOCKET) -> int:
     fields = FIELDS.get(argv[0], ()) if argv else ()
     if not fields or len(argv) != 1 + len(fields):
-        print("usage: woltspace secrets enroll WOLT | register ACTION | grant|revoke|run WOLT ACTION",
-              file=sys.stderr)
+        print("usage: woltspace secrets enroll|retire WOLT | rename WOLT NEW | register ACTION"
+              " | grant|revoke|run WOLT ACTION", file=sys.stderr)
         return 2
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
@@ -185,7 +332,7 @@ def admin(argv: list[str], path: Path = SOCKET) -> int:
     except (OSError, ValueError):
         reply = {"result": "unavailable"}
     print(json.dumps(reply))
-    return 0 if reply == {"result": "ok"} else 1
+    return 0 if isinstance(reply, dict) and reply.get("result") == "ok" else 1
 
 
 if __name__ == "__main__":
@@ -194,8 +341,7 @@ if __name__ == "__main__":
     store, policy_dir, path = map(Path, sys.argv[1:4])  # fixed by the root startup owner
     try:
         action(store)
-        load(policy_dir)
-        os.close(_open(policy_dir / "audit.log", AUDIT))
+        broker = Broker(policy_dir)
         server = listen(path)
         print(json.dumps({"result": "accepted"}), flush=True)
     except (OSError, ValueError):
@@ -204,6 +350,6 @@ if __name__ == "__main__":
         conn = server.accept()[0]
         with conn:
             try:
-                answer(conn, policy_dir)
+                broker.answer(conn)
             except OSError:
-                pass  # no reply when the audit cannot be written
+                pass

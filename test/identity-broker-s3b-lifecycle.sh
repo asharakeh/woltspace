@@ -267,6 +267,8 @@ for proc in proc_root.iterdir():
         status = read_status(proc)
     except (OSError, ValueError):
         continue
+    # tty_nr is field 7, after the parenthesized process name.
+    assert (proc / "stat").read_text().rsplit(") ", 1)[1].split()[4] == "0"
     workers.append(status)
 assert len(workers) == 2
 for status in workers:
@@ -278,6 +280,36 @@ for status in workers:
     parent = read_status(proc_root / status["PPid"].strip())
     assert parent["Uid"].split() == ["0"] * 4
     assert int(status["Seccomp_filters"]) > int(parent["Seccomp_filters"])
+PYTEST
+tmux_socket="/tmp/tmux-$node_uid/default"
+terminal has-session -t "=$a"
+docker exec -i --user 991:991 "$name" env -i PATH=/usr/bin:/bin \
+    "$venv_python" -I - "$tmux_socket" <<'PYTEST'
+import errno
+import os
+import socket
+import sys
+
+from woltspace.protected_launcher import deny_new_channels
+
+def refused(operation, expected):
+    try:
+        operation()
+    except OSError as exc:
+        assert exc.errno == expected
+    else:
+        raise AssertionError("unexpected channel access")
+
+assert os.getuid() == os.geteuid() == 991
+with socket.socket(socket.AF_UNIX) as existing:
+    existing.settimeout(2)
+    # A connect-only probe sends no tmux command and makes no terminal changes.
+    refused(lambda: existing.connect(sys.argv[1]), errno.EACCES)
+    deny_new_channels()
+    refused(lambda: existing.connect(sys.argv[1]), errno.EPERM)
+    for family in (socket.AF_UNIX, socket.AF_INET, socket.AF_INET6):
+        refused(lambda: socket.socket(family), errno.EPERM)
+    refused(socket.socketpair, errno.EPERM)
 PYTEST
 [[ $(count attach ok) == 3 ]]
 echo 'PASS lifecycle-start' >&3

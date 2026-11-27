@@ -8,6 +8,8 @@ one writer thread commits every mutation together with its audit row. Stored gra
 on every broker start until the owner grants them again, so restored or old media revives nothing.
 Intake stays the serial admin socket: the writer and the lookup are separate, not yet concurrent.
 """
+from collections import deque
+from concurrent.futures import Future
 import json
 import os
 import queue
@@ -19,11 +21,15 @@ import stat
 import struct
 import sys
 import threading
+import time
 from pathlib import Path
+from typing import NamedTuple
 
 POLICY_DIR = Path("/var/lib/woltspace-secrets")
 SOCKET = Path("/run/woltspace-broker/admin.sock")
 ACTION, ADMIN_UID, MAX_REQUEST, CAPACITY, PENDING, GROUP = "dummy.ping", 0, 512, 64, 16, 8
+WORKERS, WAITING, PER_WOLT, BINDINGS = 2, 6, 3, 128
+DUMMY_DELAY = 0.025
 ACTIONS = {ACTION: ("secret", "dummy", "ping")}  # allowlisted action -> (resource type, resource, operation)
 FIELDS = {"enroll": ("wolt",), "rename": ("wolt", "to"), "retire": ("wolt",), "register": ("action",),
           "grant": ("wolt", "action"), "revoke": ("wolt", "action"), "run": ("wolt", "action")}
@@ -137,6 +143,7 @@ class Authz:
 
     def __init__(self, db: sqlite3.Connection, policy_dir: Path):
         self.lock, self.policy_dir, self.active = threading.Lock(), policy_dir, set()  # every start: none
+        self.bindings = {}  # session -> current WorkerBinding; never persisted
         self.names = dict(db.execute("SELECT name, id FROM principals WHERE name IS NOT NULL"))
         self.stored = {(pid, f"{resource}.{operation}") for pid, resource, operation in db.execute(
             "SELECT principal, resources.name, operation FROM grants JOIN resources ON resources.id = resource")}
@@ -165,6 +172,7 @@ class Authz:
     def drop(self, op: str, pid: str, wolt: str | None = None, name: str | None = None) -> None:
         if op == "retire":
             self.names = {n: i for n, i in self.names.items() if i != pid}
+            self.bindings = {s: b for s, b in self.bindings.items() if b.principal != pid}
         elif op == "rename" and self.names.get(wolt) == pid:
             del self.names[wolt]
         for grants in (self.active, self.stored):
@@ -273,14 +281,128 @@ def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
     return ({**reply, "id": pid} if op == "enroll" else reply), change
 
 
+class WorkerBinding(NamedTuple):
+    principal: str
+    session: str
+    instance: str
+
+
+class Dispatcher:
+    """Trusted launcher interface. The transport must supply the binding for its channel."""
+
+    def __init__(self, authz: Authz, writer: Writer):
+        self.authz, self.writer = authz, writer
+        self.ready = threading.Condition(authz.lock)
+        self.waiting = {}  # one FIFO per principal, in ready-wolt rotation order
+        self.running = set()
+        self.started = False
+
+    def bind(self, principal: str, session: str) -> WorkerBinding | None:
+        """Called only by the trusted launcher, with the enrolled stable ID."""
+        with self.ready:
+            current = self.authz.bindings.get(session)
+            if principal not in self.authz.names.values():
+                return None
+            if current is None and len(self.authz.bindings) >= BINDINGS:
+                return None
+            if current is not None and current.principal != principal:
+                return None
+            binding = WorkerBinding(principal, session, secrets.token_hex(16))
+            self.authz.bindings[session] = binding
+            return binding
+
+    def end(self, binding: WorkerBinding) -> None:
+        with self.ready:
+            if self.authz.bindings.get(binding.session) == binding:
+                del self.authz.bindings[binding.session]
+
+    def submit(self, binding: WorkerBinding, name: str) -> Future:
+        future = Future()
+        future.set_running_or_notify_cancel()  # the adapter owns completion
+        with self.ready:
+            if self.authz.bindings.get(binding.session) != binding:
+                future.set_result("denied")
+            elif name != ACTION:
+                future.set_result("unknown-action")
+            elif (len(self.waiting.get(binding.principal, ())) >= PER_WOLT
+                  or sum(map(len, self.waiting.values())) >= WAITING):
+                future.set_result("busy")
+            else:
+                self.waiting.setdefault(binding.principal, deque()).append((binding, future))
+                if not self.started:
+                    self.started = True
+                    for _ in range(WORKERS):
+                        threading.Thread(target=self._work, daemon=True).start()
+                self.ready.notify()
+        return future
+
+    def _work(self) -> None:
+        while True:
+            with self.ready:
+                self.ready.wait_for(lambda: self.waiting.keys() - self.running)
+                principal = next(pid for pid in self.waiting if pid not in self.running)
+                queue_for_wolt = self.waiting.pop(principal)
+                binding, future = queue_for_wolt.popleft()
+                if queue_for_wolt:
+                    self.waiting[principal] = queue_for_wolt
+                self.running.add(principal)
+            try:
+                result = self._dispatch(binding)
+            finally:
+                with self.ready:
+                    self.running.remove(principal)
+                    self.ready.notify()
+            future.set_result(result)
+
+    def _dispatch(self, binding: WorkerBinding) -> str:
+        # At most two pool threads submit audit work. The serial owner route
+        # has writer capacity even if every dispatch queue is full.
+        def intent(db):
+            row = db.execute(
+                "INSERT INTO audit (caller, op, principal, action, result) VALUES (?, ?, ?, ?, ?)",
+                ("worker", "dispatch", binding.principal, ACTION, "pending"),
+            )
+            return {"result": "ok", "seq": row.lastrowid}, None
+
+        reply = self.writer.submit(intent)
+        if reply["result"] != "ok":
+            return reply["result"]
+        with self.ready:
+            admitted = (self.authz.bindings.get(binding.session) == binding
+                        and (binding.principal, ACTION) in self.authz.active)
+        result = self._dummy() if admitted else "denied"
+
+        def outcome(db):
+            db.execute("UPDATE audit SET result = ? WHERE seq = ?", (result, reply["seq"]))
+            return {"result": "ok"}, None
+
+        return result if self.writer.submit(outcome)["result"] == "ok" else "unknown"
+
+    def _dummy(self) -> str:
+        # One fixed adapter with a bounded delay. No caller-selected timeout,
+        # destination or input. Admission and storage locks are released here.
+        time.sleep(DUMMY_DELAY)
+        try:
+            _key(self.authz.policy_dir)
+        except (OSError, ValueError):
+            return "storage-error"
+        return "ok"
+
+
 class Broker:
     def __init__(self, policy_dir: Path):
         self.policy_dir, db = policy_dir, open_registry(policy_dir)
         if not (policy_dir / "action.key").exists() and not (policy_dir / "action.key").is_symlink():
             _write_key(policy_dir)
         _key(policy_dir)  # existing custody must be ours and well formed before readiness
+        try:
+            db.execute("UPDATE audit SET result = 'unknown' WHERE op = 'dispatch' AND result = 'pending'")
+        except sqlite3.Error as exc:
+            db.close()
+            raise ValueError("broker recovery failed") from exc
         self.authz = Authz(db, policy_dir)
         self.writer = Writer(db, self.authz)
+        self.dispatch = Dispatcher(self.authz, self.writer)
 
     def apply(self, request) -> dict:
         op = request.get("op") if isinstance(request, dict) else None
@@ -298,7 +420,8 @@ class Broker:
         return self.writer.submit(lambda db: mutate(db, op, wolt, name, to))
 
     def record(self, caller: str, op: str, result: str, wolt: str | None = None) -> dict:
-        pid = self.authz.names.get(wolt) if wolt else None
+        with self.authz.lock:
+            pid = self.authz.names.get(wolt) if wolt else None
         name = ACTION if op in {"register", "grant", "revoke", "run"} and result != "unknown-action" else "other"
         return self.writer.submit(lambda db: audit(db, caller, op, pid, name, result))  # none unaudited
 

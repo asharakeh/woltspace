@@ -397,3 +397,160 @@ def test_unsafe_custody_fails_the_action_closed(store, owner):
     assert [op(b, "enroll", "wolt-a"), op(b, "register"), op(b, "grant", "wolt-a")] == ["ok"] * 3
     (store / "action.key").chmod(0o644)
     assert op(b, "run", "wolt-a") == "storage-error" and op(b, "run", "wolt-b") == "unknown-wolt"
+
+
+def enrolled(b, name):
+    return ask(b, {"op": "enroll", "wolt": name})["id"]
+
+
+def test_dispatch_binding_instance_and_stable_id_are_checked_separately(store, owner):
+    b = broker.Broker(store)
+    alpha, beta = enrolled(b, "alpha"), enrolled(b, "beta")
+    assert op(b, "register") == "ok" and op(b, "grant", "alpha") == "ok"
+    old = b.dispatch.bind(alpha, "conversation-a")
+    other = b.dispatch.bind(beta, "conversation-b")
+    assert b.dispatch.bind(beta, "conversation-a") is None
+    assert b.dispatch.submit(old._replace(principal=beta), A).result(5) == "denied"
+    assert b.dispatch.submit(old._replace(instance=other.instance), A).result(5) == "denied"
+    assert b.dispatch.submit(other, A).result(5) == "denied"
+    assert b.dispatch.submit(old, "other.send").result(5) == "unknown-action"
+    assert b.dispatch.submit(old, A).result(5) == "ok"
+    current = b.dispatch.bind(alpha, old.session)
+    assert current.instance != old.instance and current.principal == old.principal
+    assert b.dispatch.submit(old, A).result(5) == "denied"
+    b.dispatch.end(old)  # an old transport closing must not end the replacement
+    assert op(b, "rename", "alpha", to="new-alpha") == "ok"
+    assert b.dispatch.submit(current, A).result(5) == "ok"
+    b.dispatch.end(current)
+    assert b.dispatch.submit(current, A).result(5) == "denied"
+
+
+def test_dispatch_limits_fairness_and_revoke_under_load(store, owner, monkeypatch, record_property):
+    b = broker.Broker(store)
+    assert op(b, "register") == "ok"
+    alpha, beta, gamma = [enrolled(b, name) for name in ("alpha", "beta", "gamma")]
+    for name in ("alpha", "beta", "gamma"):
+        assert op(b, "grant", name) == "ok"
+    sessions = [b.dispatch.bind(alpha, f"a-{i}") for i in range(5)]
+    other = [b.dispatch.bind(beta, f"b-{i}") for i in range(5)]
+    third = b.dispatch.bind(gamma, "c")
+    entered = [threading.Event(), threading.Event()]
+    release = [threading.Event(), threading.Event()]
+    ticks, calls = [], []
+    adapter = b.dispatch._dummy
+
+    def delayed():
+        index = len(calls)
+        calls.append(time.perf_counter())
+        if index < len(entered):
+            entered[index].set()
+            assert release[index].wait(5)
+        return adapter()
+
+    monkeypatch.setattr(b.dispatch, "_dummy", delayed)
+
+    def submit(binding):
+        start = time.perf_counter()
+        future = b.dispatch.submit(binding, A)
+        future.add_done_callback(lambda _: ticks.append(time.perf_counter() - start))
+        return future
+
+    start = time.perf_counter()
+    try:
+        first = submit(sessions[0])
+        assert entered[0].wait(5)
+        pending = [submit(binding) for binding in sessions[1:4]]
+        assert submit(sessions[4]).result(5) == "busy"  # per stable ID across sessions
+        second = submit(other[0])
+        assert entered[1].wait(5)  # another principal gains the remaining worker
+        beta_wait = [submit(binding) for binding in other[1:4]]
+        assert submit(third).result(5) == "busy"  # global waiting cap with both slots held
+        assert len(calls) == 2
+        revoke_start = time.perf_counter()
+        assert op(b, "revoke", "alpha") == "ok"
+        revoke_latency = time.perf_counter() - revoke_start
+        assert len(calls) == 2 and not first.done() and not second.done()
+        release[0].set()
+        assert first.result(5) == "ok"  # admitted before revoke
+        assert [future.result(5) for future in pending] == ["denied"] * 3
+        assert submit(third).result(5) == "ok"  # progresses while beta remains held
+        assert len(calls) == 3
+        release[1].set()
+        assert second.result(5) == "ok"
+        assert [future.result(5) for future in beta_wait] == ["ok"] * 3
+    finally:
+        for event in release:
+            event.set()
+    elapsed = time.perf_counter() - start
+    assert rows(store, "SELECT result, count(*) FROM audit WHERE op = 'dispatch' GROUP BY result") == [
+        ("denied", 3), ("ok", 6)]
+    until(lambda: len(ticks) == 11)
+    assert len(calls) == 6
+    latency = sorted(ticks)
+    for label, index in (("p50_ms", 5), ("p95_ms", 10), ("p99_ms", 10)):
+        record_property(label, round(latency[index] * 1000, 3))
+    record_property("workload", "11 submissions: 6 ok, 3 denied, 2 busy; fixed 25 ms plus controlled holds")
+    record_property("requests_per_second", round(11 / elapsed, 2))
+    record_property("revoke_ms", round(revoke_latency * 1000, 3))
+
+
+@pytest.mark.parametrize("change", ["revoke", "replace", "end"])
+def test_dispatch_checks_current_authority_after_intent_commit(store, owner, monkeypatch, change):
+    b = broker.Broker(store)
+    principal = enrolled(b, "alpha")
+    assert op(b, "register") == "ok" and op(b, "grant", "alpha") == "ok"
+    binding = b.dispatch.bind(principal, "a")
+    pending, resume = threading.Event(), threading.Event()
+    real = b.writer.submit
+
+    def pause_after_commit(work):
+        result = real(work)
+        if "seq" in result:
+            pending.set()
+            assert resume.wait(5)
+        return result
+
+    monkeypatch.setattr(b.writer, "submit", pause_after_commit)
+    future = b.dispatch.submit(binding, A)
+    try:
+        assert pending.wait(5)
+        assert rows(store, "SELECT result FROM audit WHERE op = 'dispatch'") == [("pending",)]
+        if change == "revoke":
+            assert op(b, "revoke", "alpha") == "ok"
+        elif change == "replace":
+            assert b.dispatch.bind(principal, "a") != binding
+        else:
+            b.dispatch.end(binding)
+    finally:
+        resume.set()
+    assert future.result(5) == "denied"
+    assert rows(store, "SELECT result FROM audit WHERE op = 'dispatch'") == [("denied",)]
+
+
+def test_dispatch_crash_leaves_unknown_with_no_replay(store, owner):
+    child = subprocess.run([sys.executable, "-I", "-S", "-c", """
+import os, runpy, sys
+from pathlib import Path
+scope = runpy.run_path(sys.argv[1])
+b = scope["Broker"](Path(sys.argv[2]))
+principal = b.apply({"op": "enroll", "wolt": "alpha"})["id"]
+assert b.apply({"op": "register", "action": "dummy.ping"}) == {"result": "ok"}
+assert b.apply({"op": "grant", "wolt": "alpha", "action": "dummy.ping"}) == {"result": "ok"}
+binding = b.dispatch.bind(principal, "a")
+print(binding.instance, flush=True)
+b.dispatch._dummy = lambda: os._exit(23)
+b.dispatch.submit(binding, "dummy.ping").result(5)
+""", broker.__file__, str(store)], capture_output=True, text=True, timeout=15)
+    assert child.returncode == 23
+    assert rows(store, "SELECT result FROM audit WHERE op = 'dispatch'") == [("pending",)]
+    b = broker.Broker(store)
+    principal = enrolled(b, "alpha")
+    stale = broker.WorkerBinding(principal, "a", child.stdout.strip())
+    assert b.dispatch.submit(stale, A).result(5) == "denied"
+    current = b.dispatch.bind(principal, "a")
+    assert current.instance != stale.instance
+    assert b.dispatch.submit(current, A).result(5) == "denied"  # restored grant inactive
+    assert op(b, "grant", "alpha") == "ok"
+    assert b.dispatch.submit(current, A).result(5) == "ok"
+    assert rows(store, "SELECT result FROM audit WHERE op = 'dispatch' ORDER BY seq") == [
+        ("unknown",), ("denied",), ("ok",)]

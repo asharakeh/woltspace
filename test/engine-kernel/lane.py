@@ -2,6 +2,7 @@
 
 drive <fixture> <state> <lane>: stdio protocol prepared/go, then step zero's verbs.
 stop <state> <lane>: forced stop of that lane's whole launcher tree.
+census <state>: live recorded members (pid + start time) per lane.
 """
 import ctypes
 import errno
@@ -24,53 +25,89 @@ PROBE = {"sibling_state": "EACCES", "control_state": "EACCES", "lodge_file": "EA
          "signal_launcher": "EPERM", "sibling_proc": "EACCES"}
 
 
+def ident(pid):
+    """(ppid, start time) of a live, non-zombie pid, else None."""
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            fields = stat.read().rsplit(")", 1)[1].split()
+    except OSError:
+        return None
+    return None if fields[0] == "Z" else (int(fields[1]), fields[19])
+
+
+def born(pid):
+    return (ident(pid) or (0, None))[1]
+
+
 def tree(root):
-    """Live (non-zombie) descendants of root, by a full /proc parent walk."""
-    parents = {}
-    for entry in filter(str.isdigit, os.listdir("/proc")):
-        try:
-            with open(f"/proc/{entry}/stat") as stat:
-                fields = stat.read().rsplit(")", 1)[1].split()
-        except OSError:
-            continue
-        parents[int(entry)] = (int(fields[1]), fields[0], fields[19])
-    found, frontier = set(), {root}
+    """{pid: start} of live descendants of root, by a full /proc parent walk."""
+    rows = {int(entry): row for entry in filter(str.isdigit, os.listdir("/proc")) if (row := ident(entry))}
+    found, frontier = {}, {root}
     while frontier:
-        frontier = {pid for pid, row in parents.items() if row[0] in frontier} - found
-        found |= frontier
-    return {pid for pid in found if parents[pid][1] != "Z"}, parents
+        frontier = {pid for pid, (ppid, _) in rows.items() if ppid in frontier and pid not in found}
+        found.update({pid: rows[pid][1] for pid in frontier})
+    return found
 
 
-def kill_tree(launcher, window=0.0):
-    """TERM, observe for `window`, then KILL every descendant, then the launcher."""
-    first, _ = tree(launcher)
-    for pid in first:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+def owned_signal(pid, start, sig):
+    """Signal only through a pidfd whose process still has the recorded start time."""
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return False
+    try:
+        if start is None or born(pid) != start:
+            return False
+        signal.pidfd_send_signal(fd, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def kill_tree(launcher, start, window=0.0, members=()):
+    """TERM the tree, observe for `window`, KILL it and live recorded members, then the launcher."""
+    if born(launcher) != start:
+        return {}, {}  # stale record: nothing is signalled
+    first = tree(launcher)
+    for pid, when in first.items():
+        owned_signal(pid, when, signal.SIGTERM)
     time.sleep(window)
-    survivors, _ = tree(launcher)
+    survivors = tree(launcher)
     deadline = time.monotonic() + 10
-    while (left := tree(launcher)[0]):
+    while (left := {**tree(launcher), **{pid: when for pid, when in members if born(pid) == when}}):
         assert time.monotonic() < deadline, "descendants survived SIGKILL"
-        for pid in left:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        for pid, when in left.items():
+            owned_signal(pid, when, signal.SIGKILL)
         time.sleep(.02)
-    os.kill(launcher, signal.SIGKILL)
+    owned_signal(launcher, start, signal.SIGKILL)
     return first, survivors
 
 
+def reclaim(record):
+    """Recovery from a lane record alone: identity-checked, never a bare pid."""
+    if record.get("start"):
+        kill_tree(record["launcher"], record["start"], members=record["members"])
+    for pid, when in record.get("members", []):
+        owned_signal(pid, when, signal.SIGKILL)
+
+
+def census(state):
+    counts = []
+    for lane in "ab":
+        record = json.loads((state / "ctl" / f"{lane}.json").read_text())
+        owned = [[record.get("launcher"), record.get("start")], *record.get("members", [])]
+        counts.append(f"{lane}={sum(when is not None and born(pid) == when for pid, when in owned)}")
+    print("census", *counts, flush=True)
+
+
 def stop(state, lane):
-    info = json.loads((state / "ctl" / f"{lane}.json").read_text())
-    _, parents = tree(info["launcher"])
-    assert parents.get(info["launcher"], (0, "", ""))[2] == info["start"], "launcher identity"
-    first, survivors = kill_tree(info["launcher"], window=1.0)
+    record = json.loads((state / "ctl" / f"{lane}.json").read_text())
+    assert born(record["launcher"]) == record["start"], "stale launcher record"
+    first, survivors = kill_tree(record["launcher"], record["start"], 1.0, record["members"])
     deadline = time.monotonic() + 10
-    while info["launcher"] in (live := tree(1)[1]) and live[info["launcher"]][1] != "Z":
+    while born(record["launcher"]) == record["start"]:
         assert time.monotonic() < deadline, "launcher survived"
         time.sleep(.02)
     print(f"stopped tree={len(first)} term_survivors={len(survivors)}", flush=True)
@@ -91,6 +128,7 @@ def spawn(argv, env, stdin, stdout, own, port, reads, keep=()):
             os.execve(argv[0], argv, env)
         finally:
             os._exit(127)
+    return pid
 
 
 def drive(fixture, state, lane):
@@ -127,23 +165,28 @@ def drive(fixture, state, lane):
     assert sys.stdin.readline() == "go\n", "go"
     sibling = json.loads((state / "ctl" / f"{other}.json").read_text())
     engine_in, engine_out, probe_out = os.pipe(), os.pipe(), os.pipe()
+    gate, report = os.pipe(), os.pipe()
     channel, inherited = socket.socketpair()
     token = secrets.token_hex(8)
     python = os.path.realpath(sys.executable)
     launcher = os.fork()
     if launcher == 0:
         try:
+            os.close(gate[1])
+            if os.read(gate[0], 1) != b"1":
+                os._exit(0)  # released only after the driver published this launcher
             os.setsid()
             assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
-            spawn([str(fixture / "codex"), "app-server", "--listen", "stdio://"], env,
-                  engine_in[0], engine_out[1], own, port, [fixture])
-            spawn([python, "-I", str(fixture / "probe.py"), str(own), str(state / other),
-                   str(state / "ctl"), str(state / "lodge" / "secret"), str(port),
-                   str(sibling["port"]), str(decoy.getsockname()[1]), str(sibling["pid"]),
-                   str(inherited.fileno()), token], {"PATH": "/usr/bin:/bin"},
-                  os.open("/dev/null", os.O_RDONLY), probe_out[1], own, port, [fixture],
-                  keep=[inherited.fileno()])
-            for fd in (*engine_in, *engine_out, *probe_out):
+            engine = spawn([str(fixture / "codex"), "app-server", "--listen", "stdio://"], env,
+                           engine_in[0], engine_out[1], own, port, [fixture])
+            probe = spawn([python, "-I", str(fixture / "probe.py"), str(own), str(state / other),
+                           str(state / "ctl"), str(state / "lodge" / "secret"), str(port),
+                           str(sibling["port"]), str(decoy.getsockname()[1]), str(sibling["pid"]),
+                           str(inherited.fileno()), token], {"PATH": "/usr/bin:/bin"},
+                          os.open("/dev/null", os.O_RDONLY), probe_out[1], own, port, [fixture],
+                          keep=[inherited.fileno()])
+            os.write(report[1], f"{engine} {probe}".encode())
+            for fd in (*engine_in, *engine_out, *probe_out, *report, gate[0]):
                 os.close(fd)
             while True:
                 try:
@@ -152,18 +195,26 @@ def drive(fixture, state, lane):
                     time.sleep(.05)
         finally:
             os._exit(0)
-    for fd in (engine_in[0], engine_out[1], probe_out[1]):
-        os.close(fd)
-    inherited.close()
-    with open(f"/proc/{launcher}/stat") as stat:
-        start = stat.read().rsplit(")", 1)[1].split()[19]
-    control.write_text(json.dumps({"port": port, "pid": os.getpid(), "launcher": launcher, "start": start}))
+    record = {"port": port, "pid": os.getpid(), "launcher": launcher, "start": None, "members": []}
     serving = None
     try:
+        for fd in (engine_in[0], engine_out[1], probe_out[1], gate[0], report[1]):
+            os.close(fd)
+        inherited.close()
+        record["start"] = born(launcher)
+        control.write_text(json.dumps(record))  # published while the launcher is still gated
+        os.write(gate[1], b"1")
+        assert select.select([report[0]], [], [], 10)[0], "launch report"
+        record["members"] = [[int(pid), born(int(pid))] for pid in os.read(report[0], 64).split()]
+        control.write_text(json.dumps(record))
         channel.sendall(token.encode())
         assert select.select([probe_out[0]], [], [], 20)[0], "probe deadline"
         with os.fdopen(probe_out[0]) as stream:
             result = json.loads(stream.readline())
+        descendant = [result["descendant_pid"], result["descendant_start"]]
+        assert born(descendant[0]) == descendant[1], "descendant identity"
+        record["members"].append(descendant)
+        control.write_text(json.dumps(record))
         mismatch = sorted(key for key, value in PROBE.items()
                           if result.get(key) != value or result["descendant"].get(key) != value)
         own_ok = all(result[key] == "ok" for key in ("own_state", "own_tcp", "inherited_channel"))
@@ -176,8 +227,8 @@ def drive(fixture, state, lane):
         assert not list(own.rglob("auth.json")), "unexpected auth state"
         saved.write_text(thread + "\n")
     finally:
-        if tree(launcher)[1].get(launcher, (0, "Z"))[1] != "Z":
-            kill_tree(launcher)
+        reclaim(record)
+        os.kill(launcher, signal.SIGKILL)  # own unreaped child: its pid cannot be reused yet
         os.waitpid(launcher, 0)
         if serving is not None:
             server.shutdown()
@@ -188,5 +239,7 @@ def drive(fixture, state, lane):
 if __name__ == "__main__":
     if sys.argv[1] == "stop":
         stop(Path(sys.argv[2]), sys.argv[3])
+    elif sys.argv[1] == "census":
+        census(Path(sys.argv[2]))
     else:
         drive(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4])

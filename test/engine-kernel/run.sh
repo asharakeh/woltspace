@@ -11,7 +11,10 @@ cleanup() {
     local status=$? failed=0
     trap - EXIT
     trap '' INT TERM
-    if (( owned )) && docker image inspect "$image"; then docker image rm "$image" || failed=1; fi
+    if (( owned )) && docker image inspect "$image"; then
+        docker image rm "$image" || failed=1
+        if docker image inspect "$image"; then failed=1; fi  # read back: the owned tag is gone
+    fi
     if [[ -n $root ]] && { ! rm -rf -- "$root" || [[ -e $root ]]; }; then failed=1; fi
     if (( failed )); then
         printf '::error::broker-smoke phase=cleanup line=%s\n' "$LINENO" >&3

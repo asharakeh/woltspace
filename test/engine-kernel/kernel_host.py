@@ -34,17 +34,12 @@ class Lanes:
         self.workers.append(worker)
         return worker
 
-    def count(self, text):
-        command = [*self.prefix, "/bin/sh", "-c", "for f in /proc/[0-9]*/cmdline; do "
-                   "tr '\\0' ' ' < $f 2>/dev/null; echo; done"]
-        lines = subprocess.run(command, stdout=subprocess.PIPE, text=True, check=True, timeout=30).stdout
-        return sum(text in line for line in lines.splitlines())
-
-    def engines(self):
-        return self.count(f"{self.fixture}/codex app-server")
-
-    def probes(self, lane=""):
-        return self.count(f"{self.fixture}/probe.py {self.state}/{lane}")
+    def census(self):
+        """Live fixture-recorded members (pid + start time) per lane; no command-line matching."""
+        out = subprocess.run(self.lane("census", self.state), stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, check=True, timeout=30).stdout.split()
+        assert out[0] == "census"
+        return dict(field.split("=") for field in out[1:])
 
 
 def boot(lanes, names):
@@ -78,7 +73,7 @@ def lifecycle(lanes):
     zero.expect(left, "complete")
     zero.expect(right, "complete")
     original, sibling = (a_state / "thread").read_text(), (b_state / "thread").read_text()
-    assert original != sibling and lanes.engines() == 2
+    assert original != sibling and lanes.census() == {"a": "3", "b": "3"}  # launcher, engine, descendant
     zero.tell(left, "reuse")
     zero.expect(left, "complete")
     assert (a_state / "thread").read_text() == original
@@ -89,9 +84,9 @@ def lifecycle(lanes):
                              stderr=subprocess.DEVNULL, text=True, check=True, timeout=30).stdout.split()
     counts = dict(field.split("=") for field in stopped[1:])
     assert stopped[0] == "stopped" and int(counts["tree"]) >= 2 and int(counts["term_survivors"]) >= 1
+    assert lanes.census() == {"a": "0", "b": "3"}  # TERM-ignoring descendant gone, sibling whole
     left.stdin.close()  # the trusted driver outlives its engine; end it
-    assert left.wait(timeout=10) == 1 and lanes.engines() == 1
-    assert lanes.probes("a") == 0 and lanes.probes("b") == 1  # TERM-ignoring descendant gone
+    assert left.wait(timeout=10) == 1
     zero.tell(right, "survive")
     zero.expect(right, "complete")
     assert (b_state / "thread").read_text() == sibling
@@ -105,7 +100,7 @@ def lifecycle(lanes):
     for worker in (resumed, right):
         zero.tell(worker, "exit")
         assert worker.wait(timeout=15) == 0
-    assert lanes.engines() == 0 and lanes.probes() == 0
+    assert lanes.census() == {"a": "0", "b": "0"}
     print("PASS lifecycle-resume", flush=True)
 
 

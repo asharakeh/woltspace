@@ -64,6 +64,8 @@ def main(own, sibling, control, lodge, port, sibling_port, decoy, sibling_pid, c
         finally:
             os._exit(1)
     os.close(write)
+    with open(f"/proc/{child}/stat") as stat:
+        result["descendant_pid"], result["descendant_start"] = child, stat.read().rsplit(")", 1)[1].split()[19]
     with os.fdopen(read) as stream:
         result["descendant"] = json.loads(stream.read())
     print(json.dumps(result), flush=True)

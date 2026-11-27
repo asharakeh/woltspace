@@ -1,0 +1,19 @@
+name: Stock engine step zero
+
+on:
+  push:
+    branches: [test/identity-broker-engine-step-zero]
+
+permissions:
+  contents: read
+
+jobs:
+  engine-step-zero:
+    if: github.event.repository.fork == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: env -i PATH=/usr/local/bin:/usr/bin:/bin bash test/engine-step-zero/run.sh

@@ -425,6 +425,10 @@ def open_tmux_window(wolt_name: str, wolt_dir: Path, wolts_dir: Path) -> None:
     )
     subprocess.run(["tmux", "set", "-g", "mouse", "on"], check=True)
 
+    if wolt_name and os.environ.get("WOLTSPACE_FEATURE_ISOLATION") == "true":
+        print("automatic wolt launch refused: protected session launch required")
+        return
+
     runtime_lib_on_path(resolve_install_root(os.environ.get("WOLTSPACE_DIR")))
     from harnesses import build_command, platform_skill_invoke
 

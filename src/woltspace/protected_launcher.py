@@ -51,7 +51,6 @@ def deny_new_channels():
         lib.seccomp_release(context)
 
 
-
 def redeem(raw):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(5)
@@ -64,7 +63,12 @@ def redeem(raw):
             if (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS):
                 fds.frombytes(data)
         try:
-            if (flags & socket.MSG_CTRUNC or len(fds) != 1
+            while reply and not reply.endswith(b"\n") and len(reply) < 512:
+                chunk = client.recv(512 - len(reply))
+                if not chunk:
+                    break
+                reply += chunk
+            if (flags & socket.MSG_CTRUNC or len(fds) != 1 or not reply.endswith(b"\n")
                     or json.loads(reply) != {"result": "ok"}):
                 raise ValueError("protected launch refused")
             return fds.pop()
@@ -176,14 +180,22 @@ def bridge(session, attempt):
                 return 1
             sys.stdout.buffer.write(READY)
             sys.stdout.buffer.flush()
+            pending = b""
             while True:
                 ready, _, _ = select.select([fd, conn], [], [])
                 if conn in ready:
                     chunk = conn.recv(4096)
                     if not chunk:
                         return 0
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.buffer.flush()
+                    pending += chunk
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        if line not in (b"dummy ok", b"dummy refused"):
+                            return 1
+                        sys.stdout.buffer.write(line + b"\n")
+                        sys.stdout.buffer.flush()
+                    if len(pending) > len(b"dummy refused"):
+                        return 1
                 if fd in ready:
                     chunk = os.read(fd, 4096)
                     if not chunk:

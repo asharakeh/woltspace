@@ -135,7 +135,7 @@ def test_incompatible_or_damaged_volume_fails_closed_untouched(store, owner, dam
         (store / "action.key").write_text("0" * 64)
     elif damage in {"foreign-db", "schema-drift", "version", "over-capacity"}:
         with sqlite3.connect(db) as conn:  # same table names and version still differ from the contract
-            conn.executescript({"foreign-db": "CREATE TABLE notes (x)", "version": "PRAGMA user_version = 3",
+            conn.executescript({"foreign-db": "CREATE TABLE notes (x)", "version": "PRAGMA user_version = 4",
                 "schema-drift": "DROP TABLE audit; CREATE TABLE audit (seq INTEGER PRIMARY KEY, caller, op,"
                                 " principal, action, result, body)",
                 "over-capacity": "INSERT INTO principals (id, name) SELECT 'p-' || value, 'w' || value"

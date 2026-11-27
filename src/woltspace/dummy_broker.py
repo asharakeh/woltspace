@@ -51,7 +51,7 @@ OWNER = {"review": ("code",), "approve": ("code", "terms"), "reconcile": ("code"
 TERMS = ("name", "type", "harness", "model", "display", "policy", "role", "description")
 CHECKS = {"request": re.compile(r"[0-9a-f]{32}"), "code": re.compile(r"c-[0-9a-f]{8}"),
           "stage": re.compile(r"scaffolding|scaffolded|ambiguous|launching|launched|launch-failed"),
-          "terms": re.compile(r"[0-9a-f]{12}")}
+          "terms": re.compile(r"[0-9a-f]{12}"), "session": SESSION}
 # Each step is claimed once ("-ing"), so concurrent retries never scaffold or launch twice. A claim left
 # by a crash is uncertain: only the owner's reconcile clears it, so a first launch is never silently repeated.
 REPORTS = {"scaffolding": {"approved"}, "scaffolded": {"scaffolding"}, "ambiguous": {"approved", "scaffolding"},
@@ -69,7 +69,10 @@ CREATE TABLE audit (seq INTEGER PRIMARY KEY, caller TEXT NOT NULL, op TEXT NOT N
 CREATES = """CREATE TABLE creates (request TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
                       terms TEXT NOT NULL, status TEXT NOT NULL, principal TEXT REFERENCES principals);
 """
-SCHEMA = f"{TABLES}{CREATES}PRAGMA user_version = 2;\n"
+# v3: the exact first session a successful create launched, recorded with its "launched" transition. The column
+# is added the same way on a fresh and on a migrated volume, so their schemas compare equal.
+SESSION_COLUMN = "ALTER TABLE creates ADD COLUMN session TEXT;"
+SCHEMA = f"{TABLES}{CREATES}{SESSION_COLUMN}PRAGMA user_version = 3;\n"
 
 
 def action(store: Path) -> dict:
@@ -147,8 +150,10 @@ def open_registry(policy_dir: Path) -> sqlite3.Connection:
             db.execute("PRAGMA journal_mode = DELETE")
             db.executescript(f"BEGIN IMMEDIATE; {SCHEMA} COMMIT;")  # first start, or one cut short
         if db.execute("PRAGMA user_version").fetchone()[0] == 1 and contract(db) == contract(EXPECTED_V1):
-            db.executescript(f"BEGIN IMMEDIATE; {CREATES} PRAGMA user_version = 2; COMMIT;")  # an exact stage 1/2 volume
-        if db.execute("PRAGMA user_version").fetchone()[0] != 2 or contract(db) != contract(EXPECTED):
+            db.executescript(f"BEGIN IMMEDIATE; {CREATES} {SESSION_COLUMN} PRAGMA user_version = 3; COMMIT;")
+        if db.execute("PRAGMA user_version").fetchone()[0] == 2 and contract(db) == contract(EXPECTED_V2):
+            db.executescript(f"BEGIN IMMEDIATE; {SESSION_COLUMN} PRAGMA user_version = 3; COMMIT;")  # rows kept
+        if db.execute("PRAGMA user_version").fetchone()[0] != 3 or contract(db) != contract(EXPECTED):
             raise ValueError("incompatible broker registry")
         if db.execute("SELECT count(*) FROM principals WHERE name IS NOT NULL").fetchone()[0] > CAPACITY:
             raise ValueError("malformed broker registry")
@@ -162,9 +167,10 @@ def contract(db: sqlite3.Connection) -> list:
     return db.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name").fetchall()
 
 
-EXPECTED, EXPECTED_V1 = (sqlite3.connect(":memory:", check_same_thread=False) for _ in range(2))
+EXPECTED, EXPECTED_V1, EXPECTED_V2 = (sqlite3.connect(":memory:", check_same_thread=False) for _ in range(3))
 EXPECTED.executescript(SCHEMA)
 EXPECTED_V1.executescript(TABLES)
+EXPECTED_V2.executescript(f"{TABLES}{CREATES}")
 
 
 class Authz:
@@ -317,11 +323,12 @@ def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
 def lifecycle(db, caller: str, request: dict, denials=None) -> tuple:
     """Create reservation states: pending -> approved (one stable ID) -> scaffolded -> launched or launch-failed."""
     op, column = request["op"], "request" if "request" in request else "code"
-    row = db.execute(f"SELECT request, code, terms, status, principal FROM creates WHERE {column} = ?",
+    row = db.execute(f"SELECT request, code, terms, status, principal, session FROM creates WHERE {column} = ?",
                      (request[column],)).fetchone()
 
     def done(result, row=row, change=None, **extra):
-        state = {"status": row[3], "code": row[1], **({"id": row[4]} if row[4] else {})} if row else {}
+        state = {"status": row[3], "code": row[1], **({"id": row[4]} if row[4] else {}),
+                 **({"first_session": row[5]} if row[5] else {})} if row else {}
         logged = denials.admit(caller, op, result) if denials else result  # refusals stay bounded
         if logged is None:
             return {"result": result}, None
@@ -336,8 +343,9 @@ def lifecycle(db, caller: str, request: dict, denials=None) -> tuple:
         if db.execute("SELECT 1 FROM principals WHERE name = ? UNION SELECT 1 FROM creates WHERE name = ?"
                       " AND status = 'pending'", (name, name)).fetchone():
             return done("name-held")
-        row = (request["request"], "c-" + secrets.token_hex(4), terms, "pending", None)
-        db.execute("INSERT INTO creates VALUES (?, ?, ?, ?, ?, ?)", (*row[:2], name, *row[2:]))
+        row = (request["request"], "c-" + secrets.token_hex(4), terms, "pending", None, None)
+        db.execute("INSERT INTO creates (request, code, name, terms, status, principal) VALUES (?, ?, ?, ?, ?, ?)",
+                   (*row[:2], name, *row[2:5]))
         return done("ok", row)
     if row is None:
         return done("unknown-request")
@@ -354,15 +362,18 @@ def lifecycle(db, caller: str, request: dict, denials=None) -> tuple:
         pid = "p-" + secrets.token_hex(16)  # persisted once, before any scaffold
         db.execute("INSERT INTO principals (id, name) VALUES (?, ?)", (pid, name))
         db.execute("UPDATE creates SET status = 'approved', principal = ? WHERE request = ?", (pid, row[0]))
-        return done("ok", (*row[:3], "approved", pid), lambda authz: authz.widen({name: pid}))
+        return done("ok", (*row[:3], "approved", pid, None), lambda authz: authz.widen({name: pid}))
     if op in {"create-status", "approve"}:  # an approve replay reports the recorded state
         return done("ok")
     target, allowed = {"reconcile": (RECONCILE.get(row[3]), set(RECONCILE)), "reject": ("rejected", {"pending"})}.get(
         op) or (request["stage"], REPORTS[request["stage"]])  # a rejected request frees its name
     if row[3] not in allowed:
         return done("refused")
-    db.execute("UPDATE creates SET status = ? WHERE request = ?", (target, row[0]))
-    return done("ok", (*row[:3], target, row[4]))
+    session = request.get("session") if target == "launched" else row[5]
+    if target == "launched" and not session:
+        return done("refused")  # a successful first launch is recorded with its exact session
+    db.execute("UPDATE creates SET status = ?, session = ? WHERE request = ?", (target, session, row[0]))
+    return done("ok", (*row[:3], target, row[4], session))
 
 
 def call(request: dict, path: Path | None = None) -> dict:
@@ -865,6 +876,8 @@ class Broker:
                     and bool(NAME.fullmatch(value["name"]) and NAME.fullmatch(value["type"])))
             return isinstance(value, str) and bool(CHECKS[field].fullmatch(value))
 
+        if request["op"] == "create-report" and "session" in request:  # the launched first session
+            fields = (*fields, "session")
         if request.keys() != {"op", *fields} or not all(valid(f, request[f]) for f in fields):
             return self.record(caller, request["op"], "invalid")
         return self.writer.submit(lambda db: lifecycle(db, caller, request, self.denials))

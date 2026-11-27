@@ -2164,7 +2164,6 @@ def start_session(
     execution_policy: str | None = None,
     name: str = "",
     track_attempt: bool = False,
-    create_request: str = "",
 ) -> dict:
     """Start an agent session for a specific wolt.
 
@@ -2253,7 +2252,7 @@ def start_session(
             user_id=str((routing or {}).get("user_id", "")),
             thread_ts=str((routing or {}).get("thread_ts", "")),
             session_url=session_url,
-        ), track_attempt, create_request)
+        ), track_attempt)
     _schedule_pickup(wolt)  # after publication: whichever of this and the backend's ready call comes later hints
 
     result = {
@@ -2318,13 +2317,11 @@ def _open_launch(name, wolt, attempt, prompt="", *, resume=False):
     return shlex.join([sys.executable, "-I", "-m", "woltspace.protected_launcher", "bridge", name, attempt])
 
 
-def _create_and_launch(registry, name, wolt, harness, target, prompt, fields, track=False, create_request="") -> None:
+def _create_and_launch(registry, name, wolt, harness, target, prompt, fields, track=False) -> None:
     """Create the row, mark the attempt, spawn, publish: under the agent's lock."""
     mode = inbox_mode(registry.wolts_dir)  # before the row: a malformed switch starts nothing
     registry.create(name, wolt=wolt, harness=harness, dir=str(target.canonical_workdir),
                     target=target, prompt=prompt, **fields)
-    if create_request:  # a protected create's first launch: the exact session a rejoin names
-        registry.update(name, wolt=wolt, create_request=create_request)
     protected = _protected_launch_enabled()
     if protected:
         registry.update(name, wolt=wolt, harness_session_id=str(uuid.uuid4()))

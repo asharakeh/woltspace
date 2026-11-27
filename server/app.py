@@ -1375,7 +1375,6 @@ async def session_new_create(request: Request):
                     display_name=typed_name, linkage=linkage),  # the approved engine is pinned
                 lambda: start_session(
                     wolt=wolt_name, harness=selected_harness, execution_policy=level, track_attempt=True,
-                    create_request=request_id,
                     prompt=platform_skill_invoke(selected_harness, "create-wolt",
                                                  delivery=wolt_skills_delivery(WOLTS_DIR / wolt_name)),
                     routing={"adapter": "lodge"}))
@@ -1383,12 +1382,12 @@ async def session_new_create(request: Request):
             return JSONResponse({"detail": str(e)}, status_code=500)
         if reply.get("status") == "launched" and "session" not in reply:  # a rejoin: the exact first session
             from sessions import SessionRegistry
-            started = [row["name"] for row in SessionRegistry(WOLTS_DIR).stored(wolt_name)  # read only
-                       if row.get("create_request") == request_id and row.get("stop_reason") != "launch_failed"]
-            if len(started) != 1:  # never a guess, never a relaunch: the page and tui show this as an error
+            first = reply.get("first_session")  # recorded by the broker with the launched transition
+            row = SessionRegistry(WOLTS_DIR).get(first, check_alive=False) if first else None  # read only
+            if row is None or row.get("wolt") != wolt_name:  # gone, or an old record without the link
                 return JSONResponse({**reply, "session": None,
                                      "detail": "the first session of this create is unavailable"}, status_code=409)
-            reply["session"] = {"name": started[0]}
+            reply["session"] = {"name": first}  # never a guess, never a relaunch
         status = {"ok": {"launched": 200, "pending": 202}.get(reply.get("status"), 409),
                   "unavailable": 503}.get(reply["result"], 409)
         if status != 200:  # shown as is by the lodge page and the tui

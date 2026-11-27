@@ -136,7 +136,7 @@ def test_partial_scaffold_waits_for_the_owner_and_a_failed_launch_keeps_its_prin
     assert ordinary(op="create-status", request=RID) | {"code": None} == {
         "result": "ok", "status": "launch-failed", "code": None, "id": pid}
     assert create() | {"code": None} == {"result": "ok", "status": "launched", "code": None, "id": pid,
-                                          "session": {"name": "wolt-a-session"}}
+                                          "first_session": "wolt-a-session", "session": {"name": "wolt-a-session"}}
     assert create()["status"] == "launched" and calls == ["scaffold", "scaffold", "launch", "launch"]
     # A folder this request did not start is ambiguous: reported and left for the owner.
     other = {**TERMS, "name": "wolt-b"}
@@ -217,7 +217,7 @@ def test_only_a_definite_non_start_releases_the_first_launch(lodge, monkeypatch,
     def create():
         return protected_create.create(RID, TERMS, lodge.wolts, lambda linkage: (lodge.wolts / "wolt-a" / "wolt").mkdir(
             parents=True) or (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").write_text("{}"),
-            lambda: sessions.start_session(wolt="wolt-a", prompt="hi", track_attempt=True, create_request=RID))
+            lambda: sessions.start_session(wolt="wolt-a", prompt="hi", track_attempt=True))
 
     code = request_and_approve()["code"]
     with pytest.raises((OSError, subprocess.CalledProcessError)):
@@ -228,9 +228,12 @@ def test_only_a_definite_non_start_releases_the_first_launch(lodge, monkeypatch,
     else:
         assert ordinary(op="create-status", request=RID)["status"] == "launch-failed"
     assert create()["status"] == "launched" and len(spawned) == 2
-    rows = sessions.SessionRegistry(lodge.wolts).stored("wolt-a")  # the retained attempt and the success
-    assert [row.get("create_request") for row in rows] == [RID, RID]
-    assert len([row for row in rows if row.get("stop_reason") != "launch_failed"]) == (2 if failure == "after-spawn" else 1)
+    first = ordinary(op="create-status", request=RID)["first_session"]  # recorded with the launched transition
+    assert first == spawned[-1] != spawned[0]  # the success, never the retained (failed or uncertain) attempt
+    registry = sessions.SessionRegistry(lodge.wolts)
+    registry.delete(first, wolt="wolt-a")  # later deleted: the record still names it, so a rejoin finds nothing
+    assert ordinary(op="create-status", request=RID)["first_session"] == first and registry.get(first) is None
+    assert registry.get(spawned[0], check_alive=False) is not None  # the earlier attempt is still there, unnamed
     (lodge.wolts / "wolt-u" / "wolt").mkdir(parents=True)
     (lodge.wolts / "wolt-u" / "wolt" / "wolt.json").write_text("{}")
     ordinary_start = sessions.start_session(wolt="wolt-u", prompt="hi")  # every unprotected launch: unchanged
@@ -255,14 +258,14 @@ def test_a_retry_that_read_approved_never_touches_a_live_scaffold(lodge, monkeyp
         assert finished.wait(5)
 
     def late():
-        out["late"] = protected_create.create(RID, TERMS, lodge.wolts, scaffold, dict)
+        out["late"] = protected_create.create(RID, TERMS, lodge.wolts, scaffold, lambda: {"name": "wolt-a-late"})
         finished.set()
 
     monkeypatch.setattr(protected_create, "_call", call)
     thread = threading.Thread(target=late, name="late")
     thread.start()
     assert read.wait(5)
-    first = protected_create.create(RID, TERMS, lodge.wolts, scaffold, dict)
+    first = protected_create.create(RID, TERMS, lodge.wolts, scaffold, lambda: {"name": "wolt-a-first"})
     thread.join(5)
     assert out["late"]["status"] == "scaffolding" and first["status"] == "launched"
 
@@ -304,7 +307,11 @@ def test_name_is_held_until_retirement_and_restore_keeps_the_approved_id(lodge):
     for stage in ("scaffolding", "scaffolded", "launching", "launched"):
         if stage != "launched":  # an unfinished create keeps its name: before scaffold and before first launch
             assert owner(op="rename", wolt="wolt-a", to="wolt-r") == {"result": "creating"}
-        assert ordinary(op="create-report", request=RID, stage=stage)["status"] == stage
+        if stage == "launched":  # the success is recorded only with its exact first session
+            assert ordinary(op="create-report", request=RID, stage=stage) == {"result": "refused"}
+        first = {"session": "wolt-a-first"} if stage == "launched" else {}
+        assert ordinary(op="create-report", request=RID, stage=stage, **first)["status"] == stage
+    assert ordinary(op="create-status", request=RID)["first_session"] == "wolt-a-first"
     assert owner(op="rename", wolt="wolt-a", to="wolt-r") == {"result": "ok"}
     assert owner(op="enroll", wolt="wolt-r")["id"] == pid  # rename keeps the stable ID
     assert ordinary(op="create-request", request=OTHER, terms={**TERMS, "name": "wolt-r"}) == {"result": "name-held"}
@@ -332,10 +339,25 @@ def test_an_exact_stage_two_registry_migrates_once_and_keeps_its_rows(tmp_path):
     (v1_store / "registry.db").chmod(0o600)
     b = broker.Broker(v1_store)
     with sqlite3.connect(v1_store / "registry.db") as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (2,)
+        assert db.execute("PRAGMA user_version").fetchone() == (3,)
         assert db.execute("SELECT id, name FROM principals").fetchall() == [("p-" + "1" * 32, "wolt-a")]
     assert b.create("worker", {"op": "create-request", "request": RID, "terms": TERMS}) == {"result": "name-held"}
     broker.Broker(v1_store)  # an ordinary restart of the migrated file
+
+
+def test_a_stage_three_a_registry_gains_the_session_column_and_keeps_its_creates(tmp_path):
+    store = tmp_path / "policy"
+    store.mkdir(mode=0o700)
+    with sqlite3.connect(store / "registry.db") as conn:  # a v2 volume with a create launched before v3
+        conn.executescript(f"{broker.TABLES}{broker.CREATES} PRAGMA user_version = 2;"
+                           " INSERT INTO creates VALUES ('" + RID + "', 'c-00000001', 'wolt-a', '{}', 'launched', NULL);")
+    (store / "registry.db").chmod(0o600)
+    b = broker.Broker(store)
+    with sqlite3.connect(store / "registry.db") as db:
+        assert db.execute("PRAGMA user_version").fetchone() == (3,)
+        assert db.execute("SELECT request, status, session FROM creates").fetchall() == [(RID, "launched", None)]
+    status = b.create("worker", {"op": "create-status", "request": RID})
+    assert status["status"] == "launched" and "first_session" not in status  # old linkage: a rejoin gets 409
 
 
 def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypatch, capsys):
@@ -380,17 +402,18 @@ def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypa
     assert (lodge.wolts / "wolt-a" / protected_create.MARKER).read_text() == f"{RID} {pid}\n"
     assert (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").is_file()
     import sessions
-    assert launched[0]["create_request"] == RID  # the first launch records its request on the session row
-    failed = {"name": "wolt-a-1", "created_at": 1, "create_request": RID, "stop_reason": "launch_failed"}
-    later = {"name": "wolt-a-3", "created_at": 9}  # an ordinary later session, no create request
-    for rows, expected in (([failed, {"name": "wolt-a-2", "created_at": 1, "create_request": RID}, later], {"name": "wolt-a-2"}),
-                           ([failed, later], None),  # the original is gone: unavailable, never a substitute
-                           ([{"name": "x", "create_request": RID}, {"name": "y", "create_request": RID}], None)):
-        monkeypatch.setattr(sessions.SessionRegistry, "stored", lambda self, wolt, rows=rows: rows)
+    assert ordinary(op="create-status", request=RID)["first_session"] == "wolt-a-session"  # the exact one launched
+    for row, expected in (({"name": "wolt-a-session", "wolt": "wolt-a"}, {"name": "wolt-a-session"}),
+                          (None, None),  # deleted later: unavailable, never another row
+                          ({"name": "wolt-a-session", "wolt": "wolt-b"}, None)):  # a name that is not this wolt's
+        monkeypatch.setattr(sessions.SessionRegistry, "get", lambda self, name, row=row, **kw: row)
         rejoin = asyncio.run(post(request_id=RID))  # the page or tui coming back after a completed create
         assert rejoin.json()["status"] == "launched" and rejoin.json()["session"] == expected
         assert rejoin.status_code == (200 if expected else 409)  # unavailable takes the clients' error path
         assert expected or rejoin.json()["detail"] == "the first session of this create is unavailable"
+    with sqlite3.connect(lodge.store / "registry.db") as db:  # an old record without the link
+        db.execute("UPDATE creates SET session = NULL WHERE request = ?", (RID,))
+    assert asyncio.run(post(request_id=RID)).status_code == 409
     assert len(launched) == 1  # a rejoin never starts anything
 
     def cli(*argv):

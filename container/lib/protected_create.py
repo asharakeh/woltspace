@@ -19,8 +19,8 @@ def _call(request: dict) -> dict:
     return dummy_broker.call(request, dummy_broker.SOCKET.with_name(dummy_broker.CREATE))
 
 
-def _report(request_id: str, stage: str) -> dict:
-    return _call({"op": "create-report", "request": request_id, "stage": stage})
+def _report(request_id: str, stage: str, session: str = "") -> dict:
+    return _call({"op": "create-report", "request": request_id, "stage": stage, **({"session": session} if session else {})})
 
 
 def _claim(request_id: str, stage: str) -> dict | None:
@@ -76,4 +76,5 @@ def create(request_id: str, terms: dict, wolts_dir: Path | None, scaffold, launc
         if _nothing_started(wolts_dir, terms["name"]):
             _report(request_id, "launch-failed")  # definitely never started: a retry may launch, same principal
         raise  # otherwise the launching claim stays: the owner reconciles an uncertain first launch
-    return _report(request_id, "launched") | {"session": session}
+    # The broker records this exact first session with the launched transition; a rejoin names only it.
+    return _report(request_id, "launched", (session or {}).get("name", "")) | {"session": session}

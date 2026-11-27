@@ -97,15 +97,65 @@ screen_has() {
 }
 admin() { WOLTSPACE_IMAGE="$image" WOLTSPACE_FEATURE_ISOLATION=true ./woltspace secrets "$@" 3>&-; }
 
+boot() {
+    local isolation=$1 wolts=$2
+    local -a mounts=()
+    if [[ $isolation == true ]]; then
+        docker volume create "$volume"
+        mounts+=(-v "$volume:/var/lib/woltspace-secrets")
+    fi
+    container=$(docker create --name "$name" --network none --security-opt no-new-privileges \
+        -e WOLTSPACE_FEATURE_ISOLATION="$isolation" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+        "${mounts[@]}" -v "$wolts:/workspace/wolts:rw" \
+        -v "$wolts/.claude:/home/node/.claude:rw" "$image")
+    [[ $(docker inspect -f '{{.HostConfig.NetworkMode}}' "$container") == none ]]
+    docker start "$container"
+    wait_for api /health
+}
+finish_container() {
+    docker stop --time 15 "$container"
+    [[ $(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$container") == 'exited 0' ]]
+    docker rm "$container"
+    local remaining
+    remaining=$(docker ps -aq --no-trunc --filter "id=$container")
+    [[ -z $remaining ]]
+    container=
+}
+terminal() {
+    docker exec --user node "$container" env -i PATH=/usr/bin:/bin tmux \
+        -S "/tmp/tmux-$(id -u)/default" "$@"
+}
+
+phase=flag-off
+mkdir -p "$root/flag-off/.claude"
+cp "$WOLTSPACE_WOLTS_DIR/.env" "$root/flag-off/.env"
+boot false "$root/flag-off"
+docker exec -i -u 0 "$container" sh -ec '
+    engine=/home/node/.local/bin/claude
+    [ -e "$engine" ] || [ -L "$engine" ]
+    rm -f "$engine"
+    cat >"$engine"
+    chmod 0755 "$engine"
+' <<'ENGINE'
+#!/bin/sh
+[ -t 0 ] || exit 0
+printf 'started\n' >.ordinary-engine
+while :; do sleep 60; done
+ENGINE
+post /sessions/new/create '{"name":"control","type":"beaver"}'
+wait_for test -s "$root/flag-off/control/.ordinary-engine"
+docker exec -u 0 "$container" sh -ec '
+    test -f /etc/woltspace/stock-fixture
+    test ! -e /run/woltspace-launch.sock
+    test ! -e /run/woltspace-engine
+    test ! -e /var/lib/woltspace-broker
+'
+[[ -z $(docker volume ls -q --filter "name=^${volume}$") ]]
+finish_container
+echo 'PASS flag-off' >&3
+
 phase=flag-on
-docker volume create "$volume"
-container=$(docker create --name "$name" --network none --security-opt no-new-privileges \
-    -e WOLTSPACE_FEATURE_ISOLATION=true -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-    -v "$volume:/var/lib/woltspace-secrets" -v "$WOLTSPACE_WOLTS_DIR:/workspace/wolts:rw" \
-    -v "$WOLTSPACE_WOLTS_DIR/.claude:/home/node/.claude:rw" "$image")
-[[ $(docker inspect -f '{{.HostConfig.NetworkMode}}' "$container") == none ]]
-docker start "$container"
-wait_for api /health
+boot true "$WOLTSPACE_WOLTS_DIR"
 if post /sessions/new/lodge '{"wolt":"alpha"}'; then exit 1; fi
 admin enroll alpha
 admin enroll beta
@@ -113,10 +163,32 @@ admin register dummy.ping
 admin grant alpha dummy.ping
 echo 'PASS flag-on' >&3
 
+# Inventory only the in-container broker's actual socket handles, once it has
+# processed the admin request. No descriptor duplication or broker state mutation.
+broker_pid=$(docker exec "$container" ps -eo pid=,uid= | awk '$2 == 990 {print $1}')
+[[ $broker_pid =~ ^[1-9][0-9]*$ ]]
+broker_sockets() {
+    docker exec --user 990:990 "$container" sh -ec '
+        test -r "/proc/$1/fd"
+        test -x "/proc/$1/fd"
+        for fd in /proc/"$1"/fd/*; do
+            target=$(readlink "$fd") || continue
+            case "$target" in socket:\[*\]) printf "%s\n" "$target";; esac
+        done
+    ' sh "$broker_pid" | sort -u
+}
 phase=lifecycle-start
+broker_sockets >"$root/broker-before"
+[[ $(wc -l <"$root/broker-before") -ge 3 ]]
 a=$(post /sessions/new/lodge '{"wolt":"alpha","prompt":"fixture-overlap"}' | field name)
+broker_sockets >"$root/broker-alpha"
+old_socket=$(comm -13 "$root/broker-before" "$root/broker-alpha")
+[[ $old_socket =~ ^socket:\[[0-9]+\]$ ]]
 b=$(post /sessions/new/lodge '{"wolt":"beta","prompt":"fixture-overlap"}' | field name)
 [[ $a != "$b" ]]
+broker_sockets >"$root/broker-both"
+sibling_socket=$(comm -13 "$root/broker-alpha" "$root/broker-both")
+[[ $sibling_socket =~ ^socket:\[[0-9]+\]$ && $sibling_socket != "$old_socket" ]]
 a_row=$(api "/sessions/$a")
 original=$(field harness_session_id <<<"$a_row")
 attempt=$(field attempt <<<"$a_row")
@@ -141,6 +213,13 @@ echo 'PASS lifecycle-start' >&3
 
 phase=lifecycle-stop
 post "/sessions/$a/stop" '{}' | field status | grep -Fx stopped
+old_channel_retired() {
+    local current
+    current=$(broker_sockets) || return
+    grep -Fxq "$sibling_socket" <<<"$current" && ! grep -Fxq "$old_socket" <<<"$current"
+}
+wait_for old_channel_retired
+echo 'PASS broker retirement' >&3
 post "/sessions/$b/resume" '{"prompt":"fixture-survive"}'
 sibling_replied() {
     local lines
@@ -163,6 +242,30 @@ assert reap_status(sys.argv[1], sys.argv[2], 1) == "unavailable"
 ' "$a" "$attempt"
 post "/sessions/$a/stop" '{}' | field status | grep -Fx stopped
 post "/sessions/$b/stop" '{}' | field status | grep -Fx stopped
-docker stop --time 15 "$container"
-[[ $(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$container") == 'exited 0' ]]
 echo 'PASS lifecycle-resume' >&3
+
+phase=lifecycle-stop
+# Start a fresh turn whose fixed endpoint waits for release, then drop its
+# dedicated bridge while the request is pending. Let the ordinary stop API
+# observe the exact receipt after the pane no longer exists.
+c=$(post /sessions/new/lodge '{"wolt":"alpha","prompt":"fixture-overlap"}' | field name)
+c_row=$(api "/sessions/$c")
+c_uuid=$(field harness_session_id <<<"$c_row")
+c_pane=$(field runtime pane_id <<<"$c_row")
+turn_pending() {
+    local matches
+    matches=$(docker exec -u 0 "$container" find /run/woltspace-engine \
+        -path "*/$c_uuid/control/arrived" -type f) || return
+    [[ -n $matches ]]
+}
+wait_for turn_pending
+terminal kill-pane -t "$c_pane"
+post "/sessions/$c/stop" '{}' | field status | grep -Fx stopped
+no_broker_workers() {
+    local current
+    current=$(broker_sockets) || return
+    [[ $current == "$(cat "$root/broker-before")" ]]
+}
+wait_for no_broker_workers
+finish_container
+echo 'PASS controlled interruption' >&3

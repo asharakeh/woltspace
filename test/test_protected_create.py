@@ -280,6 +280,14 @@ def test_a_folder_that_appears_after_the_check_is_never_written(tmp_path, monkey
     assert [p.name for p in (tmp_path / "wolt-a").iterdir()] == ["owner.txt"]
 
 
+def test_flag_off_create_cli_runs_without_the_woltspace_package():
+    lib = Path(__file__).parent.parent / "container" / "lib"  # -I -S: no site-packages, so no woltspace
+    run = subprocess.run([sys.executable, "-I", "-S", "-c", f"import sys; sys.path.insert(0, {str(lib)!r}); "
+                          "import protected_create; assert 'woltspace.dummy_broker' not in sys.modules"],
+                         capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
 def test_lodge_page_and_tui_keep_one_request_id_and_read_both_session_shapes():
     test = Path(__file__).with_name("create-request.test.mjs")

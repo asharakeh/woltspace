@@ -7,8 +7,6 @@ the displayed code never approve anything.
 import os
 from pathlib import Path
 
-from woltspace import dummy_broker
-
 MARKER = Path(".state") / "create-request"  # written first; evidence for the owner, never authority
 
 
@@ -17,6 +15,7 @@ def enabled() -> bool:
 
 
 def _call(request: dict) -> dict:
+    from woltspace import dummy_broker  # only an isolated lodge talks to the broker; flag-off needs no package
     return dummy_broker.call(request, dummy_broker.SOCKET.with_name(dummy_broker.CREATE))
 
 

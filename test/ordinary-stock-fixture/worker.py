@@ -8,7 +8,6 @@ import sys
 import time
 
 
-
 ROOT = Path("/state")
 WORKDIR = ROOT
 
@@ -17,20 +16,49 @@ class Endpoint(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def setup(self):
+        self.request.settimeout(2)
+        super().setup()
+
     def do_POST(self):
-        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        # Keep root-side request parsing and work bounded on the fixed endpoint.
+        lengths = self.headers.get_all("Content-Length") or []
+        try:
+            length = int(lengths[0]) if len(lengths) == 1 else 0
+            if not 0 < length <= 262144 or self.headers.get("Transfer-Encoding"):
+                raise ValueError("fixture framing")
+            body = bytearray()
+            deadline = time.monotonic() + 3
+            while len(body) < length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError("fixture body deadline")
+                self.request.settimeout(remaining)
+                chunk = self.rfile.read1(length - len(body))
+                if not chunk:
+                    raise ValueError("fixture body closed")
+                body.extend(chunk)
+            self.request.settimeout(2)
+            request = json.loads(body)
+            parts = [
+                (item.get("role"), piece.get("text"))
+                for item in request["input"] if isinstance(item, dict)
+                for piece in (item.get("content") or []) if isinstance(piece, dict)
+            ]
+        except (ValueError, TypeError, KeyError, OSError, RecursionError):
+            self.send_error(400, "fixture framing")
+            return
         valid = (
             self.path == "/responses"
             and not self.headers.get("Authorization")
             and request.get("model") == "fixture"
             and request.get("stream") is True
-            and any(
-                piece.get("text") == self.server.prompt
-                for item in request["input"] if item.get("role") == "user"
-                for piece in item["content"]
-            )
+            and ("user", self.server.prompt) in parts
+            and (not self.server.history or ("assistant", self.server.history) in parts)
+            and not self.server.accepted
         )
-        self.server.accepted.append(valid)
+        if len(self.server.accepted) < 2:
+            self.server.accepted.append(valid)
         if not valid:
             self.send_error(400, "fixture request mismatch")
             return
@@ -93,6 +121,7 @@ def _drive(child, server, lane, expected):
             chunk = os.read(child.stdout.fileno(), 65536)
             assert chunk, f"{phase} stdio closed"
             pending += chunk
+            assert len(pending) <= 262144, "fixture RPC frame too large"
         line, pending = pending.split(b"\n", 1)
         return json.loads(line)
 
@@ -122,6 +151,7 @@ def _drive(child, server, lane, expected):
         server.prompt = f"Fixture prompt {lane} {verb}"
         server.answer = f"fixture-{lane}-{verb}"
         server.overlap = verb == "overlap"
+        server.history = f"fixture-{lane}-reuse" if verb == "resume" else None
         server.accepted.clear()
         deadline = time.monotonic() + 40
         turn_id = 3

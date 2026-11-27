@@ -157,6 +157,14 @@ echo 'PASS flag-off' >&3
 phase=flag-on
 boot true "$WOLTSPACE_WOLTS_DIR"
 if post /sessions/new/lodge '{"wolt":"alpha"}'; then exit 1; fi
+failed=$(api /sessions | python3 -c '
+import json, sys
+rows = [row for row in json.load(sys.stdin) if row.get("wolt") == "alpha"]
+assert len(rows) == 1 and rows[0]["status"] == "stopped"
+print(rows[0]["name"])
+')
+docker exec -u 0 "$container" test ! -e /run/woltspace-engine
+post "/sessions/$failed/stop" '{}' | field status | grep -Fx stopped
 admin enroll alpha
 admin enroll beta
 admin register dummy.ping
@@ -212,6 +220,13 @@ wait_for screen_has "$b_pane" 'dummy refused'
 echo 'PASS lifecycle-start' >&3
 
 phase=lifecycle-stop
+post "/sessions/$a/resume" '{"prompt":"fixture-reuse"}'
+replied_twice() {
+    local lines
+    lines=$(screen_has "$1" 'fixture complete') || return
+    [[ $(wc -l <<<"$lines") == 2 ]]
+}
+wait_for replied_twice "$a_pane"
 post "/sessions/$a/stop" '{}' | field status | grep -Fx stopped
 old_channel_retired() {
     local current
@@ -221,12 +236,7 @@ old_channel_retired() {
 wait_for old_channel_retired
 echo 'PASS broker retirement' >&3
 post "/sessions/$b/resume" '{"prompt":"fixture-survive"}'
-sibling_replied() {
-    local lines
-    lines=$(screen_has "$b_pane" 'fixture complete') || return
-    [[ $(wc -l <<<"$lines") == 2 ]]
-}
-wait_for sibling_replied
+wait_for replied_twice "$b_pane"
 [[ $(api "/sessions/$b" | field attempt) == "$b_attempt" ]]
 echo 'PASS lifecycle-stop' >&3
 
@@ -237,8 +247,9 @@ a_row=$(api "/sessions/$a")
 wait_for screen_has "$(field runtime pane_id <<<"$a_row")" 'fixture complete'
 docker exec --user node "$container" /opt/woltspace/tools/woltspace/bin/python -I -c '
 import sys
-from woltspace.protected_launcher import reap_status
-assert reap_status(sys.argv[1], sys.argv[2], 1) == "unavailable"
+from woltspace.protected_launcher import launcher_epoch, reap_status
+epoch = launcher_epoch(sys.argv[1], sys.argv[2])
+assert epoch and reap_status(sys.argv[1], sys.argv[2], 1, epoch) == "unavailable"
 ' "$a" "$attempt"
 post "/sessions/$a/stop" '{}' | field status | grep -Fx stopped
 post "/sessions/$b/stop" '{}' | field status | grep -Fx stopped

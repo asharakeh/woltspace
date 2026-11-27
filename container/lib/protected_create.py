@@ -30,6 +30,19 @@ def _claim(request_id: str, stage: str) -> dict | None:
     return None if reply.get("result") == "ok" else _call({"op": "create-status", "request": request_id})
 
 
+def _nothing_started(wolts_dir: Path, wolt: str) -> bool:
+    """A definite non-start under the session attempt contract: this new wolt has no session row, or only
+    rows that sessions._launch_failed settled. Anything else (a marked attempt, a published runtime, an
+    unreadable registry) is uncertain and stays for the host owner."""
+    try:
+        from sessions import SessionRegistry
+        rows = SessionRegistry(wolts_dir).list(wolt=wolt)
+    except Exception:
+        return False
+    return all(row.get("status") == "stopped" and row.get("stop_reason") == "launch_failed"
+               and not row.get("launching") for row in rows)
+
+
 def create(request_id: str, terms: dict, wolts_dir: Path | None, scaffold, launch=None) -> dict:
     """Advance one create request as far as its approval allows. Replays are safe."""
     if wolts_dir is None:
@@ -61,6 +74,7 @@ def create(request_id: str, terms: dict, wolts_dir: Path | None, scaffold, launc
     try:
         session = launch()
     except Exception:
-        _report(request_id, "launch-failed")  # the same principal stays for a retry
-        raise
+        if _nothing_started(wolts_dir, terms["name"]):
+            _report(request_id, "launch-failed")  # definitely never started: a retry may launch, same principal
+        raise  # otherwise the launching claim stays: the owner reconciles an uncertain first launch
     return _report(request_id, "launched") | {"session": session}

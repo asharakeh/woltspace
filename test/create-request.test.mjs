@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { webcrypto } from 'node:crypto';
 import { runInNewContext } from 'node:vm';
 
 import { createUntilStarted } from '../tui/src/create-wolt.js';
@@ -11,13 +12,17 @@ const source = (name) => lodge.slice(lodge.indexOf(`function ${name}(`), lodge.i
 test('the lodge page keeps one request ID per exact form and reads both session shapes', () => {
   const page = {};
   runInNewContext(`let createRequest = null;\n${source('createRequestBody')}\n${source('createdSessionName')}
-    page.body = createRequestBody; page.name = createdSessionName;`, { page });
+    page.body = createRequestBody; page.name = createdSessionName;`,
+  { page, crypto: { getRandomValues: (bytes) => webcrypto.getRandomValues(bytes) } });  // plain HTTP: no randomUUID
   let n = 0;
   const id = () => `id-${(n += 1)}`;
   const form = { name: 'maple', type: 'beaver', harness: 'claude' };
   assert.equal(page.body(form, id).request_id, 'id-1');
   assert.equal(page.body({ ...form }, id).request_id, 'id-1');  // "check again" is the same request
   assert.equal(page.body({ ...form, type: 'otter' }, id).request_id, 'id-2');  // other terms, other request
+  const real = page.body({ ...form, name: 'pine' }).request_id;  // the page's own default ID
+  assert.match(real, /^[0-9a-f]{32}$/);
+  assert.equal(page.body({ ...form, name: 'pine' }).request_id, real);
   assert.equal(page.name({ name: 'maple-1' }), 'maple-1');  // ordinary lodge
   assert.equal(page.name({ status: 'launched', session: { name: 'maple-2' } }), 'maple-2');  // isolated lodge
 });

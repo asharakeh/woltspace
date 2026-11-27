@@ -187,6 +187,54 @@ def test_concurrent_retries_launch_once_and_an_uncertain_launch_waits_for_the_ow
     assert create(OTHER, other)["status"] == "launched" and calls[-1] == "launch"
 
 
+@pytest.mark.parametrize("failure", ["after-spawn", "refused"])
+def test_only_a_definite_non_start_releases_the_first_launch(lodge, monkeypatch, failure):
+    import sessions
+    from session_runtime import RuntimeHandle
+
+    monkeypatch.setenv("WOLTSPACE_ISOLATION", "external")
+    (lodge.wolts / ".space").mkdir()
+    (lodge.wolts / "woltspace.json").write_text(json.dumps({"inbox": {"enabled": True, "native_hints": True}}))
+    monkeypatch.setattr(sessions, "WOLTS_DIR", lodge.wolts)
+    spawned = []
+
+    def spawn(name, cwd, command):  # the real start path up to tmux; the first spawn fails as asked
+        spawned.append(name)
+        if failure == "refused" and len(spawned) == 1:
+            raise subprocess.CalledProcessError(1, ["tmux", "new-session"])
+        return RuntimeHandle(woltspace_session_id=name, tmux_session_name=name, pane_id="%1")
+
+    real_publish = sessions.publish_runtime
+
+    def publish(*args, **kwargs):  # a first session already spawned, then its publication fails
+        if failure == "after-spawn" and len(spawned) == 1:
+            raise OSError("lodge.db is busy")
+        return real_publish(*args, **kwargs)
+
+    for attr, value in (("_tmux_spawn", spawn), ("publish_runtime", publish), ("_tmux_alive", lambda data: True),
+                        ("_tmux_exists", lambda where: None), ("harness_install_problem", lambda *a, **k: None),
+                        ("ensure_site", lambda wolt: None), ("get_tunnel_url", lambda: "")):
+        monkeypatch.setattr(sessions, attr, value)
+    native = SimpleNamespace(prepare=lambda root, name, harness, attempt: {
+        "kind": harness, "addr": str(root / ".space" / name / attempt), "attempt": attempt}, retire=lambda locator: None)
+    monkeypatch.setitem(sys.modules, "native_adapters", native)
+
+    def create():
+        return protected_create.create(RID, TERMS, lodge.wolts, lambda linkage: (lodge.wolts / "wolt-a" / "wolt").mkdir(
+            parents=True) or (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").write_text("{}"),
+            lambda: sessions.start_session(wolt="wolt-a", prompt="hi"))
+
+    code = request_and_approve()["code"]
+    with pytest.raises((OSError, subprocess.CalledProcessError)):
+        create()
+    if failure == "after-spawn":  # a live first session may exist: never spawned again on its own
+        assert create()["status"] == "launching" and len(spawned) == 1
+        assert owner(op="reconcile", code=code)["status"] == "launch-failed"  # the owner checked and decided
+    else:
+        assert ordinary(op="create-status", request=RID)["status"] == "launch-failed"
+    assert create()["status"] == "launched" and len(spawned) == 2
+
+
 def test_a_retry_that_read_approved_never_touches_a_live_scaffold(lodge, monkeypatch):
     request_and_approve()
     read, scaffolding, finished, out = threading.Event(), threading.Event(), threading.Event(), {}

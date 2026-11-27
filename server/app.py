@@ -1385,6 +1385,8 @@ async def session_new_create(request: Request):
         if status != 200:  # shown as is by the lodge page and the tui
             reply["detail"] = (f"waiting for the host owner: woltspace secrets review {reply['code']}"
                                if status == 202 else f"create request {reply.get('status') or reply['result']}")
+            if reply.get("status") == "launching":  # in progress, or uncertain after a failure
+                reply["detail"] += f"; if no first session started, the host owner runs woltspace secrets reconcile {reply['code']}"
         return JSONResponse(reply, status_code=status)
 
     try:

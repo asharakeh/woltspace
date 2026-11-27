@@ -994,8 +994,10 @@ function updateCreatePreview() {
 
 // An isolated lodge answers a create with a pending request for the host owner to approve.
 // One request ID per exact form, kept across "check again", so a retry is the same request.
+// getRandomValues, not randomUUID: the lodge page is also served over plain HTTP on a LAN address.
 let createRequest = null;
-function createRequestBody(payload, newId = () => crypto.randomUUID().replaceAll('-', '')) {
+function createRequestBody(payload, newId = () => Array.from(
+  crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('')) {
   const key = JSON.stringify(payload);
   if (!createRequest || createRequest.key !== key) createRequest = { key, id: newId() };
   return { ...payload, request_id: createRequest.id };

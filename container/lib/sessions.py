@@ -1063,7 +1063,7 @@ def _await_agent(session: str | dict | RuntimeHandle, harness: str | None,
     limit = _AGENT_APPEAR_TIMEOUT if timeout is None else timeout
     deadline = time.monotonic() + limit
     while True:
-        if resolve_agent_handle(session, harness, include_launching=True) is not None:
+        if resolve_agent_handle(session, harness, include_launching=not _protected_launch_enabled()) is not None:
             return True
         if time.monotonic() >= deadline:
             return False
@@ -2296,14 +2296,43 @@ def start_session(
     return result
 
 
+def _protected_launch_enabled() -> bool:
+    return os.environ.get("WOLTSPACE_FEATURE_ISOLATION") == "true"
+
+
+def _launch_control(op, name, attempt, **fields):
+    from woltspace import dummy_broker
+
+    return dummy_broker.call(
+        {"op": op, "session": name, "attempt": attempt, **fields},
+        dummy_broker.SOCKET.with_name(dummy_broker.LAUNCH),
+    )
+
+
+def _open_launch(name, wolt, attempt, prompt="", *, resume=False):
+    if not _protected_launch_enabled():
+        return build_session_command(name, prompt, resume=True) if resume else build_session_command(name, prompt)
+    if _launch_control("launch-open", name, attempt, wolt=wolt) != {"result": "ok"}:
+        raise subprocess.CalledProcessError(1, "protected session launch")
+    return shlex.join([sys.executable, "-I", "-m", "woltspace.protected_launcher", "bridge", name, attempt])
+
+
 def _create_and_launch(registry, name, wolt, harness, target, prompt, fields, track=False) -> None:
     """Create the row, mark the attempt, spawn, publish: under the agent's lock."""
     mode = inbox_mode(registry.wolts_dir)  # before the row: a malformed switch starts nothing
     registry.create(name, wolt=wolt, harness=harness, dir=str(target.canonical_workdir),
                     target=target, prompt=prompt, **fields)
-    attempt = mark_launching(registry, name, wolt, harness, mode, track)
+    protected = _protected_launch_enabled()
+    if protected:
+        registry.update(name, wolt=wolt, harness_session_id=str(uuid.uuid4()))
+    attempt = mark_launching(registry, name, wolt, harness, mode, track or protected)
     with _launch_step(registry, name, wolt, attempt, name, settle=True):
-        handle = _tmux_spawn(name, str(target.canonical_workdir), build_session_command(name, prompt))
+        command = _open_launch(name, wolt, attempt, prompt)
+        handle = _tmux_spawn(name, str(target.canonical_workdir), command)
+        if protected and not _await_agent(handle, harness):
+            if _tmux_exists(handle) is not False:
+                _tmux_stop(handle)
+            raise RuntimeError("protected session did not start")
     publish_runtime(registry, name, wolt, attempt, handle.to_record())
 
 
@@ -2321,6 +2350,8 @@ def _launch_step(registry, name: str, wolt: str, attempt: str, where, *, settle:
     try:
         yield
     except Exception as exc:
+        if attempt and _protected_launch_enabled():
+            _launch_control("launch-cancel", name, attempt)
         if attempt and (isinstance(exc, subprocess.CalledProcessError) or _tmux_exists(where) is False):
             _launch_failed(registry, name, wolt, attempt, settle=settle)
         raise
@@ -2399,7 +2430,7 @@ def _relaunch(registry: "SessionRegistry", name: str, wolt: str, harness: str, o
                                " is launching; the wake does not revive it")
         mode = inbox_mode(registry.wolts_dir)  # chosen afresh, before the old locator is retired
         invalidate_native(registry, name, wolt, current)
-        yield mark_launching(registry, name, wolt, harness, mode)
+        yield mark_launching(registry, name, wolt, harness, mode, _protected_launch_enabled())
 
 
 def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -> dict:
@@ -2537,7 +2568,8 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
     # It reads dir/model/harness from the registry, builds the agent command
     # via prepare_session_command, and closes out the lifecycle (finish status,
     # viewport reset) when the agent exits — which raw agent commands skipped.
-    resume_cmd = build_session_command(name, prompt, resume=True)
+    protected = _protected_launch_enabled()
+    resume_cmd = "" if protected else build_session_command(name, prompt, resume=True)
     respawn_detail = "tmux was dead, created new tmux with --resume"
 
     if tmux_alive and not agent_running:
@@ -2548,7 +2580,8 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
                 try:
                     with _launch_step(registry, name, wolt, attempt, target, settle=False), \
                             _paste_lock(name, registry.db_dir):
-                        _tmux_paste(target, resume_cmd)
+                        command = resume_cmd if not protected else _open_launch(name, wolt, attempt)
+                        _tmux_paste(target, command)
                 except subprocess.CalledProcessError as exc:
                     raise ResumeFailed(f"session '{name}': the resume command could not be pasted ({exc})") from exc
                 publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
@@ -2561,7 +2594,8 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
             with _relaunch(registry, name, wolt, harness, only_resting) as attempt:
                 try:
                     with _launch_step(registry, name, wolt, attempt, target, settle=False):
-                        target = _tmux_spawn_in_session(target, work_dir or "/workspace", resume_cmd)
+                        command = resume_cmd if not protected else _open_launch(name, wolt, attempt)
+                        target = _tmux_spawn_in_session(target, work_dir or "/workspace", command)
                 except subprocess.CalledProcessError as exc:
                     raise ResumeFailed(f"session '{name}': no window could be opened for the resume ({exc})") from exc
                 publish_runtime(registry, name, wolt, attempt, target.to_record(), status="running")
@@ -2571,8 +2605,12 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
             data = {**data, "runtime": target.to_record()}
             detail = "agent pane was gone, restarted with --resume in a new window"
         if _await_agent(target, harness, _AGENT_REVIVE_TIMEOUT):
+            if protected and prompt:
+                _tmux_paste(target, _guard_paste_text(harness, prompt))
             return {"name": name, "url": session_url,
                     "status": "revived", "detail": detail}
+        if protected:
+            raise ResumeFailed("protected session did not start in its existing tmux session")
         # In-place revival did not take. The pane we pasted into may be a
         # leftover login shell in a state that swallows the command, or the
         # wrapper died on arrival. Escalate to a clean tmux — but only after
@@ -2602,7 +2640,8 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
     # session) — create a fresh tmux session running the wrapper.
     with _relaunch(registry, name, wolt, harness, only_resting) as attempt:
         with _launch_step(registry, name, wolt, attempt, name, settle=True):  # a fresh new-session
-            handle = _tmux_spawn(name, work_dir or "/workspace", resume_cmd)
+            command = resume_cmd if not protected else _open_launch(name, wolt, attempt)
+            handle = _tmux_spawn(name, work_dir or "/workspace", command)
         publish_runtime(registry, name, wolt, attempt, handle.to_record(), status="running")
     _schedule_pickup(wolt)
     if not _await_agent(handle, harness):
@@ -2626,6 +2665,8 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
             f"the launcher died on arrival. Run "
             f"`session-reg prepare {name} resume` to see why"
         )
+    if protected and prompt:
+        _tmux_paste(handle, _guard_paste_text(harness, prompt))
     return {"name": name, "url": session_url, "status": "respawned",
             "detail": respawn_detail}
 

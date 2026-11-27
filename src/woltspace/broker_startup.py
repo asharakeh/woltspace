@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import dummy_broker
+from . import dummy_broker, protected_launcher
 
 SERVICE = 990
 CONFIG = Path("/etc/woltspace/broker-dummy")
@@ -32,14 +32,17 @@ def protected(path: Path) -> None:
 
 def preflight() -> None:
     uid, gid = int(os.environ.get("HOST_UID") or "1000"), int(os.environ.get("HOST_GID") or "1000")
-    if uid <= 0 or gid <= 0 or SERVICE in (uid, gid) or os.environ.get("WOLTSPACE_DIR"):
+    if (uid <= 0 or gid <= 0 or {uid, gid} & {SERVICE, protected_launcher.WORKER_UID}
+            or os.environ.get("WOLTSPACE_DIR")):
         raise ValueError("unsafe broker startup identity or install override")
-    if any(p.pw_uid == SERVICE for p in pwd.getpwall()) or any(g.gr_gid == SERVICE for g in grp.getgrall()):
+    reserved = {SERVICE, protected_launcher.WORKER_UID}
+    if any(p.pw_uid in reserved for p in pwd.getpwall()) or any(g.gr_gid in reserved for g in grp.getgrall()):
         raise ValueError("broker identity collision")
     if any(g.gr_name in {"root", "sudo", "wheel", "admin", "docker"} and
            (g.gr_gid == gid or "node" in g.gr_mem) for g in grp.getgrall()):
         raise ValueError("privileged node group")
-    for path in (CONFIG, Path(__file__), Path(dummy_broker.__file__), Path(sys.executable)):
+    for path in (CONFIG, Path(__file__), Path(dummy_broker.__file__),
+                 Path(protected_launcher.__file__), Path(sys.executable)):
         protected(path)
     if not CONFIG.is_file() or CONFIG.read_text() != "dummy\n":
         raise ValueError("missing or unsafe dummy configuration")
@@ -130,13 +133,22 @@ def supervise(node_argv: list[str]) -> int:
                     return 1
         if stopping or json.loads(ready) != {"result": "accepted"} or broker.poll() is not None:
             return 1
+        launcher = subprocess.Popen(
+            [sys.executable, "-I", "-m", "woltspace.protected_launcher", "serve"],
+            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, cwd="/",
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=True,
+        )
+        children.append(launcher)
+        if (not select.select([launcher.stdout], [], [], READY_SECONDS)[0]
+                or launcher.stdout.readline() != b"accepted\n" or stopping):
+            return 1
         node = subprocess.Popen(node_argv, close_fds=True)
         children.append(node)
-        while not stopping and node.poll() is None and broker.poll() is None:
+        while not stopping and all(child.poll() is None for child in children):
             time.sleep(.05)
         if stopping:
             return 0
-        return 1 if broker.poll() is not None else node.returncode
+        return 1 if node.returncode is None else node.returncode
     finally:
         # Reverse creation order: preserve node's connector drain before stopping its broker.
         cleanup_failed = False
@@ -145,7 +157,7 @@ def supervise(node_argv: list[str]) -> int:
                 if child.poll() is None:
                     child.terminate()
                     try:
-                        child.wait(timeout=DRAIN_SECONDS if child is children[-1] and len(children) == 2 else BROKER_SECONDS)
+                        child.wait(timeout=DRAIN_SECONDS if child is children[-1] and len(children) == 3 else BROKER_SECONDS)
                     except subprocess.TimeoutExpired:
                         child.kill()
                 child.wait(timeout=BROKER_SECONDS)

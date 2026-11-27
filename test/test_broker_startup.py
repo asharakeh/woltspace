@@ -82,7 +82,7 @@ def test_actual_core_action_and_executable(tmp_path, capsys):
         assert dummy_broker.admin(["enroll", "wolt-a"], short / "admin.sock") == 1  # this caller is not uid 0
         assert capsys.readouterr().out == '{"result": "denied"}\n'
         assert {p.name: oct(p.stat().st_mode & 0o777) for p in short.iterdir()} == {
-            "admin.sock": "0o600", dummy_broker.CREATE: "0o666"}  # only the create route is open to node
+            "admin.sock": "0o600", dummy_broker.CREATE: "0o666", dummy_broker.LAUNCH: "0o666"}
         status = {"op": "create-status", "request": "a" * 32}
         assert dummy_broker.call(status, short / dummy_broker.CREATE) == {"result": "unknown-request"}
         assert sorted(p.name for p in policy.iterdir()) == ["action.key", "registry.db"]
@@ -114,7 +114,7 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, mode):
     class Child:
         def __init__(self, role):
             self.role, self.returncode = role, None
-            self.stdout = SimpleNamespace(fileno=lambda: 42, close=lambda: None) if role == "broker" else None
+            self.stdout = SimpleNamespace(fileno=lambda: 42, close=lambda: None, readline=lambda: b"accepted\n") if role != "node" else None
         def poll(self):
             return self.returncode
         def terminate(self):
@@ -130,7 +130,7 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, mode):
             self.returncode = self.returncode or 0
             return self.returncode
     def spawn(argv, **kw):
-        child = Child("broker" if not children else "node")
+        child = Child(("broker", "launcher", "node")[len(children)])
         children.append(child)
         if child.role == "broker":
             assert kw["env"] == {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
@@ -143,7 +143,7 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, mode):
         if mode == "lost":
             children[0].returncode = 7
         elif mode == "node-exit":
-            children[1].returncode = 9
+            children[2].returncode = 9
         else:
             sig = signal.SIGINT if mode == "interrupt" else signal.SIGTERM
             handlers[sig](sig, None)
@@ -177,9 +177,9 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, mode):
     else:
         result = boot.supervise(["dummy-node"])
         assert result == (0 if mode in {"stop", "interrupt", "kill", "resume"} else 9 if mode == "node-exit" else 1)
-    assert len(children) == (1 if mode in {"missing-ready", "bad-ready", "startup-stop", "early-loss", "ready-timeout"} else 2)
+    assert len(children) == (1 if mode in {"missing-ready", "bad-ready", "startup-stop", "early-loss", "ready-timeout"} else 3)
     assert all(child.returncode is not None for child in children)
-    if len(children) == 2 and mode != "cleanup-failure":
+    if len(children) == 3 and mode != "cleanup-failure":
         assert events.index(("node", "wait")) < events.index(("broker", "wait"))
     if mode == "cleanup-failure":
         assert ("node", "kill") in events and ("broker", "wait") in events

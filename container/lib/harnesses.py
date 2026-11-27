@@ -1410,6 +1410,10 @@ def _wanted_processes(harness: str | None, include_launching: bool) -> set[str]:
         process_names = set().union(*(e["process_names"] for e in HARNESSES.values()))
     else:
         process_names = set(get_harness(harness)["process_names"])
+    if os.environ.get("WOLTSPACE_FEATURE_ISOLATION") == "true":
+        process_names.add("wolt-dummy")
+        if include_launching:
+            process_names.add("wolt-dummy-wait")
     if include_launching:
         process_names |= LAUNCHING_NAMES
     return process_names

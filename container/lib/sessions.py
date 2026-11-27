@@ -2241,7 +2241,7 @@ def start_session(
 
     registry = SessionRegistry()
     with lifecycle.agent_lock(WOLTS_DIR, wolt):
-        _create_and_launch(registry, name, wolt, harness, target, prompt, dict(
+        conversation = _create_and_launch(registry, name, wolt, harness, target, prompt, dict(
             creature=creature or "",
             model=model or "",
             execution_policy=policy,
@@ -2266,6 +2266,8 @@ def start_session(
         "auto_grant": grant.to_record() if grant else None,
         "harness": harness,
     }
+    if conversation:  # a protected launch's conversation id, carried from this start itself
+        result["conversation"] = conversation
     if app:
         result["app"] = app
     if creature:
@@ -2317,14 +2319,15 @@ def _open_launch(name, wolt, attempt, prompt="", *, resume=False):
     return shlex.join([sys.executable, "-I", "-m", "woltspace.protected_launcher", "bridge", name, attempt])
 
 
-def _create_and_launch(registry, name, wolt, harness, target, prompt, fields, track=False) -> None:
+def _create_and_launch(registry, name, wolt, harness, target, prompt, fields, track=False) -> str | None:
     """Create the row, mark the attempt, spawn, publish: under the agent's lock."""
     mode = inbox_mode(registry.wolts_dir)  # before the row: a malformed switch starts nothing
     registry.create(name, wolt=wolt, harness=harness, dir=str(target.canonical_workdir),
                     target=target, prompt=prompt, **fields)
     protected = _protected_launch_enabled()
+    conversation = str(uuid.uuid4()) if protected else None  # issued once, under the lock, for this exact row
     if protected:
-        registry.update(name, wolt=wolt, harness_session_id=str(uuid.uuid4()))
+        registry.update(name, wolt=wolt, harness_session_id=conversation)
     attempt = mark_launching(registry, name, wolt, harness, mode, track or protected)
     with _launch_step(registry, name, wolt, attempt, name, settle=True):
         command = _open_launch(name, wolt, attempt, prompt)
@@ -2336,6 +2339,7 @@ def _create_and_launch(registry, name, wolt, harness, target, prompt, fields, tr
     publish_runtime(registry, name, wolt, attempt, handle.to_record())
     if protected and prompt:
         _tmux_paste(handle, _guard_paste_text(harness, prompt))
+    return conversation
 
 
 def _tmux_exists(where) -> bool | None:

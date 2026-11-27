@@ -376,12 +376,8 @@ def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypa
         monkeypatch.setattr(module, "WOLTS_DIR", lodge.wolts)
     launched = []
     monkeypatch.setattr(app_module, "start_session",
-                        lambda **kwargs: launched.append(kwargs) or {"name": f"{kwargs['wolt']}-session"})
-    import sessions
-    real_get = sessions.SessionRegistry.get
-    monkeypatch.setattr(sessions.SessionRegistry, "get", lambda self, name, **kw: {  # the row start_session made
-        "name": name, "wolt": name.rsplit("-", 1)[0], "harness_session_id": CONV} if name.endswith("-session")
-        else real_get(self, name, **kw))
+                        lambda **kwargs: launched.append(kwargs) or {"name": f"{kwargs['wolt']}-session", "conversation": CONV})
+
 
     async def post(**body):
         transport = httpx.ASGITransport(app=app_module.app)
@@ -413,6 +409,7 @@ def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypa
         (terms["harness"], terms["policy"], True)]
     assert (lodge.wolts / "wolt-a" / protected_create.MARKER).read_text() == f"{RID} {pid}\n"
     assert (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").is_file()
+    import sessions
     status = ordinary(op="create-status", request=RID)  # the exact one launched, and its conversation
     assert (status["first_session"], status["first_conversation"]) == ("wolt-a-session", CONV)
     same = {"name": "wolt-a-session", "wolt": "wolt-a", "harness_session_id": CONV}

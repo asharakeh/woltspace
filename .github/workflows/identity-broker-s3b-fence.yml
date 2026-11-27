@@ -1,0 +1,19 @@
+name: Identity broker Stage 3b fence
+
+on:
+  push:
+    branches: [test/identity-broker-s3b-fence]
+
+permissions:
+  contents: read
+
+jobs:
+  identity-broker-s3b-fence:
+    if: github.event.repository.fork == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: env -i PATH=/usr/local/bin:/usr/bin:/bin bash test/identity-broker-s3b-fence.sh

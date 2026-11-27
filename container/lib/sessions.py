@@ -2334,6 +2334,8 @@ def _create_and_launch(registry, name, wolt, harness, target, prompt, fields, tr
                 _tmux_stop(handle)
             raise RuntimeError("protected session did not start")
     publish_runtime(registry, name, wolt, attempt, handle.to_record())
+    if protected and prompt:
+        _tmux_paste(handle, _guard_paste_text(harness, prompt))
 
 
 def _tmux_exists(where) -> bool | None:

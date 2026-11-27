@@ -92,7 +92,7 @@ def test_actual_core_action_and_executable(tmp_path, capsys):
         child.wait(timeout=3)
         child.stdout.close()
         child.stderr.close()
-        for name in ("admin.sock", dummy_broker.CREATE):
+        for name in ("admin.sock", dummy_broker.CREATE, dummy_broker.LAUNCH):
             (short / name).unlink(missing_ok=True)
         short.rmdir()
     old = tmp_path / "s1"

@@ -9,6 +9,7 @@ trap 'failure_line=$LINENO' ERR
 cleanup() {
     local status=$?
     trap - EXIT
+    trap '' INT TERM
     if [[ -n $root ]] && { ! rm -rf -- "$root" || [[ -e $root ]]; }; then
         printf '::error::broker-smoke phase=cleanup line=%s\n' "$LINENO" >&3
         exit 1

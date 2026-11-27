@@ -141,35 +141,70 @@ class Run:
         return worker
 
     def cleanup(self):
-        # Names are registered before creation. Resolve a missing receipt by
-        # inspecting the exact name and checking its run label before removal.
-        active = set(self.matching("container"))
-        observed = set()
-        for name, ident in self.names.items():
-            info = docker("container", "inspect", name, check=False)
-            if info.returncode:
-                assert ident is None, "recorded container disappeared"
-                continue
-            row = json.loads(info.stdout)[0]
+        handlers = {sig: signal.signal(sig, signal.SIG_IGN)
+                    for sig in (signal.SIGTERM, signal.SIGINT)}
+        errors = 0
+
+        def attempt(action, *args):
+            nonlocal errors
+            try:
+                return action(*args)
+            except Exception:
+                errors += 1
+                return None
+
+        def owned(name, ident):
+            result = docker("container", "inspect", name, check=False)
+            if result.returncode:
+                # Docker's exact-name inventory below distinguishes absence
+                # from an unsuccessful inspect of a still-present container.
+                return None
+            row = json.loads(result.stdout)[0]
             assert row["Config"]["Labels"].get(LABEL) == self.root.name
             assert ident is None or row["Id"] == ident
-            observed.add(row["Id"])
-            self.inventory(row["Id"])
-            docker("rm", "-f", row["Id"])
-        assert all(any(ident.startswith(short) for ident in observed) for short in active)
-        for worker in self.workers:
-            if worker.poll() is None:
-                worker.kill()
-            worker.wait(timeout=5)
-            worker.stdin.close()
-            worker.stdout.close()
-        for kind in ("container", "network", "volume"):
-            assert not self.matching(kind), "owned Docker resource survived"
-        for name in self.names:
-            assert docker("container", "inspect", name, check=False).returncode != 0
-        until(lambda: all(not Path(f"/proc/{pid}").exists() for pid in self.processes))
-        shutil.rmtree(self.root)
-        assert not self.root.exists()
+            return row["Id"]
+
+        def remaining_names():
+            # A successful listing is required even if every inspect failed.
+            names = docker("container", "ls", "-a", "--format", "{{.Names}}").stdout.splitlines()
+            return set(names) & self.names.keys()
+
+        try:
+            for name, ident in self.names.items():
+                confirmed = attempt(owned, name, ident)
+                if confirmed is not None:
+                    attempt(self.inventory, confirmed)
+                    attempt(docker, "rm", "-f", confirmed)
+            for worker in self.workers:
+                if worker.poll() is None:
+                    attempt(worker.kill)
+                attempt(worker.wait, 5)
+                attempt(worker.stdin.close)
+                attempt(worker.stdout.close)
+            attempt(shutil.rmtree, self.root)
+
+            names = attempt(remaining_names)
+            counts = {kind: attempt(self.matching, kind)
+                      for kind in ("container", "network", "volume")}
+            def pids_left():
+                return sum(Path(f"/proc/{pid}").exists() for pid in self.processes)
+
+            attempt(until, lambda: pids_left() == 0)
+            pids = pids_left()
+            drivers = sum(worker.poll() is None for worker in self.workers)
+            roots = int(self.root.exists())
+            unknown = int(names is None) + sum(rows is None for rows in counts.values())
+            containers = max(len(names or ()), len(counts["container"] or ()))
+            networks = len(counts["network"] or ())
+            volumes = len(counts["volume"] or ())
+            if any((errors, unknown, containers, networks, volumes, drivers, pids, roots)):
+                print(f"FAIL cleanup errors={errors} unknown={unknown} containers={containers} "
+                      f"networks={networks} volumes={volumes} drivers={drivers} "
+                      f"pids={pids} roots={roots}", flush=True)
+                raise RuntimeError("owned resource cleanup failed")
+        finally:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
 
 
 def lifecycle(run):
@@ -268,8 +303,10 @@ if __name__ == "__main__":
             exercise(image, files, mode)
     except (Exception, KeyboardInterrupt) as error:
         trace = error.__traceback__
-        while trace.tb_next is not None:
+        line = 1
+        while trace is not None:
+            if trace.tb_frame.f_code.co_filename == __file__:
+                line = trace.tb_lineno
             trace = trace.tb_next
-        line = trace.tb_lineno
         print(f"::error::broker-smoke phase={phase} line={line}", flush=True)
         sys.exit(1)

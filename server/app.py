@@ -1316,7 +1316,8 @@ async def session_new_create(request: Request):
         )
     if not wolt_name:
         return JSONResponse({"detail": "name needs at least one letter"}, status_code=400)
-    if (WOLTS_DIR / wolt_name).exists():
+    import protected_create
+    if (WOLTS_DIR / wolt_name).exists() and not protected_create.enabled():  # protected: the broker decides
         return JSONResponse(
             {"detail": f"a wolt named {wolt_name} already exists"}, status_code=409,
         )
@@ -1356,9 +1357,31 @@ async def session_new_create(request: Request):
     except ValueError as e:
         return JSONResponse({"detail": str(e)}, status_code=400)
 
+    from wolts import create_creature_wolt
+    if protected_create.enabled():
+        # Isolated lodge: a pending request the host owner approves; this side never approves.
+        request_id = body.get("request_id")
+        terms = {"name": wolt_name, "type": wolt_type, "harness": requested_harness, "model": requested_model,
+                 "display": typed_name, "role": "", "description": ""}
+        try:
+            reply = protected_create.create(
+                request_id if isinstance(request_id, str) else "", terms, WOLTS_DIR,
+                lambda linkage: create_creature_wolt(
+                    wolt_name, wolt_type, harness=selected_harness if requested_model else requested_harness,
+                    model=requested_model, display_name=typed_name, linkage=linkage),
+                lambda: start_session(
+                    wolt=wolt_name, harness=selected_harness, workdir=body.get("workdir"),
+                    prompt=platform_skill_invoke(selected_harness, "create-wolt",
+                                                 delivery=wolt_skills_delivery(WOLTS_DIR / wolt_name)),
+                    execution_policy=body.get("execution_policy"), routing={"adapter": "lodge"}))
+        except Exception as e:  # the broker keeps the step reached and the principal for a retry
+            return JSONResponse({"detail": str(e)}, status_code=500)
+        status = {"ok": {"launched": 200, "pending": 202}.get(reply.get("status"), 409),
+                  "unavailable": 503}.get(reply["result"], 409)
+        return JSONResponse(reply, status_code=status)
+
     try:
         # Step 1: Scaffold the wolt with environment-appropriate harness config.
-        from wolts import create_creature_wolt
         # Only an explicit request becomes a durable per-wolt override. An API
         # caller that omits harness keeps following the lodge default later.
         # A chosen model is pinned with its harness: a pin only means something

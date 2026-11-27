@@ -86,9 +86,9 @@ def prepare_policy() -> None:
     if (info.st_uid, info.st_gid) != (SERVICE, SERVICE) or stat.S_IMODE(info.st_mode) != 0o700:
         raise ValueError("unsafe broker policy volume")
     protected(run.parent)
-    run.mkdir(mode=0o700, exist_ok=True)
+    run.mkdir(mode=0o711, exist_ok=True)  # searchable for the ordinary create socket, never listable
     info = run.lstat()
-    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700 or not owned(info):
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o711 or not owned(info):
         raise ValueError("unsafe broker socket directory")
     os.chown(run, SERVICE, SERVICE)
 
@@ -159,6 +159,7 @@ def supervise(node_argv: list[str]) -> int:
                 STORE.parent.rmdir()  # unexpected contents refuse; no recursive deletion
                 if served:  # only the socket directory this start validated
                     dummy_broker.SOCKET.unlink(missing_ok=True)
+                    dummy_broker.SOCKET.with_name(dummy_broker.CREATE).unlink(missing_ok=True)
                     dummy_broker.SOCKET.parent.rmdir()
             except OSError:
                 cleanup_failed = True

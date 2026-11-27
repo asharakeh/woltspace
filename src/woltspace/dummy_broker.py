@@ -11,6 +11,7 @@ Intake stays the serial admin socket: the writer and the lookup are separate, no
 from array import array
 from collections import deque
 from concurrent.futures import Future
+import hashlib
 import json
 import os
 import queue
@@ -28,7 +29,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 POLICY_DIR = Path("/var/lib/woltspace-secrets")
-SOCKET = Path("/run/woltspace-broker/admin.sock")
+SOCKET = Path("/run/woltspace-broker/admin.sock")  # 0600 in a 0711 directory: only the service and root
+CREATE = "create.sock"  # 0666 beside it: the ordinary create route, nothing else
 ACTION, ADMIN_UID, MAX_REQUEST, CAPACITY, PENDING, GROUP = "dummy.ping", 0, 512, 64, 16, 8
 WORKERS, WAITING, PER_WOLT, BINDINGS = 2, 6, 3, 128
 DUMMY_DELAY = 0.5
@@ -37,16 +39,31 @@ FIELDS = {"enroll": ("wolt",), "rename": ("wolt", "to"), "retire": ("wolt",), "r
           "grant": ("wolt", "action"), "revoke": ("wolt", "action"), "run": ("wolt", "action")}
 NAME = re.compile(r"[a-z][a-z0-9-]{0,39}")
 PRINCIPAL = re.compile(r"p-[0-9a-f]{32}")
+# Protected create: the ordinary node may only ask and report; the owner reviews and approves exact terms.
+ORDINARY = {"create-request": ("request", "terms"), "create-status": ("request",), "create-report": ("request", "stage")}
+OWNER = {"review": ("code",), "approve": ("code", "terms"), "reconcile": ("code",), "reject": ("code",)}
+TERMS = ("name", "type", "harness", "model", "display", "role", "description")
+CHECKS = {"request": re.compile(r"[0-9a-f]{32}"), "code": re.compile(r"c-[0-9a-f]{8}"),
+          "stage": re.compile(r"scaffolding|scaffolded|ambiguous|launching|launched|launch-failed"),
+          "terms": re.compile(r"[0-9a-f]{12}")}
+# Each step is claimed once ("-ing"), so concurrent retries never scaffold or launch twice. A claim left
+# by a crash is uncertain: only the owner's reconcile clears it, so a first launch is never silently repeated.
+REPORTS = {"scaffolding": {"approved"}, "scaffolded": {"scaffolding"}, "ambiguous": {"approved", "scaffolding"},
+           "launching": {"scaffolded", "launch-failed"}, "launched": {"launching"}, "launch-failed": {"launching"}}
+RECONCILE = {"ambiguous": "approved", "scaffolding": "approved", "launching": "launch-failed"}
 FILES = {"registry.db": 0o600, "registry.db-journal": 0o600, "action.key": 0o400}
-SCHEMA = """
+TABLES = """
 CREATE TABLE principals (id TEXT PRIMARY KEY, name TEXT UNIQUE, retired INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE resources (id TEXT PRIMARY KEY, type TEXT NOT NULL, name TEXT NOT NULL UNIQUE);
 CREATE TABLE grants (principal TEXT NOT NULL REFERENCES principals, resource TEXT NOT NULL REFERENCES resources,
                      operation TEXT NOT NULL, PRIMARY KEY (principal, resource, operation));
 CREATE TABLE audit (seq INTEGER PRIMARY KEY, caller TEXT NOT NULL, op TEXT NOT NULL, principal TEXT,
                     action TEXT NOT NULL, result TEXT NOT NULL);
-PRAGMA user_version = 1;
 """
+CREATES = """CREATE TABLE creates (request TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                      terms TEXT NOT NULL, status TEXT NOT NULL, principal TEXT REFERENCES principals);
+"""
+SCHEMA = f"{TABLES}{CREATES}PRAGMA user_version = 2;\n"
 
 
 def action(store: Path) -> dict:
@@ -123,7 +140,9 @@ def open_registry(policy_dir: Path) -> sqlite3.Connection:
         if empty and names <= {"registry.db"} and db.execute("PRAGMA user_version").fetchone()[0] == 0:
             db.execute("PRAGMA journal_mode = DELETE")
             db.executescript(f"BEGIN IMMEDIATE; {SCHEMA} COMMIT;")  # first start, or one cut short
-        if db.execute("PRAGMA user_version").fetchone()[0] != 1 or contract(db) != contract(EXPECTED):
+        if db.execute("PRAGMA user_version").fetchone()[0] == 1 and contract(db) == contract(EXPECTED_V1):
+            db.executescript(f"BEGIN IMMEDIATE; {CREATES} PRAGMA user_version = 2; COMMIT;")  # an exact stage 1/2 volume
+        if db.execute("PRAGMA user_version").fetchone()[0] != 2 or contract(db) != contract(EXPECTED):
             raise ValueError("incompatible broker registry")
         if db.execute("SELECT count(*) FROM principals WHERE name IS NOT NULL").fetchone()[0] > CAPACITY:
             raise ValueError("malformed broker registry")
@@ -137,8 +156,9 @@ def contract(db: sqlite3.Connection) -> list:
     return db.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name").fetchall()
 
 
-EXPECTED = sqlite3.connect(":memory:", check_same_thread=False)
+EXPECTED, EXPECTED_V1 = (sqlite3.connect(":memory:", check_same_thread=False) for _ in range(2))
 EXPECTED.executescript(SCHEMA)
+EXPECTED_V1.executescript(TABLES)
 
 
 class Authz:
@@ -270,6 +290,7 @@ def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
     elif op == "retire":
         db.execute("DELETE FROM grants WHERE principal = ?", (pid,))
         db.execute("UPDATE principals SET name = NULL, retired = 1 WHERE id = ?", (pid,))
+        db.execute("UPDATE creates SET status = 'retired' WHERE principal = ?", (pid,))  # the name is free again
         change = lambda authz: authz.drop(op, pid)
     elif rid is None:
         return audit(db, "host-admin", op, pid, label, "not-registered")
@@ -282,6 +303,67 @@ def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
         change = lambda authz: authz.drop(op, pid, wolt, name)  # by id, in order after any queued grant
     reply, _ = audit(db, "host-admin", op, pid, label, "ok")
     return ({**reply, "id": pid} if op == "enroll" else reply), change
+
+
+def lifecycle(db, caller: str, request: dict) -> tuple:
+    """Create reservation states: pending -> approved (one stable ID) -> scaffolded -> launched or launch-failed."""
+    op, column = request["op"], "request" if "request" in request else "code"
+    row = db.execute(f"SELECT request, code, terms, status, principal FROM creates WHERE {column} = ?",
+                     (request[column],)).fetchone()
+
+    def done(result, row=row, change=None, **extra):
+        state = {"status": row[3], "code": row[1], **({"id": row[4]} if row[4] else {})} if row else {}
+        reply, change = audit(db, caller, op, row[4] if row else None, "other", result, change)
+        return ({**reply, **state, **extra} if result == "ok" else reply), change
+
+    if op == "create-request":
+        terms = json.dumps(request["terms"], sort_keys=True)
+        if row:  # a replay returns its recorded state; other terms under the same ID are refused
+            return done("ok") if row[2] == terms else done("conflict")
+        name = request["terms"]["name"]
+        if db.execute("SELECT 1 FROM principals WHERE name = ? UNION SELECT 1 FROM creates WHERE name = ?"
+                      " AND status = 'pending'", (name, name)).fetchone():
+            return done("name-held")
+        row = (request["request"], "c-" + secrets.token_hex(4), terms, "pending", None)
+        db.execute("INSERT INTO creates VALUES (?, ?, ?, ?, ?, ?)", (*row[:2], name, *row[2:]))
+        return done("ok", row)
+    if row is None:
+        return done("unknown-request")
+    if op == "review":
+        return done("ok", terms=json.loads(row[2]), fingerprint=hashlib.sha256(row[2].encode()).hexdigest()[:12])
+    if op == "approve" and row[3] == "pending":
+        name = json.loads(row[2])["name"]
+        if request["terms"] != hashlib.sha256(row[2].encode()).hexdigest()[:12]:
+            return done("terms-changed")  # the owner approves exactly what they reviewed
+        if db.execute("SELECT 1 FROM principals WHERE name = ?", (name,)).fetchone():
+            return done("name-held")
+        if db.execute("SELECT count(*) FROM principals WHERE name IS NOT NULL").fetchone()[0] >= CAPACITY:
+            return done("full")
+        pid = "p-" + secrets.token_hex(16)  # persisted once, before any scaffold
+        db.execute("INSERT INTO principals (id, name) VALUES (?, ?)", (pid, name))
+        db.execute("UPDATE creates SET status = 'approved', principal = ? WHERE request = ?", (pid, row[0]))
+        return done("ok", (*row[:3], "approved", pid), lambda authz: authz.widen({name: pid}))
+    if op in {"create-status", "approve"}:  # an approve replay reports the recorded state
+        return done("ok")
+    target, allowed = {"reconcile": (RECONCILE.get(row[3]), set(RECONCILE)), "reject": ("rejected", {"pending"})}.get(
+        op) or (request["stage"], REPORTS[request["stage"]])  # a rejected request frees its name
+    if row[3] not in allowed:
+        return done("refused")
+    db.execute("UPDATE creates SET status = ? WHERE request = ?", (target, row[0]))
+    return done("ok", (*row[:3], target, row[4]))
+
+
+def call(request: dict, path: Path | None = None) -> dict:
+    """One framed request on the broker socket; the kernel tells the broker who is asking."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(str(path or SOCKET))
+            client.sendall(json.dumps(request).encode() + b"\n")
+            reply = json.loads(client.makefile("rb").readline(2048))
+    except (OSError, ValueError):
+        reply = None
+    return reply if isinstance(reply, dict) else {"result": "unavailable"}
 
 
 class WorkerBinding(NamedTuple):
@@ -582,7 +664,7 @@ class Broker:
         name = ACTION if op in {"register", "grant", "revoke", "run"} and result != "unknown-action" else "other"
         return self.writer.submit(lambda db: audit(db, caller, op, pid, name, result))  # none unaudited
 
-    def answer(self, conn: socket.socket) -> None:
+    def answer(self, conn: socket.socket, route: str = "admin") -> None:
         _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         owner = uid == ADMIN_UID
         caller, request, descriptors = ("host-admin" if owner else "worker"), None, []
@@ -593,7 +675,13 @@ class Broker:
             except (ValueError, RecursionError, TimeoutError):
                 pass  # a silent or slow caller is malformed too
             op = request.get("op") if isinstance(request, dict) else None
-            if not owner:
+            op = op if isinstance(op, str) else None
+            if route == "create":  # any caller, ordinary create steps only; approval stays on the admin route
+                reply = (self.create("worker", request) if op in ORDINARY and not descriptors
+                         else self.record("worker", "other", "denied"))
+            elif op in OWNER and owner and not descriptors:
+                reply = self.create(caller, request)
+            elif not owner:
                 reply = self.record(caller, op if isinstance(op, str) and op in FIELDS else "other", "denied")
             elif op == "attach":
                 reply = self.attach(request, descriptors)
@@ -606,6 +694,20 @@ class Broker:
                 os.close(descriptor)
         conn.sendall(json.dumps(reply).encode() + b"\n")
 
+
+    def create(self, caller: str, request: dict) -> dict:
+        fields = (OWNER if caller == "host-admin" else ORDINARY)[request["op"]]
+
+        def valid(field, value):
+            if field == "terms" and caller == "worker":  # the exact normalized create parameters
+                return (isinstance(value, dict) and value.keys() == set(TERMS) and all(
+                    isinstance(v, str) and len(v) <= 120 and v.isprintable() for v in value.values())
+                    and bool(NAME.fullmatch(value["name"]) and NAME.fullmatch(value["type"])))
+            return isinstance(value, str) and bool(CHECKS[field].fullmatch(value))
+
+        if request.keys() != {"op", *fields} or not all(valid(f, request[f]) for f in fields):
+            return self.record(caller, request["op"], "invalid")
+        return self.writer.submit(lambda db: lifecycle(db, caller, request))
 
     def attach(self, request: dict, descriptors: list[int]) -> dict:
         principal = request.get("principal")
@@ -624,29 +726,36 @@ def _unique(pairs: list) -> dict:
     return dict(pairs)
 
 
-def listen(path: Path = SOCKET) -> socket.socket:
+def listen(path: Path = SOCKET, mode: int = 0o600) -> socket.socket:
     if path.is_socket():
         path.unlink()  # left by an unclean stop; the directory is the service's own
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
+    os.chmod(path, mode)
     server.listen(4)
     return server
 
 
-def admin(argv: list[str], path: Path = SOCKET) -> int:
-    fields = FIELDS.get(argv[0], ()) if argv else ()
+def serve(broker: "Broker", server: socket.socket, route: str = "admin") -> None:
+    while True:
+        try:
+            conn = server.accept()[0]
+        except OSError:
+            return  # a closed listener; the startup owner sees the broker end
+        with conn:
+            try:
+                broker.answer(conn, route)
+            except OSError:
+                pass
+
+
+def admin(argv: list[str], path: Path | None = None) -> int:
+    fields = {**FIELDS, **OWNER}.get(argv[0], ()) if argv else ()
     if not fields or len(argv) != 1 + len(fields):
         print("usage: woltspace secrets enroll|retire WOLT | rename WOLT NEW | register ACTION"
-              " | grant|revoke|run WOLT ACTION", file=sys.stderr)
+              " | grant|revoke|run WOLT ACTION | review|reconcile|reject CODE | approve CODE FINGERPRINT", file=sys.stderr)
         return 2
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(5)
-            client.connect(str(path))
-            client.sendall(json.dumps({"op": argv[0], **dict(zip(fields, argv[1:]))}).encode() + b"\n")
-            reply = json.loads(client.makefile("rb").readline(256))
-    except (OSError, ValueError):
-        reply = {"result": "unavailable"}
+    reply = call({"op": argv[0], **dict(zip(fields, argv[1:]))}, path)
     print(json.dumps(reply))
     return 0 if isinstance(reply, dict) and reply.get("result") == "ok" else 1
 
@@ -658,14 +767,9 @@ if __name__ == "__main__":
     try:
         action(store)
         broker = Broker(policy_dir)
-        server = listen(path)
+        server, ordinary = listen(path), listen(path.with_name(CREATE), 0o666)
         print(json.dumps({"result": "accepted"}), flush=True)
     except (OSError, ValueError):
         sys.exit(1)  # never print the store or exception text
-    while True:
-        conn = server.accept()[0]
-        with conn:
-            try:
-                broker.answer(conn)
-            except OSError:
-                pass
+    threading.Thread(target=serve, args=(broker, ordinary, "create"), daemon=True).start()
+    serve(broker, server)

@@ -10,6 +10,7 @@ Examples:
 """
 
 import argparse
+import json
 import subprocess
 import sys
 import os
@@ -18,6 +19,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 
 from wolts import create_creature_wolt, get_active_creature, is_rodent, SINGLETON_TYPES
+import protected_create
 from sites import ensure_site
 
 
@@ -37,7 +39,15 @@ def main():
     parser.add_argument("type", help="Creature type (rodent, wolf, dog, spider, bear, panda)")
     parser.add_argument("--role", default="", help="Role description")
     parser.add_argument("--description", default="", help="Full description")
+    parser.add_argument("--request", default="", help="Create request ID (32 hex; an isolated lodge only)")
     args = parser.parse_args()
+    if protected_create.enabled():  # the host owner approves; rerun with the same ID once approved
+        terms = {"name": args.name, "type": args.type, "harness": "", "model": "", "display": "",
+                 "role": args.role, "description": args.description}
+        reply = protected_create.create(args.request, terms, None, lambda linkage: create_creature_wolt(
+            args.name, args.type, role=args.role, description=args.description, linkage=linkage))
+        print(json.dumps(reply))
+        sys.exit(0 if reply.get("result") == "ok" and reply["status"] != "ambiguous" else 1)
 
     # Warn about singleton demotion
     if args.type in SINGLETON_TYPES:

@@ -1,0 +1,266 @@
+"""Stage 3a protected create: real broker sockets and registry; only the admin uid is mocked to this test's uid."""
+import asyncio
+import json
+import os
+import runpy
+import sqlite3
+import sys
+import tempfile
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+import protected_create
+import wolts
+from woltspace import dummy_broker as broker
+
+RID, OTHER = "a" * 32, "b" * 32
+TERMS = {"name": "wolt-a", "type": "beaver", "harness": "", "model": "", "display": "Wolt A", "role": "", "description": ""}
+CLI = Path(__file__).parent.parent / "container" / "bin" / "create-creature-wolt"
+
+
+@pytest.fixture
+def lodge(tmp_path, monkeypatch):
+    monkeypatch.setattr(broker, "ADMIN_UID", os.getuid())
+    with tempfile.TemporaryDirectory(prefix="pc-") as run:  # a short Unix socket path
+        store = tmp_path / "policy"
+        store.mkdir(mode=0o700)
+        b = broker.Broker(store)
+        monkeypatch.setattr(broker, "SOCKET", Path(run) / "admin.sock")
+        servers = [broker.listen(broker.SOCKET), broker.listen(broker.SOCKET.with_name(broker.CREATE), 0o666)]
+        for server, route in zip(servers, ("admin", "create")):
+            threading.Thread(target=broker.serve, args=(b, server, route), daemon=True).start()
+        (tmp_path / "wolts").mkdir()
+        yield SimpleNamespace(broker=b, store=store, wolts=tmp_path / "wolts")
+        for server in servers:
+            server.close()
+
+
+def ordinary(**request):
+    return broker.call(request, broker.SOCKET.with_name(broker.CREATE))
+
+
+def owner(**request):
+    return broker.call(request)
+
+
+def request_and_approve(rid=RID, **terms):
+    code = ordinary(op="create-request", request=rid, terms={**TERMS, **terms})["code"]
+    fingerprint = owner(op="review", code=code)["fingerprint"]
+    return owner(op="approve", code=code, terms=fingerprint)
+
+
+def audit(store):
+    with sqlite3.connect(store / "registry.db") as db:
+        return db.execute("SELECT caller, op, principal, action, result FROM audit").fetchall()
+
+
+def test_only_the_host_owner_approves_the_exact_reviewed_terms(lodge, monkeypatch, capsys):
+    first = ordinary(op="create-request", request=RID, terms=TERMS)
+    assert first["result"] == "ok" and first["status"] == "pending" and "id" not in first
+    assert ordinary(op="create-request", request=RID, terms=TERMS) == first  # a replay is the same reservation
+    assert ordinary(op="create-request", request=RID, terms={**TERMS, "model": "other"}) == {"result": "conflict"}
+    held = ordinary(op="create-request", request=OTHER, terms={**TERMS, "name": "wolt-h"})
+    assert ordinary(op="create-request", request=OTHER, terms=TERMS) == {"result": "conflict"}
+    assert ordinary(op="create-request", request="c" * 32, terms=TERMS) == {"result": "name-held"}
+    assert owner(op="reject", code=held["code"])["status"] == "rejected"  # frees wolt-h, refuses the request
+    late = ordinary(op="create-request", request="d" * 32, terms={**TERMS, "name": "wolt-h"})
+    assert late["status"] == "pending" and owner(op="enroll", wolt="wolt-h")["result"] == "ok"  # direct owner enroll
+    review = owner(op="review", code=late["code"])
+    assert owner(op="approve", code=late["code"], terms=review["fingerprint"]) == {"result": "name-held"}
+    for bad in ({**TERMS, "extra": ""}, {**TERMS, "name": "../x"}, {**TERMS, "role": "x\n"}, "wolt-a"):
+        assert ordinary(op="create-request", request="e" * 32, terms=bad) == {"result": "invalid"}
+    code = first["code"]
+    assert ordinary(op="approve", code=code, terms="0" * 12) == {"result": "denied"}  # the create socket never approves
+    monkeypatch.setattr(broker, "ADMIN_UID", os.getuid() + 1)
+    assert owner(op="approve", code=code, terms="0" * 12) == {"result": "denied"}  # nor any other uid on the admin one
+    monkeypatch.setattr(broker, "ADMIN_UID", os.getuid())
+    assert ordinary(op="create-status", request=RID)["status"] == "pending"
+    assert broker.admin(["review", code]) == 0  # the real host client
+    review = json.loads(capsys.readouterr().out)
+    assert review["terms"] == TERMS and review["status"] == "pending"
+    assert owner(op="approve", code=code, terms="0" * 12) == {"result": "terms-changed"}
+    assert broker.admin(["approve", code, review["fingerprint"]]) == 0
+    approved = json.loads(capsys.readouterr().out)
+    assert broker.PRINCIPAL.fullmatch(approved["id"]) and approved["status"] == "approved"
+    assert owner(op="approve", code=code, terms=review["fingerprint"]) == approved  # one durable ID
+    assert ordinary(op="create-status", request=RID) == approved
+    assert owner(op="enroll", wolt="wolt-a")["id"] == approved["id"]
+    assert owner(op="run", wolt="wolt-a", action=broker.ACTION) == {"result": "not-granted"}
+    rows = audit(lodge.store)
+    assert ("host-admin", "approve", approved["id"], "other", "ok") in rows
+    assert ("worker", "other", None, "other", "denied") in rows
+    assert "wolt-a" not in str(rows) and RID not in str(rows) and code not in str(rows)  # ids only
+
+
+def test_partial_scaffold_waits_for_the_owner_and_a_failed_launch_keeps_its_principal(lodge):
+    calls = []
+
+    def scaffold(name, fail=False):
+        def run(linkage):
+            calls.append("scaffold")
+            (lodge.wolts / name / ".state").mkdir(parents=True)
+            (lodge.wolts / name / protected_create.MARKER).write_text(linkage)
+            if fail:
+                raise OSError("interrupted scaffold")
+        return run
+
+    def launch(fail=False):
+        calls.append("launch")
+        if fail:
+            raise RuntimeError("engine did not start")
+        return {"name": "wolt-a-session"}
+
+    def create(rid=RID, terms=TERMS, scaffold_fail=False, launch_fail=False):
+        return protected_create.create(rid, terms, lodge.wolts, scaffold(terms["name"], scaffold_fail),
+                                       lambda: launch(launch_fail))
+
+    assert create()["status"] == "pending" and calls == [] and not any(lodge.wolts.iterdir())  # unapproved
+    pid = request_and_approve()["id"]
+    with pytest.raises(OSError):
+        create(scaffold_fail=True)
+    partial = (lodge.wolts / "wolt-a" / protected_create.MARKER).read_text()
+    assert create()["status"] == "ambiguous"  # even its own marker is not trusted linkage
+    assert (lodge.wolts / "wolt-a" / protected_create.MARKER).read_text() == partial  # untouched
+    code = ordinary(op="create-status", request=RID)["code"]
+    assert owner(op="reconcile", code=code)["status"] == "approved"
+    (lodge.wolts / "wolt-a").rename(lodge.wolts / "owner-checked")  # the owner's own resolution
+    with pytest.raises(RuntimeError):
+        create(launch_fail=True)
+    assert ordinary(op="create-status", request=RID) | {"code": None} == {
+        "result": "ok", "status": "launch-failed", "code": None, "id": pid}
+    assert create() | {"code": None} == {"result": "ok", "status": "launched", "code": None, "id": pid,
+                                          "session": {"name": "wolt-a-session"}}
+    assert create()["status"] == "launched" and calls == ["scaffold", "scaffold", "launch", "launch"]
+    # A folder this request did not start is ambiguous: reported and left for the owner.
+    other = {**TERMS, "name": "wolt-b"}
+    (lodge.wolts / "wolt-b" / ".state").mkdir(parents=True)
+    (lodge.wolts / "wolt-b" / protected_create.MARKER).write_text(f"{OTHER} p-planted\n")
+    code = request_and_approve(OTHER, name="wolt-b")["code"]
+    for _ in range(2):
+        assert create(OTHER, other)["status"] == "ambiguous" and calls[-1] == "launch"
+    assert (lodge.wolts / "wolt-b" / protected_create.MARKER).read_text() == f"{OTHER} p-planted\n"
+    assert ordinary(op="create-report", request=OTHER, stage="scaffolded") == {"result": "refused"}
+    assert owner(op="reconcile", code=code)["status"] == "approved"
+    (lodge.wolts / "wolt-b").rename(lodge.wolts / "owner-kept")
+    assert create(OTHER, other)["status"] == "launched"
+
+
+def test_concurrent_retries_launch_once_and_an_uncertain_launch_waits_for_the_owner(lodge):
+    request_and_approve()
+    entered, release, calls, first = threading.Event(), threading.Event(), [], []
+
+    def scaffold(linkage):
+        calls.append("scaffold")
+        (lodge.wolts / "wolt-a").mkdir()
+
+    def launch():
+        calls.append("launch")
+        entered.set()
+        release.wait(5)
+        return {"name": "session"}
+
+    def create(rid=RID, terms=TERMS):  # the API and the CLI both enter here
+        return protected_create.create(rid, terms, lodge.wolts, scaffold, launch)
+
+    worker = threading.Thread(target=lambda: first.append(create()))
+    worker.start()
+    assert entered.wait(5)
+    assert create()["status"] == "launching" and calls == ["scaffold", "launch"]  # no second launch
+    release.set()
+    worker.join(5)
+    assert first[0]["status"] == "launched" and create()["status"] == "launched" and len(calls) == 2
+    # A caller that died after claiming its first launch leaves it uncertain: nothing relaunches it silently.
+    code = request_and_approve(OTHER, name="wolt-b")["code"]
+    for stage in ("scaffolding", "scaffolded", "launching"):
+        assert ordinary(op="create-report", request=OTHER, stage=stage)["result"] == "ok"
+    other = {**TERMS, "name": "wolt-b"}
+    assert create(OTHER, other)["status"] == "launching" and len(calls) == 2
+    assert ordinary(op="create-report", request=OTHER, stage="launching") == {"result": "refused"}  # nor directly
+    assert owner(op="reconcile", code=code)["status"] == "launch-failed"  # the owner decides
+    assert create(OTHER, other)["status"] == "launched" and calls[-1] == "launch"
+
+
+def test_name_is_held_until_retirement_and_restore_keeps_the_approved_id(lodge):
+    pid = request_and_approve()["id"]
+    snapshot = (lodge.store / "registry.db").read_bytes()  # old media: approved, not yet scaffolded
+    assert [ordinary(op="create-report", request=RID, stage=s)["status"] for s in ("scaffolding", "scaffolded")] == [
+        "scaffolding", "scaffolded"]
+    assert owner(op="rename", wolt="wolt-a", to="wolt-r") == {"result": "ok"}
+    assert owner(op="enroll", wolt="wolt-r")["id"] == pid  # rename keeps the stable ID
+    assert ordinary(op="create-request", request=OTHER, terms={**TERMS, "name": "wolt-r"}) == {"result": "name-held"}
+    assert owner(op="register", action=broker.ACTION) == {"result": "ok"}
+    assert [owner(op=o, wolt="wolt-r", action=broker.ACTION)["result"] for o in ("grant", "run")] == ["ok"] * 2
+    assert owner(op="retire", wolt="wolt-r") == {"result": "ok"}
+    assert ordinary(op="create-status", request=RID)["status"] == "retired"
+    again = request_and_approve(OTHER, name="wolt-r")
+    assert again["result"] == "ok" and again["id"] != pid  # a recreated name is a new principal ...
+    assert owner(op="run", wolt="wolt-r", action=broker.ACTION) == {"result": "not-granted"}  # ... with no grant
+    (lodge.store / "registry.db").write_bytes(snapshot)
+    restored = broker.Broker(lodge.store)
+    status = restored.create("worker", {"op": "create-status", "request": RID})
+    assert (status["status"], status["id"]) == ("approved", pid)
+    assert restored.create("worker", {"op": "create-request", "request": OTHER, "terms": {
+        **TERMS, "name": "wolt-r"}})["status"] == "pending"  # the old media never knew the recreate
+
+
+def test_an_exact_stage_two_registry_migrates_once_and_keeps_its_rows(tmp_path):
+    v1_store = tmp_path / "policy"
+    v1_store.mkdir(mode=0o700)
+    with sqlite3.connect(v1_store / "registry.db") as conn:
+        conn.executescript(f"{broker.TABLES} PRAGMA user_version = 1;"
+                           " INSERT INTO principals (id, name) VALUES ('p-" + "1" * 32 + "', 'wolt-a');")
+    (v1_store / "registry.db").chmod(0o600)
+    b = broker.Broker(v1_store)
+    with sqlite3.connect(v1_store / "registry.db") as db:
+        assert db.execute("PRAGMA user_version").fetchone() == (2,)
+        assert db.execute("SELECT id, name FROM principals").fetchall() == [("p-" + "1" * 32, "wolt-a")]
+    assert b.create("worker", {"op": "create-request", "request": RID, "terms": TERMS}) == {"result": "name-held"}
+    broker.Broker(v1_store)  # an ordinary restart of the migrated file
+
+
+def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypatch, capsys):
+    from server import app as app_module
+
+    for module in (app_module, wolts):
+        monkeypatch.setattr(module, "WOLTS_DIR", lodge.wolts)
+    monkeypatch.setattr(app_module, "start_session", lambda **kwargs: {"name": f"{kwargs['wolt']}-session"})
+
+    async def post(**body):
+        transport = httpx.ASGITransport(app=app_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost:7777") as client:
+            return await client.post("/sessions/new/create", json={"name": "wolt-a", "type": "beaver", **body})
+
+    monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
+    with pytest.raises(PermissionError):
+        wolts.create_creature_wolt("wolt-z", "beaver")  # no direct scaffold while isolation is on
+    assert asyncio.run(post()).status_code == 409  # no request ID: refused, nothing reserved
+    pending = asyncio.run(post(request_id=RID))
+    assert pending.status_code == 202 and pending.json()["status"] == "pending" and not any(lodge.wolts.iterdir())
+    fingerprint = owner(op="review", code=pending.json()["code"])["fingerprint"]
+    pid = owner(op="approve", code=pending.json()["code"], terms=fingerprint)["id"]
+    done = asyncio.run(post(request_id=RID))
+    assert done.status_code == 200 and done.json()["session"] == {"name": "wolt-a-session"}
+    assert (lodge.wolts / "wolt-a" / protected_create.MARKER).read_text() == f"{RID} {pid}\n"
+    assert (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").is_file()
+    assert asyncio.run(post(request_id=RID)).json()["status"] == "launched"  # a replay starts nothing new
+
+    def cli(*argv):
+        monkeypatch.setattr(sys, "argv", [str(CLI), *argv])
+        with pytest.raises(SystemExit) as exit_code:
+            runpy.run_path(str(CLI), run_name="__main__")
+        return exit_code.value.code, json.loads(capsys.readouterr().out)
+
+    assert cli("wolt-c", "otter", "--request", OTHER)[1]["status"] == "pending"
+    fingerprint = owner(op="review", code=ordinary(op="create-status", request=OTHER)["code"])["fingerprint"]
+    owner(op="approve", code=ordinary(op="create-status", request=OTHER)["code"], terms=fingerprint)
+    first = cli("wolt-c", "otter", "--request", OTHER)
+    assert first[0] == 0 and first[1]["status"] == "scaffolded"  # the first launch stays separate
+    assert cli("wolt-c", "otter", "--request", OTHER) == first and (lodge.wolts / "wolt-c" / "wolt").is_dir()
+    assert cli("wolt-c", "otter", "--role", "x", "--request", OTHER) == (1, {"result": "conflict"})
+    monkeypatch.delenv("WOLTSPACE_FEATURE_ISOLATION")  # flag off: the ordinary path, no broker and no marker
+    assert asyncio.run(post(name="wolt-d")).status_code == 200
+    assert not (lodge.wolts / "wolt-d" / protected_create.MARKER).exists()

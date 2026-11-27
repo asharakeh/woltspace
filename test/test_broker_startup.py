@@ -81,6 +81,10 @@ def test_actual_core_action_and_executable(tmp_path, capsys):
         assert json.loads(child.stdout.readline()) == {"result": "accepted"}
         assert dummy_broker.admin(["enroll", "wolt-a"], short / "admin.sock") == 1  # this caller is not uid 0
         assert capsys.readouterr().out == '{"result": "denied"}\n'
+        assert {p.name: oct(p.stat().st_mode & 0o777) for p in short.iterdir()} == {
+            "admin.sock": "0o600", dummy_broker.CREATE: "0o666"}  # only the create route is open to node
+        status = {"op": "create-status", "request": "a" * 32}
+        assert dummy_broker.call(status, short / dummy_broker.CREATE) == {"result": "unknown-request"}
         assert sorted(p.name for p in policy.iterdir()) == ["action.key", "registry.db"]
         assert oct(policy.joinpath("registry.db").stat().st_mode & 0o777) == "0o600"
     finally:
@@ -88,7 +92,8 @@ def test_actual_core_action_and_executable(tmp_path, capsys):
         child.wait(timeout=3)
         child.stdout.close()
         child.stderr.close()
-        (short / "admin.sock").unlink(missing_ok=True)
+        for name in ("admin.sock", dummy_broker.CREATE):
+            (short / name).unlink(missing_ok=True)
         short.rmdir()
     old = tmp_path / "s1"
     old.mkdir(mode=0o700)

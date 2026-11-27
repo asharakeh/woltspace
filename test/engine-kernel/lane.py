@@ -113,6 +113,17 @@ def stop(state, lane):
     print(f"stopped tree={len(first)} term_survivors={len(survivors)}", flush=True)
 
 
+def publish(control, record, generation):
+    """Complete snapshot to a same-directory temp file, then atomic replace: readers and recovery
+    only ever see the previous or the new full record."""
+    temporary = control.with_name(f".{control.name}.{generation}.tmp")
+    with open(temporary, "w") as stream:
+        stream.write(json.dumps(record))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, control)
+
+
 def spawn(argv, env, stdin, stdout, own, port, reads, keep=()):
     import fence
     pid = os.fork()
@@ -156,7 +167,7 @@ def drive(fixture, state, lane):
         f'name = "Local fixture"\nbase_url = "http://127.0.0.1:{port}"\nwire_api = "responses"\n'
         f'request_max_retries = 0\nstream_max_retries = 0\n[analytics]\nenabled = false\n')
     control = state / "ctl" / f"{lane}.json"
-    control.write_text(json.dumps({"port": port, "pid": os.getpid()}))
+    publish(control, {"port": port, "pid": os.getpid()}, 0)
     try:
         abi = fence.abi()
     except OSError as error:
@@ -202,11 +213,11 @@ def drive(fixture, state, lane):
             os.close(fd)
         inherited.close()
         record["start"] = born(launcher)
-        control.write_text(json.dumps(record))  # published while the launcher is still gated
+        publish(control, record, 1)  # published while the launcher is still gated
         os.write(gate[1], b"1")
         assert select.select([report[0]], [], [], 10)[0], "launch report"
         record["members"] = [[int(pid), born(int(pid))] for pid in os.read(report[0], 64).split()]
-        control.write_text(json.dumps(record))
+        publish(control, record, 2)
         channel.sendall(token.encode())
         assert select.select([probe_out[0]], [], [], 20)[0], "probe deadline"
         with os.fdopen(probe_out[0]) as stream:
@@ -214,7 +225,7 @@ def drive(fixture, state, lane):
         descendant = [result["descendant_pid"], result["descendant_start"]]
         assert born(descendant[0]) == descendant[1], "descendant identity"
         record["members"].append(descendant)
-        control.write_text(json.dumps(record))
+        publish(control, record, 3)
         mismatch = sorted(key for key, value in PROBE.items()
                           if result.get(key) != value or result["descendant"].get(key) != value)
         own_ok = all(result[key] == "ok" for key in ("own_state", "own_tcp", "inherited_channel"))

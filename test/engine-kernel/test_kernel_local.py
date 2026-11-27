@@ -82,28 +82,33 @@ def test_two_fenced_stock_lanes(tmp_path):
     assert escaped == []
 
 
-def test_driver_death_before_publication_starts_nothing(tmp_path):
+@pytest.mark.parametrize("generation", [1, 2])
+def test_driver_death_mid_publication_keeps_exact_cleanup(tmp_path, generation):
+    """1: dies publishing the launcher (gate shut, nothing may start). 2: dies publishing the
+    members after the gate opened; the last complete snapshot must still reclaim everything."""
     lanes = lanes_for(tmp_path)
     for name in ("a", "ctl", "lodge"):
         (lanes.host_state / name).mkdir()
+    control = lanes.host_state / "ctl" / "a.json"
     (lanes.host_state / "ctl" / "b.json").write_text(json.dumps({"port": 9, "pid": os.getpid()}))
+    os.mkfifo(control.with_name(f".a.json.{generation}.tmp"))  # that snapshot write blocks: no reader
     with adopted() as escaped:
         try:
             worker = lanes.driver("a")
             assert worker.stdout.readline().startswith("prepared abi=")
-            record = lanes.host_state / "ctl" / "a.json"
-            record.unlink()
-            os.mkfifo(record)  # the launcher record write now blocks: no reader
             zero = kernel_host.zero
             zero.tell(worker, "go")
             zero.until(lambda: Path(f"/proc/{worker.pid}/syscall").read_text().startswith("257 "))
             worker.kill()  # driver dies mid-publication, its teardown never runs
             worker.wait(timeout=5)
+            record = json.loads(control.read_text())  # the previous snapshot, complete
+            assert ("start" in record) == (generation == 2) and record.get("members", []) == []
         finally:
             end(lanes)
     assert escaped == []
-    assert not (lanes.host_state / "a" / "probe").exists()
-    assert not list((lanes.host_state / "a").rglob("*.jsonl"))
+    if generation == 1:  # the gate never opened: no engine or probe ever ran
+        assert not (lanes.host_state / "a" / "probe").exists()
+        assert not list((lanes.host_state / "a").rglob("*.jsonl"))
 
 
 def test_stale_record_signals_nothing():

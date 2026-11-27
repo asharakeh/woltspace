@@ -2650,13 +2650,15 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
     if not _await_agent(handle, harness):
         if protected:
             _launch_control("launch-cancel", name, attempt)
+            if resolve_agent_handle(handle, harness, include_launching=False) is None:
+                raise ResumeFailed("protected session startup could not be confirmed in its new tmux session")
         # run-session.sh may have exited before an agent appeared: a prepare
         # failure, a missing harness binary, an auth wall. Reporting
         # "respawned" here is what let the TUI attach to an empty shell and
         # call it a wake. But the wait running out is also just evidence about
         # our patience — the boot path is three python subprocesses deep before
         # the agent execs — so look once more, session-wide, before saying no.
-        if session_has_agent_process(_session_scope(handle), harness) is True:
+        elif session_has_agent_process(_session_scope(handle), harness) is True:
             return {"name": name, "url": session_url, "status": "respawned",
                     "detail": f"{respawn_detail}; the agent surfaced just past the wait"}
         # Still nothing. Report the failure, but do NOT stamp the record:
@@ -2664,12 +2666,13 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
         # "running"), so a slow-but-healthy agent stamped here would stay
         # hidden from the TUI forever with a live conversation inside it.
         # Left "running", list() tells the truth from the process table.
-        raise ResumeFailed(
-            f"session '{name}': respawned its tmux with --resume but no "
-            f"{harness} process appeared within {_AGENT_APPEAR_TIMEOUT:.0f}s — "
-            f"the launcher died on arrival. Run "
-            f"`session-reg prepare {name} resume` to see why"
-        )
+        else:
+            raise ResumeFailed(
+                f"session '{name}': respawned its tmux with --resume but no "
+                f"{harness} process appeared within {_AGENT_APPEAR_TIMEOUT:.0f}s — "
+                f"the launcher died on arrival. Run "
+                f"`session-reg prepare {name} resume` to see why"
+            )
     if protected and prompt:
         _tmux_paste(handle, _guard_paste_text(harness, prompt))
     return {"name": name, "url": session_url, "status": "respawned",

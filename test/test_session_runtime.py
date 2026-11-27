@@ -719,3 +719,40 @@ def test_protected_start_cancels_and_settles_definite_launch_failure(tmp_path, m
     stored = sessions.SessionRegistry(tmp_path).get("alpha-protected", wolt="alpha", check_alive=False)
     assert stored["status"] == "stopped" and stored["stop_reason"] == "launch_failed"
     assert "launching" not in stored
+
+
+@pytest.mark.parametrize("saved_pane", [False, True])
+def test_protected_resume_timeout_cancels_without_settling_uncertain_launch(tmp_path, monkeypatch, saved_pane):
+    import sessions
+
+    wolt = tmp_path / "alpha" / "wolt"
+    wolt.mkdir(parents=True)
+    monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
+    monkeypatch.setattr(sessions, "WOLTS_DIR", tmp_path)
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda *_: saved_pane)
+    monkeypatch.setattr(sessions, "resolve_agent_handle", lambda *_, **__: None)
+    monkeypatch.setattr(sessions, "_runtime", lambda: SimpleNamespace(handle_is_alive=lambda _: True))
+    monkeypatch.setattr(sessions, "_tmux_paste", lambda *_: None)
+    monkeypatch.setattr(sessions, "_tmux_spawn", lambda name, *_: RuntimeHandle(name, name, "%2"))
+    monkeypatch.setattr(sessions, "_await_agent", lambda *_: False)
+    monkeypatch.setattr(sessions, "_schedule_pickup", lambda *_: None)
+    monkeypatch.setattr(sessions, "_tmux_stop", lambda *_: pytest.fail("uncertain launch was stopped"))
+    effects = []
+
+    def control(operation, name, attempt, **kwargs):
+        effects.append((operation, name, attempt))
+        return {"result": "ok"}
+
+    monkeypatch.setattr(sessions, "_launch_control", control)
+    registry = sessions.SessionRegistry(tmp_path)
+    registry.create("alpha-protected", wolt="alpha", harness="claude", dir=str(wolt.parent))
+    registry.update("alpha-protected", wolt="alpha", harness_session_id=str(uuid.uuid4()),
+                    runtime=RuntimeHandle("alpha-protected", "alpha-protected", "%1").to_record())
+
+    with pytest.raises(sessions.ResumeFailed, match="could not be confirmed"):
+        sessions.resume_session("alpha-protected")
+    opened, cancelled = effects
+    assert opened[0] == "launch-open" and cancelled == ("launch-cancel", *opened[1:])
+    stored = registry.get("alpha-protected", wolt="alpha", check_alive=False)
+    assert stored["status"] == "running" and stored["attempt"] == opened[2]
+    assert stored["runtime"]["pane_id"] == ("%1" if saved_pane else "%2")

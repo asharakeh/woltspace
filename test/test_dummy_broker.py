@@ -655,3 +655,55 @@ def test_attached_worker_eof_denies_queued_request(store, owner, monkeypatch):
     assert first.result(5) == "ok"
     until(lambda: "a" not in b.authz.bindings)
     assert rows(store, "SELECT result FROM audit WHERE op = 'dispatch' ORDER BY seq") == [("ok",), ("denied",)]
+
+
+@pytest.mark.parametrize("side", ["connecting", "accepted"])
+def test_attach_refuses_either_side_of_named_seqpacket(store, owner, side):
+    b = broker.Broker(store)
+    principal = enrolled(b, "alpha")
+    with tempfile.TemporaryDirectory(prefix="named-") as root:
+        path = str(Path(root) / "listener")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+            listener.bind(path)
+            listener.listen()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as peer:
+                peer.connect(path)
+                accepted, _ = listener.accept()
+                with accepted:
+                    channel = peer if side == "connecting" else accepted
+                    assert attach_channel(b, principal, "private-session", channel) == "invalid"
+    assert not b.authz.bindings
+    assert rows(store, "SELECT caller, op, principal, action, result FROM audit WHERE op = 'attach'") == [
+        ("host-admin", "attach", principal, "other", "invalid"),
+    ]
+
+
+def test_attach_audit_failure_keeps_previous_binding_and_denies_new_channel(store, owner, monkeypatch):
+    b = broker.Broker(store)
+    principal = enrolled(b, "alpha")
+    assert op(b, "register") == "ok" and op(b, "grant", "alpha") == "ok"
+    original, worker = socket.socketpair(type=socket.SOCK_SEQPACKET)
+    with original, worker:
+        worker.settimeout(5)
+        assert attach_channel(b, principal, "private-session", original) == "ok"
+        original.close()
+        hello = json.loads(worker.recv(256))
+        audit = broker.audit
+
+        def fail_attach(db, caller, operation, *args):
+            if operation == "attach":
+                raise sqlite3.OperationalError("injected attach audit failure")
+            return audit(db, caller, operation, *args)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(broker, "audit", fail_attach)
+            endpoint, replacement = socket.socketpair(type=socket.SOCK_SEQPACKET)
+            with endpoint, replacement:
+                replacement.settimeout(5)
+                assert attach_channel(b, principal, "private-session", endpoint) == "storage-error"
+                endpoint.close()
+                assert replacement.recv(256) == b""
+            assert packet(worker, hello) == "ok"
+        assert rows(store, "SELECT caller, op, principal, action, result FROM audit WHERE op = 'attach'") == [
+            ("host-admin", "attach", principal, "other", "ok"),
+        ]

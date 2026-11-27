@@ -303,16 +303,21 @@ class Dispatcher:
     def bind(self, principal: str, session: str) -> WorkerBinding | None:
         """Called only by the trusted launcher, with the enrolled stable ID."""
         with self.ready:
-            current = self.authz.bindings.get(session)
-            if principal not in self.authz.names.values():
-                return None
-            if current is None and len(self.authz.bindings) >= BINDINGS:
-                return None
-            if current is not None and current.principal != principal:
-                return None
-            binding = WorkerBinding(principal, session, secrets.token_hex(16))
-            self.authz.bindings[session] = binding
+            binding = self.prepare_binding(principal, session)
+            if binding is not None:
+                self.authz.bindings[session] = binding
             return binding
+
+    def prepare_binding(self, principal: str, session: str) -> WorkerBinding | None:
+        """Validate under the authorization lock without publishing a replacement."""
+        current = self.authz.bindings.get(session)
+        if principal not in self.authz.names.values():
+            return None
+        if current is None and len(self.authz.bindings) >= BINDINGS:
+            return None
+        if current is not None and current.principal != principal:
+            return None
+        return WorkerBinding(principal, session, secrets.token_hex(16))
 
     def end(self, binding: WorkerBinding) -> None:
         with self.ready:
@@ -404,9 +409,16 @@ class WorkerChannels:
         # Reserve replacement capacity while previously admitted calls finish.
         self.readers = threading.BoundedSemaphore(BINDINGS + WORKERS)
 
+    def decision(self, principal: str | None, result: str, change=None) -> dict:
+        def record(db):
+            stored = db.execute("SELECT id FROM principals WHERE id = ?", (principal,)).fetchone()
+            return audit(db, "host-admin", "attach", stored[0] if stored else None, "other", result, change)
+
+        return self.dispatch.writer.submit(record)
+
     def attach(self, principal: str, session: str, descriptor: int) -> dict:
         if not self.readers.acquire(blocking=False):
-            return {"result": "busy"}
+            return self.decision(principal, "busy")
         channel = None
         handed_off = False
         duplicate = None
@@ -416,34 +428,52 @@ class WorkerChannels:
             duplicate = None
             if (channel.family != socket.AF_UNIX or channel.type != socket.SOCK_SEQPACKET
                     or channel.getsockname() or channel.getpeername()):
-                return {"result": "invalid"}
+                return self.decision(principal, "invalid")
             channel.setblocking(True)
             inode = os.fstat(channel.fileno()).st_ino
             with self.lock:
                 if inode in self.inodes:
-                    return {"result": "invalid"}
-                binding = self.dispatch.bind(principal, session)
+                    return self.decision(principal, "invalid")
+                with self.dispatch.ready:
+                    binding = self.dispatch.prepare_binding(principal, session)
                 if binding is None:
-                    return {"result": "denied"}
-                previous = self.channels.get(session)
-                self.channels[session] = channel
-                if previous is not None:
-                    try:
-                        previous.shutdown(socket.SHUT_RDWR)
-                    except OSError:  # the old worker may already have closed its end
-                        pass
-                reader = threading.Thread(target=self._serve, args=(channel, binding, inode), daemon=True)
+                    return self.decision(principal, "denied")
+
+                # Reserve the reader before writing the success audit. A reader
+                # cannot send a hello until the durable decision is published.
+                gate = threading.Event()
+
+                def serve_if_committed():
+                    gate.wait()
+                    if handed_off:
+                        self._serve(channel, binding, inode)
+
+                reader = threading.Thread(target=serve_if_committed, daemon=True)
                 try:
                     reader.start()
                 except RuntimeError:
-                    del self.channels[session]
-                    self.dispatch.end(binding)
-                    return {"result": "busy"}
-                self.inodes.add(inode)
-                handed_off = True  # the reader owns it
-            return {"result": "ok"}
+                    return self.decision(principal, "busy")
+                try:
+                    def publish(authz):
+                        authz.bindings[session] = binding
+
+                    reply = self.decision(principal, "ok", publish)
+                    if reply != {"result": "ok"}:
+                        return reply
+                    previous = self.channels.get(session)
+                    self.channels[session] = channel
+                    self.inodes.add(inode)
+                    handed_off = True
+                    if previous is not None:
+                        try:
+                            previous.shutdown(socket.SHUT_RDWR)
+                        except OSError:  # the old worker may already have closed its end
+                            pass
+                    return reply
+                finally:
+                    gate.set()
         except OSError:
-            return {"result": "invalid"}
+            return self.decision(principal, "invalid")
         finally:
             if not handed_off:
                 if channel is not None:
@@ -503,7 +533,7 @@ def _receive_admin(conn: socket.socket, owner: bool, descriptors: list[int]):
                     delivered = array("i")
                     delivered.frombytes(data[:len(data) - len(data) % word])
                     descriptors.extend(delivered)
-            if flags & socket.MSG_CTRUNC or len(descriptors) > 1:
+            if flags & socket.MSG_CTRUNC or (len(descriptors) > 1 and b"\n" not in chunk):
                 return None
         else:
             chunk = conn.recv(MAX_REQUEST + 1)
@@ -578,12 +608,13 @@ class Broker:
 
 
     def attach(self, request: dict, descriptors: list[int]) -> dict:
-        if request.keys() != {"op", "principal", "session"} or len(descriptors) != 1:
-            return {"result": "invalid"}
-        principal, session = request["principal"], request["session"]
-        if not (isinstance(principal, str) and PRINCIPAL.fullmatch(principal)
-                and isinstance(session, str) and NAME.fullmatch(session)):
-            return {"result": "invalid"}
+        principal = request.get("principal")
+        if not isinstance(principal, str) or not PRINCIPAL.fullmatch(principal):
+            principal = None
+        session = request.get("session")
+        if (request.keys() != {"op", "principal", "session"} or len(descriptors) != 1
+                or principal is None or not isinstance(session, str) or not NAME.fullmatch(session)):
+            return self.worker_channels.decision(principal, "invalid")
         return self.worker_channels.attach(principal, session, descriptors[0])
 
 

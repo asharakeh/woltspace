@@ -51,7 +51,8 @@ OWNER = {"review": ("code",), "approve": ("code", "terms"), "reconcile": ("code"
 TERMS = ("name", "type", "harness", "model", "display", "policy", "role", "description")
 CHECKS = {"request": re.compile(r"[0-9a-f]{32}"), "code": re.compile(r"c-[0-9a-f]{8}"),
           "stage": re.compile(r"scaffolding|scaffolded|ambiguous|launching|launched|launch-failed"),
-          "terms": re.compile(r"[0-9a-f]{12}"), "session": SESSION}
+          "terms": re.compile(r"[0-9a-f]{12}"), "session": SESSION,
+          "conversation": re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")}
 # Each step is claimed once ("-ing"), so concurrent retries never scaffold or launch twice. A claim left
 # by a crash is uncertain: only the owner's reconcile clears it, so a first launch is never silently repeated.
 REPORTS = {"scaffolding": {"approved"}, "scaffolded": {"scaffolding"}, "ambiguous": {"approved", "scaffolding"},
@@ -71,7 +72,7 @@ CREATES = """CREATE TABLE creates (request TEXT PRIMARY KEY, code TEXT NOT NULL 
 """
 # v3: the exact first session a successful create launched, recorded with its "launched" transition. The column
 # is added the same way on a fresh and on a migrated volume, so their schemas compare equal.
-SESSION_COLUMN = "ALTER TABLE creates ADD COLUMN session TEXT;"
+SESSION_COLUMN = "ALTER TABLE creates ADD COLUMN session TEXT; ALTER TABLE creates ADD COLUMN conversation TEXT;"
 SCHEMA = f"{TABLES}{CREATES}{SESSION_COLUMN}PRAGMA user_version = 3;\n"
 
 
@@ -323,12 +324,12 @@ def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
 def lifecycle(db, caller: str, request: dict, denials=None) -> tuple:
     """Create reservation states: pending -> approved (one stable ID) -> scaffolded -> launched or launch-failed."""
     op, column = request["op"], "request" if "request" in request else "code"
-    row = db.execute(f"SELECT request, code, terms, status, principal, session FROM creates WHERE {column} = ?",
+    row = db.execute(f"SELECT request, code, terms, status, principal, session, conversation FROM creates WHERE {column} = ?",
                      (request[column],)).fetchone()
 
     def done(result, row=row, change=None, **extra):
         state = {"status": row[3], "code": row[1], **({"id": row[4]} if row[4] else {}),
-                 **({"first_session": row[5]} if row[5] else {})} if row else {}
+                 **({"first_session": row[5], "first_conversation": row[6]} if row[5] else {})} if row else {}
         logged = denials.admit(caller, op, result) if denials else result  # refusals stay bounded
         if logged is None:
             return {"result": result}, None
@@ -343,7 +344,7 @@ def lifecycle(db, caller: str, request: dict, denials=None) -> tuple:
         if db.execute("SELECT 1 FROM principals WHERE name = ? UNION SELECT 1 FROM creates WHERE name = ?"
                       " AND status = 'pending'", (name, name)).fetchone():
             return done("name-held")
-        row = (request["request"], "c-" + secrets.token_hex(4), terms, "pending", None, None)
+        row = (request["request"], "c-" + secrets.token_hex(4), terms, "pending", None, None, None)
         db.execute("INSERT INTO creates (request, code, name, terms, status, principal) VALUES (?, ?, ?, ?, ?, ?)",
                    (*row[:2], name, *row[2:5]))
         return done("ok", row)
@@ -362,18 +363,20 @@ def lifecycle(db, caller: str, request: dict, denials=None) -> tuple:
         pid = "p-" + secrets.token_hex(16)  # persisted once, before any scaffold
         db.execute("INSERT INTO principals (id, name) VALUES (?, ?)", (pid, name))
         db.execute("UPDATE creates SET status = 'approved', principal = ? WHERE request = ?", (pid, row[0]))
-        return done("ok", (*row[:3], "approved", pid, None), lambda authz: authz.widen({name: pid}))
+        return done("ok", (*row[:3], "approved", pid, None, None), lambda authz: authz.widen({name: pid}))
     if op in {"create-status", "approve"}:  # an approve replay reports the recorded state
         return done("ok")
     target, allowed = {"reconcile": (RECONCILE.get(row[3]), set(RECONCILE)), "reject": ("rejected", {"pending"})}.get(
         op) or (request["stage"], REPORTS[request["stage"]])  # a rejected request frees its name
     if row[3] not in allowed:
         return done("refused")
-    session = request.get("session") if target == "launched" else row[5]
-    if target == "launched" and not session:
-        return done("refused")  # a successful first launch is recorded with its exact session
-    db.execute("UPDATE creates SET status = ?, session = ? WHERE request = ?", (target, session, row[0]))
-    return done("ok", (*row[:3], target, row[4], session))
+    session, conversation = ((request.get("session"), request.get("conversation")) if target == "launched"
+                             else row[5:7])
+    if target == "launched" and not (session and conversation):
+        return done("refused")  # a successful first launch is recorded with its exact session and conversation
+    db.execute("UPDATE creates SET status = ?, session = ?, conversation = ? WHERE request = ?",
+               (target, session, conversation, row[0]))
+    return done("ok", (*row[:3], target, row[4], session, conversation))
 
 
 def call(request: dict, path: Path | None = None) -> dict:
@@ -876,8 +879,8 @@ class Broker:
                     and bool(NAME.fullmatch(value["name"]) and NAME.fullmatch(value["type"])))
             return isinstance(value, str) and bool(CHECKS[field].fullmatch(value))
 
-        if request["op"] == "create-report" and "session" in request:  # the launched first session
-            fields = (*fields, "session")
+        if request["op"] == "create-report" and "session" in request:  # the launched first session and its
+            fields = (*fields, "session", "conversation")  # immutable conversation id (a name can be reused)
         if request.keys() != {"op", *fields} or not all(valid(f, request[f]) for f in fields):
             return self.record(caller, request["op"], "invalid")
         return self.writer.submit(lambda db: lifecycle(db, caller, request, self.denials))

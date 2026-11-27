@@ -1281,6 +1281,14 @@ async def wolt_message(name: str, request: Request):
 # All session creation goes through start_session() from container/lib/sessions.py.
 # Each adapter (lodge, telegram) has its own route for adapter-specific params.
 
+def _with_conversation(started: dict) -> dict:
+    """A protected first launch's immutable conversation id, from the row it just created: with its name it
+    identifies this exact session even if the name is later reused."""
+    from sessions import SessionRegistry
+    row = SessionRegistry(WOLTS_DIR).get(started["name"], check_alive=False) or {}
+    return {**started, "conversation": row.get("harness_session_id") or ""}
+
+
 @app.post("/sessions/new/create")
 async def session_new_create(request: Request):
     """Create a new wolt and start its first session.
@@ -1373,18 +1381,19 @@ async def session_new_create(request: Request):
                 lambda linkage: create_creature_wolt(
                     wolt_name, wolt_type, harness=selected_harness, model=requested_model,
                     display_name=typed_name, linkage=linkage),  # the approved engine is pinned
-                lambda: start_session(
+                lambda: _with_conversation(start_session(
                     wolt=wolt_name, harness=selected_harness, execution_policy=level, track_attempt=True,
                     prompt=platform_skill_invoke(selected_harness, "create-wolt",
                                                  delivery=wolt_skills_delivery(WOLTS_DIR / wolt_name)),
-                    routing={"adapter": "lodge"}))
+                    routing={"adapter": "lodge"})))
         except Exception as e:  # the broker keeps the step reached and the principal for a retry
             return JSONResponse({"detail": str(e)}, status_code=500)
         if reply.get("status") == "launched" and "session" not in reply:  # a rejoin: the exact first session
             from sessions import SessionRegistry
             first = reply.get("first_session")  # recorded by the broker with the launched transition
             row = SessionRegistry(WOLTS_DIR).get(first, check_alive=False) if first else None  # read only
-            if row is None or row.get("wolt") != wolt_name:  # gone, or an old record without the link
+            if (row is None or row.get("wolt") != wolt_name  # gone, or an old record without the link,
+                    or row.get("harness_session_id") != reply.get("first_conversation")):  # or a reused name
                 return JSONResponse({**reply, "session": None,
                                      "detail": "the first session of this create is unavailable"}, status_code=409)
             reply["session"] = {"name": first}  # never a guess, never a relaunch

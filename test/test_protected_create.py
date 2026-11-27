@@ -23,6 +23,7 @@ RID, OTHER = "a" * 32, "b" * 32
 TERMS = {"name": "wolt-a", "type": "beaver", "harness": "", "model": "", "display": "Wolt A", "policy": "", "role": "",
          "description": ""}
 CLI = Path(__file__).parent.parent / "container" / "bin" / "create-creature-wolt"
+CONV = "00000000-0000-4000-8000-00000000000a"
 
 
 @pytest.fixture
@@ -115,7 +116,7 @@ def test_partial_scaffold_waits_for_the_owner_and_a_failed_launch_keeps_its_prin
         calls.append("launch")
         if fail:
             raise RuntimeError("engine did not start")
-        return {"name": "wolt-a-session"}
+        return {"name": "wolt-a-session", "conversation": CONV}
 
     def create(rid=RID, terms=TERMS, scaffold_fail=False, launch_fail=False):
         return protected_create.create(rid, terms, lodge.wolts, scaffold(terms["name"], scaffold_fail),
@@ -136,7 +137,8 @@ def test_partial_scaffold_waits_for_the_owner_and_a_failed_launch_keeps_its_prin
     assert ordinary(op="create-status", request=RID) | {"code": None} == {
         "result": "ok", "status": "launch-failed", "code": None, "id": pid}
     assert create() | {"code": None} == {"result": "ok", "status": "launched", "code": None, "id": pid,
-                                          "first_session": "wolt-a-session", "session": {"name": "wolt-a-session"}}
+                                          "first_session": "wolt-a-session", "first_conversation": CONV,
+                                          "session": {"name": "wolt-a-session", "conversation": CONV}}
     assert create()["status"] == "launched" and calls == ["scaffold", "scaffold", "launch", "launch"]
     # A folder this request did not start is ambiguous: reported and left for the owner.
     other = {**TERMS, "name": "wolt-b"}
@@ -164,7 +166,7 @@ def test_concurrent_retries_launch_once_and_an_uncertain_launch_waits_for_the_ow
         calls.append("launch")
         entered.set()
         release.wait(5)
-        return {"name": "session"}
+        return {"name": "session", "conversation": CONV}
 
     def create(rid=RID, terms=TERMS):  # the API and the CLI both enter here
         return protected_create.create(rid, terms, lodge.wolts, scaffold, launch)
@@ -217,7 +219,12 @@ def test_only_a_definite_non_start_releases_the_first_launch(lodge, monkeypatch,
     def create():
         return protected_create.create(RID, TERMS, lodge.wolts, lambda linkage: (lodge.wolts / "wolt-a" / "wolt").mkdir(
             parents=True) or (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").write_text("{}"),
-            lambda: sessions.start_session(wolt="wolt-a", prompt="hi", track_attempt=True))
+            launch)
+
+    def launch():  # as the lodge's launch wrapper: the session and the conversation id its row carries
+        started = sessions.start_session(wolt="wolt-a", prompt="hi", track_attempt=True)
+        sessions.SessionRegistry(lodge.wolts).update(started["name"], wolt="wolt-a", harness_session_id=CONV)
+        return {**started, "conversation": CONV}
 
     code = request_and_approve()["code"]
     with pytest.raises((OSError, subprocess.CalledProcessError)):
@@ -258,14 +265,14 @@ def test_a_retry_that_read_approved_never_touches_a_live_scaffold(lodge, monkeyp
         assert finished.wait(5)
 
     def late():
-        out["late"] = protected_create.create(RID, TERMS, lodge.wolts, scaffold, lambda: {"name": "wolt-a-late"})
+        out["late"] = protected_create.create(RID, TERMS, lodge.wolts, scaffold, lambda: {"name": "wolt-a-late", "conversation": CONV})
         finished.set()
 
     monkeypatch.setattr(protected_create, "_call", call)
     thread = threading.Thread(target=late, name="late")
     thread.start()
     assert read.wait(5)
-    first = protected_create.create(RID, TERMS, lodge.wolts, scaffold, lambda: {"name": "wolt-a-first"})
+    first = protected_create.create(RID, TERMS, lodge.wolts, scaffold, lambda: {"name": "wolt-a-first", "conversation": CONV})
     thread.join(5)
     assert out["late"]["status"] == "scaffolding" and first["status"] == "launched"
 
@@ -309,7 +316,7 @@ def test_name_is_held_until_retirement_and_restore_keeps_the_approved_id(lodge):
             assert owner(op="rename", wolt="wolt-a", to="wolt-r") == {"result": "creating"}
         if stage == "launched":  # the success is recorded only with its exact first session
             assert ordinary(op="create-report", request=RID, stage=stage) == {"result": "refused"}
-        first = {"session": "wolt-a-first"} if stage == "launched" else {}
+        first = {"session": "wolt-a-first", "conversation": CONV} if stage == "launched" else {}
         assert ordinary(op="create-report", request=RID, stage=stage, **first)["status"] == stage
     assert ordinary(op="create-status", request=RID)["first_session"] == "wolt-a-first"
     assert owner(op="rename", wolt="wolt-a", to="wolt-r") == {"result": "ok"}
@@ -370,6 +377,11 @@ def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypa
     launched = []
     monkeypatch.setattr(app_module, "start_session",
                         lambda **kwargs: launched.append(kwargs) or {"name": f"{kwargs['wolt']}-session"})
+    import sessions
+    real_get = sessions.SessionRegistry.get
+    monkeypatch.setattr(sessions.SessionRegistry, "get", lambda self, name, **kw: {  # the row start_session made
+        "name": name, "wolt": name.rsplit("-", 1)[0], "harness_session_id": CONV} if name.endswith("-session")
+        else real_get(self, name, **kw))
 
     async def post(**body):
         transport = httpx.ASGITransport(app=app_module.app)
@@ -396,16 +408,19 @@ def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypa
     fingerprint = owner(op="review", code=pending.json()["code"])["fingerprint"]
     pid = owner(op="approve", code=pending.json()["code"], terms=fingerprint)["id"]
     done = asyncio.run(post(request_id=RID))
-    assert done.status_code == 200 and done.json()["session"] == {"name": "wolt-a-session"}
+    assert done.status_code == 200 and done.json()["session"]["name"] == "wolt-a-session"
     assert [(k["harness"], k["execution_policy"], k["track_attempt"]) for k in launched] == [
         (terms["harness"], terms["policy"], True)]
     assert (lodge.wolts / "wolt-a" / protected_create.MARKER).read_text() == f"{RID} {pid}\n"
     assert (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").is_file()
-    import sessions
-    assert ordinary(op="create-status", request=RID)["first_session"] == "wolt-a-session"  # the exact one launched
-    for row, expected in (({"name": "wolt-a-session", "wolt": "wolt-a"}, {"name": "wolt-a-session"}),
+    status = ordinary(op="create-status", request=RID)  # the exact one launched, and its conversation
+    assert (status["first_session"], status["first_conversation"]) == ("wolt-a-session", CONV)
+    same = {"name": "wolt-a-session", "wolt": "wolt-a", "harness_session_id": CONV}
+    for row, expected in ((same, {"name": "wolt-a-session"}),
                           (None, None),  # deleted later: unavailable, never another row
-                          ({"name": "wolt-a-session", "wolt": "wolt-b"}, None)):  # a name that is not this wolt's
+                          (same | {"harness_session_id": "00000000-0000-4000-8000-00000000000b"}, None),  # same
+                          # wolt, same name, a new session after the original was deleted: never the first one
+                          (same | {"wolt": "wolt-b"}, None)):  # a name that is not this wolt's
         monkeypatch.setattr(sessions.SessionRegistry, "get", lambda self, name, row=row, **kw: row)
         rejoin = asyncio.run(post(request_id=RID))  # the page or tui coming back after a completed create
         assert rejoin.json()["status"] == "launched" and rejoin.json()["session"] == expected

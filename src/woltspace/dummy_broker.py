@@ -57,20 +57,20 @@ def _open(path: Path, flags: int = os.O_RDONLY) -> int:
     return fd
 
 
-def _key(policy_dir: Path) -> bool:
+def _key(policy_dir: Path) -> None:
     """The dummy custody: a key file apart from the registry, checked but never returned."""
+    fd = _open(policy_dir / "action.key")
     try:
-        fd = _open(policy_dir / "action.key")
-    except FileNotFoundError:
-        return False
-    try:
-        return re.fullmatch(rb"[0-9a-f]{64}", os.read(fd, 65)) is not None
+        if not re.fullmatch(rb"[0-9a-f]{64}", os.read(fd, 65)):
+            raise ValueError("malformed broker key")
     finally:
         os.close(fd)
 
 
 def _write_key(policy_dir: Path) -> None:
-    """Atomic durable replace; a stale temp file from an unclean stop is dropped first."""
+    """Custody initialization, once per volume at startup: atomic and durable, never a rotation.
+
+    A stale temp file from an unclean stop is dropped first."""
     path = policy_dir / "action.key"
     tmp = path.with_name("action.key.tmp")
     tmp.unlink(missing_ok=True)
@@ -109,7 +109,7 @@ def open_registry(policy_dir: Path) -> sqlite3.Connection:
         if not tables and names <= {"registry.db"} and db.execute("PRAGMA user_version").fetchone()[0] == 0:
             db.executescript(f"BEGIN IMMEDIATE; {SCHEMA} COMMIT;")  # first start, or one cut short
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        if db.execute("PRAGMA user_version").fetchone()[0] != 1 or tables != {"principals", "resources", "grants", "audit"}:
+        if db.execute("PRAGMA user_version").fetchone()[0] != 1 or contract(db) != contract(EXPECTED):
             raise ValueError("incompatible broker registry")
         if db.execute("SELECT count(*) FROM principals WHERE name IS NOT NULL").fetchone()[0] > CAPACITY:
             raise ValueError("malformed broker registry")
@@ -117,6 +117,14 @@ def open_registry(policy_dir: Path) -> sqlite3.Connection:
         db.close()
         raise ValueError("incompatible broker registry")
     return db
+
+
+def contract(db: sqlite3.Connection) -> list:
+    return db.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name").fetchall()
+
+
+EXPECTED = sqlite3.connect(":memory:", check_same_thread=False)
+EXPECTED.executescript(SCHEMA)
 
 
 class Authz:
@@ -136,13 +144,24 @@ class Authz:
             if (pid, name) not in self.active:  # a retained row alone confers no access
                 return "inactive" if (pid, name) in self.stored else "not-granted"
         try:  # the dummy action runs outside the lock: it checks the custody and returns no secret
-            return "ok" if _key(self.policy_dir) else "not-registered"
+            _key(self.policy_dir)
         except (OSError, ValueError):
             return "storage-error"
+        return "ok"
 
     def narrow(self, op: str, wolt: str, name: str) -> None:
+        """Early narrowing by the name as the snapshot knows it; the commit repeats it by id."""
         with self.lock:
-            pid = self.names.pop(wolt, None) if op in {"rename", "retire"} else self.names.get(wolt)
+            pid = self.names.get(wolt)
+        if pid is not None:
+            self.drop(op, pid, wolt, name)
+
+    def drop(self, op: str, pid: str, wolt: str | None = None, name: str | None = None) -> None:
+        with self.lock:
+            if op == "retire":
+                self.names = {n: i for n, i in self.names.items() if i != pid}
+            elif op == "rename" and self.names.get(wolt) == pid:
+                del self.names[wolt]
             for grants in (self.active, self.stored):
                 grants -= {g for g in grants if g[0] == pid and (op == "retire" or op == "revoke" and g[1] == name)}
 
@@ -231,10 +250,11 @@ def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
         if db.execute("SELECT 1 FROM principals WHERE name = ?", (to,)).fetchone():  # keep the old name
             return audit(db, "host-admin", op, pid, label, "exists", lambda authz: authz.widen({wolt: pid}))
         db.execute("UPDATE principals SET name = ? WHERE id = ?", (to, pid))
-        change = lambda authz: authz.widen({to: pid})
+        change = lambda authz: (authz.drop(op, pid, wolt), authz.widen({to: pid}))
     elif op == "retire":
         db.execute("DELETE FROM grants WHERE principal = ?", (pid,))
         db.execute("UPDATE principals SET name = NULL, retired = 1 WHERE id = ?", (pid,))
+        change = lambda authz: authz.drop(op, pid)
     elif rid is None:
         return audit(db, "host-admin", op, pid, label, "not-registered")
     elif op == "grant":
@@ -243,7 +263,7 @@ def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
     else:
         db.execute("DELETE FROM grants WHERE principal = ? AND resource = ? AND operation = ?",
                    (pid, rid[0], ACTIONS[name][2]))
-        change = lambda authz: authz.narrow(op, wolt, name)  # again, in order after any queued grant
+        change = lambda authz: authz.drop(op, pid, wolt, name)  # by id, in order after any queued grant
     reply, _ = audit(db, "host-admin", op, pid, label, "ok")
     return ({**reply, "id": pid} if op == "enroll" else reply), change
 
@@ -251,6 +271,9 @@ def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
 class Broker:
     def __init__(self, policy_dir: Path):
         self.policy_dir, db = policy_dir, open_registry(policy_dir)
+        if not (policy_dir / "action.key").exists() and not (policy_dir / "action.key").is_symlink():
+            _write_key(policy_dir)
+        _key(policy_dir)  # existing custody must be ours and well formed before readiness
         self.authz = Authz(db, policy_dir)
         self.writer = Writer(db, self.authz)
 
@@ -267,11 +290,6 @@ class Broker:
             return self.record("host-admin", op, self.authz.admit(wolt, name), wolt)
         if op in {"revoke", "retire", "rename"}:
             self.authz.narrow(op, wolt, name)  # before it is durable or acknowledged
-        if op == "register":
-            try:
-                _write_key(self.policy_dir)
-            except OSError:
-                return self.record("host-admin", op, "storage-error")
         return self.writer.submit(lambda db: mutate(db, op, wolt, name, to))
 
     def record(self, caller: str, op: str, result: str, wolt: str | None = None) -> dict:

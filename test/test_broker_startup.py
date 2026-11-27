@@ -81,7 +81,7 @@ def test_actual_core_action_and_executable(tmp_path, capsys):
         assert json.loads(child.stdout.readline()) == {"result": "accepted"}
         assert dummy_broker.admin(["enroll", "wolt-a"], short / "admin.sock") == 1  # this caller is not uid 0
         assert capsys.readouterr().out == '{"result": "denied"}\n'
-        assert sorted(p.name for p in policy.iterdir()) == ["registry.db"]
+        assert sorted(p.name for p in policy.iterdir()) == ["action.key", "registry.db"]
         assert oct(policy.joinpath("registry.db").stat().st_mode & 0o777) == "0o600"
     finally:
         child.terminate()

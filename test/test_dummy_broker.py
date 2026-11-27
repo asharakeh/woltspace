@@ -82,10 +82,11 @@ def test_owner_ids_grants_rename_retire_and_redacted_audit(store, owner):
 @pytest.mark.parametrize("name", list(broker.FIELDS))
 def test_worker_is_denied_every_operation_and_changes_nothing(store, name):
     b = broker.Broker(store)
+    key = (store / "action.key").read_bytes()  # custody is initialized at startup, before any request
     assert op(b, name, "wolt-a", to="wolt-b") == "denied"
     assert rows(store, "SELECT count(*) FROM principals UNION ALL SELECT count(*) FROM resources") == [(0,), (0,)]
     assert rows(store, "SELECT caller, op, principal, result FROM audit") == [("worker", name, None, "denied")]
-    assert not (store / "action.key").exists()
+    assert (store / "action.key").read_bytes() == key
 
 
 @pytest.mark.parametrize("raw", [b"not json\n", b"[]\n", b'{"op": "grant", "wolt": "wolt-a"}\n',
@@ -115,8 +116,9 @@ def test_restart_or_old_snapshot_keeps_retained_grants_inactive_until_the_owner_
     assert op(b, "run", "wolt-a") == "not-granted"
 
 
-@pytest.mark.parametrize("damage", ["s1-layout", "key-only", "foreign-db", "version", "garbage", "symlink", "mode",
-    "hardlink", "dir-mode", "extra-file", "fifo", "over-capacity"])
+@pytest.mark.parametrize("damage", ["s1-layout", "key-only", "foreign-db", "schema-drift", "version", "garbage",
+    "symlink", "mode", "hardlink", "dir-mode", "extra-file", "fifo", "over-capacity", "key-symlink", "key-mode",
+    "key-hardlink", "key-malformed"])
 def test_incompatible_or_damaged_volume_fails_closed_untouched(store, owner, damage, tmp_path):
     if damage not in {"s1-layout", "key-only"}:
         b = broker.Broker(store)
@@ -128,11 +130,28 @@ def test_incompatible_or_damaged_volume_fails_closed_untouched(store, owner, dam
         (store / "audit.log").write_text("")
     elif damage == "key-only":
         (store / "action.key").write_text("0" * 64)
-    elif damage in {"foreign-db", "version", "over-capacity"}:
-        with sqlite3.connect(db) as conn:
-            conn.execute({"foreign-db": "CREATE TABLE notes (x)", "version": "PRAGMA user_version = 2",
-                          "over-capacity": "INSERT INTO principals (id, name) SELECT 'p-' || value, 'w' || value"
-                                           " FROM json_each('[" + ",".join(map(str, range(65))) + "]')"}[damage])
+    elif damage in {"foreign-db", "schema-drift", "version", "over-capacity"}:
+        with sqlite3.connect(db) as conn:  # same table names and version still differ from the contract
+            conn.executescript({"foreign-db": "CREATE TABLE notes (x)", "version": "PRAGMA user_version = 2",
+                "schema-drift": "DROP TABLE audit; CREATE TABLE audit (seq INTEGER PRIMARY KEY, caller, op,"
+                                " principal, action, result, body)",
+                "over-capacity": "INSERT INTO principals (id, name) SELECT 'p-' || value, 'w' || value"
+                                 " FROM json_each('[" + ",".join(map(str, range(65))) + "]')"}[damage])
+    elif damage.startswith("key-"):
+        key = store / "action.key"
+        if damage == "key-symlink":
+            (tmp_path / "decoy.key").write_bytes(key.read_bytes())
+            (tmp_path / "decoy.key").chmod(0o400)
+            key.unlink()
+            key.symlink_to(tmp_path / "decoy.key")
+        elif damage == "key-mode":
+            key.chmod(0o440)
+        elif damage == "key-hardlink":
+            os.link(key, tmp_path / "second-key")
+        else:
+            key.chmod(0o600)
+            key.write_text("f" * 63 + "\n")
+            key.chmod(0o400)
     elif damage == "garbage":
         db.write_bytes(b"not a database" * 100)
     elif damage == "symlink":
@@ -240,24 +259,54 @@ def test_one_writer_groups_queued_work_orders_narrowing_and_bounds_pending(store
     assert rows(store, "SELECT op, result FROM audit")[-3:] == [("revoke", "ok"), ("grant", "ok"), ("grant", "ok")]
 
 
-def test_a_revoke_queued_after_a_grant_wins_once_both_commit(store, owner):
+@pytest.mark.parametrize("last", ["revoke", "retire", "rename"])
+def test_queued_narrowing_applies_by_id_after_a_queued_enroll_and_grant(store, owner, last):
     b = broker.Broker(store)
-    assert [op(b, "enroll", "wolt-a"), op(b, "register")] == ["ok", "ok"]
+    assert op(b, "register") == "ok"
     gate, entered, real = threading.Event(), threading.Event(), b.writer.commit
     b.writer.commit = lambda: (entered.set(), gate.wait(5), real())
-    hold = threading.Thread(daemon=True, target=op, args=(b, "enroll", "wolt-z"))
-    hold.start()
-    until(entered.is_set)
-    grant = threading.Thread(daemon=True, target=op, args=(b, "grant", "wolt-a"))
-    grant.start()
-    until(lambda: b.writer.queue.qsize() == 1)
-    revoke = threading.Thread(daemon=True, target=op, args=(b, "revoke", "wolt-a"))
-    revoke.start()
-    until(lambda: b.writer.queue.qsize() == 2)
+    threads = [threading.Thread(daemon=True, target=op, args=(b, "enroll", "wolt-z"))]
+    threads[0].start()
+    until(entered.is_set)  # wolt-a is not in the snapshot while all three queue
+    for n, args in enumerate([("enroll", "wolt-a"), ("grant", "wolt-a"), (last, "wolt-a", A, "wolt-b")]):
+        threads.append(threading.Thread(daemon=True, target=op, args=(b, *args)))
+        threads[-1].start()
+        until(lambda: b.writer.queue.qsize() == n + 1)
     gate.set()
-    for thread in (hold, grant, revoke):
+    for thread in threads:
         thread.join(5)
-    assert b.authz.admit("wolt-a", A) == "not-granted" and rows(store, "SELECT count(*) FROM grants") == [(0,)]
+    assert (b.authz.admit("wolt-a", A), b.authz.admit("wolt-b", A)) == {
+        "revoke": ("not-granted", "unknown-wolt"), "retire": ("unknown-wolt", "unknown-wolt"),
+        "rename": ("unknown-wolt", "ok")}[last]  # the snapshot matches what was committed
+    assert rows(store, "SELECT count(*) FROM grants") == [(1 if last == "rename" else 0,)]
+
+
+@pytest.mark.parametrize("when", ["first", "again"])
+def test_register_never_touches_custody_and_a_failed_one_changes_nothing(store, owner, monkeypatch, when):
+    b = broker.Broker(store)
+    key, real_audit, real_commit = (store / "action.key").read_bytes(), broker.audit, b.writer.commit
+    assert op(b, "enroll", "wolt-a") == "ok" and (when == "first" or op(b, "register") == "ok")
+    resources = rows(store, "SELECT * FROM resources")
+
+    def audit(db, caller, name, *rest):
+        if name == "register":
+            raise sqlite3.OperationalError("injected audit write failure")
+        return real_audit(db, caller, name, *rest)
+
+    def commit():
+        raise sqlite3.OperationalError("injected disk failure")
+
+    monkeypatch.setattr(broker, "audit", audit)
+    assert op(b, "register") == "storage-error"
+    monkeypatch.setattr(broker, "audit", real_audit)
+    b.writer.commit = commit
+    assert op(b, "register") == "storage-error"
+    b.writer.commit = real_commit
+    assert rows(store, "SELECT * FROM resources") == resources and (store / "action.key").read_bytes() == key
+    assert op(b, "grant", "wolt-a") == ("not-registered" if when == "first" else "ok")
+    assert op(b, "register") == "ok" and op(b, "register") == "ok"  # replay-safe: one row, same custody
+    assert len(rows(store, "SELECT * FROM resources")) == 1 and (store / "action.key").read_bytes() == key
+    assert op(b, "grant", "wolt-a") == "ok" and op(b, "run", "wolt-a") == "ok"
 
 
 def test_capacity_is_a_fixed_refusal(store, owner):

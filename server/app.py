@@ -1374,7 +1374,7 @@ async def session_new_create(request: Request):
                     wolt_name, wolt_type, harness=selected_harness, model=requested_model,
                     display_name=typed_name, linkage=linkage),  # the approved engine is pinned
                 lambda: start_session(
-                    wolt=wolt_name, harness=selected_harness, execution_policy=level,
+                    wolt=wolt_name, harness=selected_harness, execution_policy=level, track_attempt=True,
                     prompt=platform_skill_invoke(selected_harness, "create-wolt",
                                                  delivery=wolt_skills_delivery(WOLTS_DIR / wolt_name)),
                     routing={"adapter": "lodge"}))

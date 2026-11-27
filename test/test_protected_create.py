@@ -192,9 +192,7 @@ def test_only_a_definite_non_start_releases_the_first_launch(lodge, monkeypatch,
     import sessions
     from session_runtime import RuntimeHandle
 
-    monkeypatch.setenv("WOLTSPACE_ISOLATION", "external")
-    (lodge.wolts / ".space").mkdir()
-    (lodge.wolts / "woltspace.json").write_text(json.dumps({"inbox": {"enabled": True, "native_hints": True}}))
+    monkeypatch.setenv("WOLTSPACE_ISOLATION", "external")  # the lodge default: no inbox, no native hints
     monkeypatch.setattr(sessions, "WOLTS_DIR", lodge.wolts)
     spawned = []
 
@@ -215,14 +213,11 @@ def test_only_a_definite_non_start_releases_the_first_launch(lodge, monkeypatch,
                         ("_tmux_exists", lambda where: None), ("harness_install_problem", lambda *a, **k: None),
                         ("ensure_site", lambda wolt: None), ("get_tunnel_url", lambda: "")):
         monkeypatch.setattr(sessions, attr, value)
-    native = SimpleNamespace(prepare=lambda root, name, harness, attempt: {
-        "kind": harness, "addr": str(root / ".space" / name / attempt), "attempt": attempt}, retire=lambda locator: None)
-    monkeypatch.setitem(sys.modules, "native_adapters", native)
 
     def create():
         return protected_create.create(RID, TERMS, lodge.wolts, lambda linkage: (lodge.wolts / "wolt-a" / "wolt").mkdir(
             parents=True) or (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").write_text("{}"),
-            lambda: sessions.start_session(wolt="wolt-a", prompt="hi"))
+            lambda: sessions.start_session(wolt="wolt-a", prompt="hi", track_attempt=True))
 
     code = request_and_approve()["code"]
     with pytest.raises((OSError, subprocess.CalledProcessError)):
@@ -233,6 +228,10 @@ def test_only_a_definite_non_start_releases_the_first_launch(lodge, monkeypatch,
     else:
         assert ordinary(op="create-status", request=RID)["status"] == "launch-failed"
     assert create()["status"] == "launched" and len(spawned) == 2
+    (lodge.wolts / "wolt-u" / "wolt").mkdir(parents=True)
+    (lodge.wolts / "wolt-u" / "wolt" / "wolt.json").write_text("{}")
+    ordinary_start = sessions.start_session(wolt="wolt-u", prompt="hi")  # every unprotected launch: unchanged
+    assert "attempt" not in sessions.SessionRegistry(lodge.wolts).get(ordinary_start["name"], check_alive=False)
 
 
 def test_a_retry_that_read_approved_never_touches_a_live_scaffold(lodge, monkeypatch):
@@ -365,7 +364,8 @@ def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypa
     pid = owner(op="approve", code=pending.json()["code"], terms=fingerprint)["id"]
     done = asyncio.run(post(request_id=RID))
     assert done.status_code == 200 and done.json()["session"] == {"name": "wolt-a-session"}
-    assert [(k["harness"], k["execution_policy"]) for k in launched] == [(terms["harness"], terms["policy"])]
+    assert [(k["harness"], k["execution_policy"], k["track_attempt"]) for k in launched] == [
+        (terms["harness"], terms["policy"], True)]
     assert (lodge.wolts / "wolt-a" / protected_create.MARKER).read_text() == f"{RID} {pid}\n"
     assert (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").is_file()
     assert asyncio.run(post(request_id=RID)).json()["status"] == "launched"  # a replay starts nothing new

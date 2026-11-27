@@ -1748,12 +1748,15 @@ def inbox_mode(root) -> str | None:
     return "native" if inbox.native_hints(root) else "paste"
 
 
-def mark_launching(registry: "SessionRegistry", name: str, wolt: str, harness: str, mode: str | None) -> str:
+def mark_launching(registry: "SessionRegistry", name: str, wolt: str, harness: str, mode: str | None,
+                   track: bool = False) -> str:
     """Commit a new launch attempt (its inbox mode, and in native mode its locator)
     before the external launch. Call under the agent's lifecycle lock. With the inbox
     off (mode None) nothing is written and the attempt is "": the launch runs as it did
-    before markers. In paste mode there is no locator: the command is the original one."""
-    if not mode:
+    before markers, unless `track` asks for a plain attempt (no inbox, no locator) so the
+    launch outcome is recorded: a protected first create needs that to tell a definite
+    non-start from an uncertain one. In paste mode there is no locator."""
+    if not mode and not track:
         return ""
     attempt = lifecycle.new_attempt()
     native = _native_adapters() if mode == "native" else None
@@ -2160,6 +2163,7 @@ def start_session(
     workdir: str | Path | None = None,
     execution_policy: str | None = None,
     name: str = "",
+    track_attempt: bool = False,
 ) -> dict:
     """Start an agent session for a specific wolt.
 
@@ -2248,7 +2252,7 @@ def start_session(
             user_id=str((routing or {}).get("user_id", "")),
             thread_ts=str((routing or {}).get("thread_ts", "")),
             session_url=session_url,
-        ))
+        ), track_attempt)
     _schedule_pickup(wolt)  # after publication: whichever of this and the backend's ready call comes later hints
 
     result = {
@@ -2292,12 +2296,12 @@ def start_session(
     return result
 
 
-def _create_and_launch(registry, name, wolt, harness, target, prompt, fields) -> None:
+def _create_and_launch(registry, name, wolt, harness, target, prompt, fields, track=False) -> None:
     """Create the row, mark the attempt, spawn, publish: under the agent's lock."""
     mode = inbox_mode(registry.wolts_dir)  # before the row: a malformed switch starts nothing
     registry.create(name, wolt=wolt, harness=harness, dir=str(target.canonical_workdir),
                     target=target, prompt=prompt, **fields)
-    attempt = mark_launching(registry, name, wolt, harness, mode)
+    attempt = mark_launching(registry, name, wolt, harness, mode, track)
     with _launch_step(registry, name, wolt, attempt, name, settle=True):
         handle = _tmux_spawn(name, str(target.canonical_workdir), build_session_command(name, prompt))
     publish_runtime(registry, name, wolt, attempt, handle.to_record())

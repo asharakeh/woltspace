@@ -3,6 +3,8 @@ import json
 import os
 import socket
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -118,9 +120,9 @@ def test_restart_or_old_snapshot_keeps_retained_grants_inactive_until_the_owner_
 
 @pytest.mark.parametrize("damage", ["s1-layout", "key-only", "foreign-db", "schema-drift", "version", "garbage",
     "symlink", "mode", "hardlink", "dir-mode", "extra-file", "fifo", "over-capacity", "key-symlink", "key-mode",
-    "key-hardlink", "key-malformed"])
+    "key-hardlink", "key-malformed", "view-only", "wal"])
 def test_incompatible_or_damaged_volume_fails_closed_untouched(store, owner, damage, tmp_path):
-    if damage not in {"s1-layout", "key-only"}:
+    if damage not in {"s1-layout", "key-only", "view-only"}:
         b = broker.Broker(store)
         assert op(b, "enroll", "wolt-a") == "ok"
         del b
@@ -152,6 +154,13 @@ def test_incompatible_or_damaged_volume_fails_closed_untouched(store, owner, dam
             key.chmod(0o600)
             key.write_text("f" * 63 + "\n")
             key.chmod(0o400)
+    elif damage == "view-only":  # a clean version-0 file with a schema object that is not ours
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE VIEW v AS SELECT 1")
+        db.chmod(0o600)
+    elif damage == "wal":
+        with sqlite3.connect(db) as conn:
+            assert conn.execute("PRAGMA journal_mode = WAL").fetchone() == ("wal",)
     elif damage == "garbage":
         db.write_bytes(b"not a database" * 100)
     elif damage == "symlink":
@@ -176,6 +185,24 @@ def test_incompatible_or_damaged_volume_fails_closed_untouched(store, owner, dam
         broker.Broker(store)
     assert {p.name: p.lstat().st_mode for p in store.iterdir()} == before  # nothing wiped or imported
     assert {p.name: p.read_bytes() for p in store.iterdir() if p.is_file() and not p.is_symlink()} == content
+
+
+def test_a_crash_mid_write_leaves_a_hot_journal_that_startup_recovers(store, owner):
+    b = broker.Broker(store)
+    assert op(b, "enroll", "wolt-a") == "ok"
+    before = rows(store, "SELECT * FROM principals")
+    crash = subprocess.run([sys.executable, "-I", "-c", """
+import os, sqlite3, sys
+db = sqlite3.connect(sys.argv[1], isolation_level=None)
+db.execute("PRAGMA cache_size = 1")
+db.execute("BEGIN IMMEDIATE")
+db.executemany("INSERT INTO audit (caller, op, action, result) VALUES ('x', 'x', ?, 'x')", [("x" * 900,)] * 400)
+os._exit(0)  # no commit, no rollback: the journal stays hot
+""", str(store / "registry.db")], timeout=30)
+    assert crash.returncode == 0 and (store / "registry.db-journal").exists()
+    b = broker.Broker(store)  # a legitimate journal is recovered, not refused
+    assert rows(store, "SELECT * FROM principals") == before and not (store / "registry.db-journal").exists()
+    assert op(b, "enroll", "wolt-a") == "ok" and len(rows(store, "SELECT * FROM audit")) == 2
 
 
 def test_a_failed_audit_write_rolls_back_its_mutation_and_a_replay_applies_once(store, owner, monkeypatch):
@@ -279,6 +306,35 @@ def test_queued_narrowing_applies_by_id_after_a_queued_enroll_and_grant(store, o
         "revoke": ("not-granted", "unknown-wolt"), "retire": ("unknown-wolt", "unknown-wolt"),
         "rename": ("unknown-wolt", "ok")}[last]  # the snapshot matches what was committed
     assert rows(store, "SELECT count(*) FROM grants") == [(1 if last == "rename" else 0,)]
+
+
+def test_admission_never_sees_part_of_a_committed_batch(store, owner):
+    b = broker.Broker(store)
+    assert op(b, "register") == "ok"
+    gate, entered, real = threading.Event(), threading.Event(), b.writer.commit
+    b.writer.commit = lambda: (entered.set(), gate.wait(5), real())
+    threads = [threading.Thread(daemon=True, target=op, args=(b, "enroll", "wolt-z"))]
+    threads[0].start()
+    until(entered.is_set)
+    for n, args in enumerate([("enroll", "wolt-a"), ("grant", "wolt-a"), ("retire", "wolt-a")]):
+        threads.append(threading.Thread(daemon=True, target=op, args=(b, *args)))
+        threads[-1].start()
+        until(lambda: b.writer.queue.qsize() == n + 1)
+    seen, real_drop = [], b.authz.drop
+
+    def drop(*args):  # the retire callback: enroll and grant of this batch are already applied
+        reader = threading.Thread(daemon=True, target=lambda: seen.append(b.authz.admit("wolt-a", A)))
+        reader.start()
+        reader.join(.3)
+        seen.append("blocked" if reader.is_alive() else "read")
+        real_drop(*args)
+
+    b.authz.drop = drop
+    gate.set()
+    for thread in threads:
+        thread.join(5)
+    until(lambda: len(seen) == 2)
+    assert seen == ["blocked", "unknown-wolt"]  # a mid-publication read waits and sees only the commit
 
 
 @pytest.mark.parametrize("when", ["first", "again"])

@@ -97,18 +97,23 @@ def open_registry(policy_dir: Path) -> sqlite3.Connection:
     if names - set(FILES) - {"action.key.tmp"} or ("registry.db" not in names and names - {"action.key.tmp"}):
         raise ValueError("incompatible broker volume")
     path = policy_dir / "registry.db"
-    os.close(_open(path, os.O_RDWR | os.O_CREAT))
+    fd = _open(path, os.O_RDWR | os.O_CREAT)
+    try:
+        header = os.read(fd, 100)
+    finally:
+        os.close(fd)
+    if header and (header[:16] != b"SQLite format 3\x00" or header[18:20] != b"\x01\x01"):
+        raise ValueError("incompatible broker registry")  # not SQLite, or WAL: refused before any open
     if "registry.db-journal" in names:
         os.close(_open(policy_dir / "registry.db-journal"))  # a hot journal is recovered only if ours
     db = sqlite3.connect(f"file:{path}?mode=rw", uri=True, isolation_level=None, check_same_thread=False)
     try:
-        db.execute("PRAGMA journal_mode = DELETE")
-        db.execute("PRAGMA synchronous = FULL")
+        db.execute("PRAGMA synchronous = FULL")  # connection settings only; nothing is written yet
         db.execute("PRAGMA foreign_keys = ON")
-        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        if not tables and names <= {"registry.db"} and db.execute("PRAGMA user_version").fetchone()[0] == 0:
+        empty = db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
+        if empty and names <= {"registry.db"} and db.execute("PRAGMA user_version").fetchone()[0] == 0:
+            db.execute("PRAGMA journal_mode = DELETE")
             db.executescript(f"BEGIN IMMEDIATE; {SCHEMA} COMMIT;")  # first start, or one cut short
-            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         if db.execute("PRAGMA user_version").fetchone()[0] != 1 or contract(db) != contract(EXPECTED):
             raise ValueError("incompatible broker registry")
         if db.execute("SELECT count(*) FROM principals WHERE name IS NOT NULL").fetchone()[0] > CAPACITY:
@@ -153,22 +158,21 @@ class Authz:
         """Early narrowing by the name as the snapshot knows it; the commit repeats it by id."""
         with self.lock:
             pid = self.names.get(wolt)
-        if pid is not None:
-            self.drop(op, pid, wolt, name)
+            if pid is not None:
+                self.drop(op, pid, wolt, name)
 
+    # drop and widen run with self.lock held: by narrow, or by the writer for a whole committed batch.
     def drop(self, op: str, pid: str, wolt: str | None = None, name: str | None = None) -> None:
-        with self.lock:
-            if op == "retire":
-                self.names = {n: i for n, i in self.names.items() if i != pid}
-            elif op == "rename" and self.names.get(wolt) == pid:
-                del self.names[wolt]
-            for grants in (self.active, self.stored):
-                grants -= {g for g in grants if g[0] == pid and (op == "retire" or op == "revoke" and g[1] == name)}
+        if op == "retire":
+            self.names = {n: i for n, i in self.names.items() if i != pid}
+        elif op == "rename" and self.names.get(wolt) == pid:
+            del self.names[wolt]
+        for grants in (self.active, self.stored):
+            grants -= {g for g in grants if g[0] == pid and (op == "retire" or op == "revoke" and g[1] == name)}
 
     def widen(self, names: dict, grant: tuple | None = None) -> None:
-        with self.lock:
-            self.names.update(names)
-            self.active |= {grant} if grant else set()
+        self.names.update(names)
+        self.active |= {grant} if grant else set()
 
 
 class Writer:
@@ -214,9 +218,10 @@ class Writer:
                 if self.db.in_transaction:
                     self.db.execute("ROLLBACK")
                 results, changes = [{"result": "storage-error"}] * len(batch), []  # early narrowing stays
-            for change in changes:  # in queue order; wider access is published only after the commit
-                change(self.authz)
-            for (_, slot), result in zip(batch, results):
+            with self.authz.lock:  # the committed batch becomes visible to admission all at once
+                for change in changes:  # in queue order; wider access is published only after the commit
+                    change(self.authz)
+            for (_, slot), result in zip(batch, results):  # replies only after publication
                 slot[1] = result
                 slot[0].set()
 

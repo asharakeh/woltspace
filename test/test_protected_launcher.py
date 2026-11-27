@@ -98,3 +98,95 @@ def test_the_dummy_probe_reports_its_own_fence(tmp_path, monkeypatch):
         tmp_path.chmod(0o755)
     assert launcher.fenced() is False  # no sockets, but the tree is writable again
     assert set(launcher.OUTPUT) >= {b"dummy fenced", b"dummy open"}  # both answers pass the bridge
+
+
+def test_private_engine_state_refuses_a_wrong_owner(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import pytest
+
+    root = tmp_path / "engine"
+    root.mkdir(mode=0o711)
+    original = Path.lstat
+
+    def lstat(path):
+        info = original(path)
+        if path == root:
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=123, st_gid=123)
+        return info
+
+    monkeypatch.setattr(launcher, "ENGINE_STATE", root)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    with pytest.raises(ValueError, match="unsafe protected state"):
+        launcher.private_engine_state("p-" + "a" * 32, "11223344-5566-7788-99aa-bbccddeeff00")
+    assert not list(root.iterdir())
+
+
+def test_reap_status_rejects_a_nonroot_peer(monkeypatch):
+    import io
+    import struct
+    from unittest.mock import MagicMock
+
+    conn = MagicMock()
+    conn.__enter__.return_value = conn
+    conn.getsockopt.return_value = struct.pack("3i", 42, 123, 123)
+    conn.makefile.return_value = io.BytesIO(b'{"result":"reaped"}\n')
+    monkeypatch.setattr(launcher.socket, "socket", lambda *_: conn)
+    assert launcher.reap_status("alpha", "a" * 12, 1) == "unavailable"
+    conn.sendall.assert_not_called()
+
+
+def test_stock_replacement_waits_and_invalidates_the_old_receipt(monkeypatch):
+    import json
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    old, new = "a" * 12, "b" * 12
+    requests = iter([
+        ("launch-redeem", old), ("launch-redeem", new), ("launch-receipt", old),
+        ("launch-receipt", old), ("launch-redeem", new), ("launch-receipt", old),
+    ])
+    child = MagicMock()
+    child.poll.return_value = None
+    spawned, replies = [], []
+    handler = None
+
+    class Listener:
+        def settimeout(self, _):
+            pass
+
+        def accept(self):
+            if replies == ["pending"]:
+                child.poll.return_value = 0
+                replies.append("between")
+                raise TimeoutError
+            try:
+                op, attempt = next(requests)
+            except StopIteration:
+                handler()
+                raise TimeoutError
+            conn = MagicMock()
+            conn.__enter__.return_value = conn
+            conn.selector = {"op": op, "session": "alpha", "attempt": attempt}
+            conn.sendall.side_effect = lambda body: replies.append(json.loads(body)["result"])
+            return conn, None
+
+    def install(_, callback):
+        nonlocal handler
+        handler = callback
+
+    def spawn(conn, uid, selector, stock):
+        spawned.append(selector["attempt"])
+        return child
+
+    monkeypatch.setattr(launcher, "stock_enabled", lambda: True)
+    monkeypatch.setattr(launcher.signal, "signal", install)
+    monkeypatch.setattr(launcher.pwd, "getpwnam", lambda _: SimpleNamespace(pw_uid=123))
+    monkeypatch.setattr(launcher, "PATH", MagicMock())
+    monkeypatch.setattr(launcher.dummy_broker, "listen", lambda *_: nullcontext(Listener()))
+    monkeypatch.setattr(launcher, "request", lambda conn, _: conn.selector)
+    monkeypatch.setattr(launcher, "spawn", spawn)
+    launcher.serve()
+    assert spawned == [old, new]
+    assert replies == ["pending", "between", "reaped", "unavailable"]

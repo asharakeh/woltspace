@@ -879,7 +879,7 @@ class SessionRegistry:
         if runtime.is_alive(handle):
             runtime.stop(handle)
         try:
-            _await_protected_reap(data)
+            _settle_protected_reap(self, name, wolt, data)
         except lifecycle.LifecycleUnknown:
             return {"session": name, "wolt": wolt, "status": STOPPING}
         now = int(time.time())
@@ -1766,6 +1766,7 @@ def mark_launching(registry: "SessionRegistry", name: str, wolt: str, harness: s
     native = _native_adapters() if mode == "native" else None
     registry.update(name, wolt=wolt, launching={
         "attempt": attempt, "at": int(time.time()), "inbox_adapter": mode,
+        **({"stock": True} if track and _protected_stock_enabled() else {}),
         # {kind, addr: a new private attempt dir, attempt}, or None: no native input
         "native": native.prepare(registry.wolts_dir, name, resolve_harness(harness), attempt)
         if native else None})
@@ -1786,6 +1787,8 @@ def publish_runtime(registry: "SessionRegistry", name: str, wolt: str, attempt: 
         if marker.get("attempt") != attempt:
             return False
         current.update(fields, runtime=runtime, attempt=attempt, last_activity=int(time.time()))
+        if marker.get("stock") is True:
+            current["stock_attempt"] = attempt
         current.pop("launching")
         for key in ("native", "inbox_adapter"):
             if marker.get(key):
@@ -1814,7 +1817,8 @@ def _markers_on(root=None) -> bool:
 
 
 def unresolved_launch(data: dict | None, root=None) -> bool:
-    return bool(data and data.get("launching")) and _markers_on(root)
+    marker = (data or {}).get("launching") or {}
+    return bool(marker) and (marker.get("stock") is True or _markers_on(root))
 
 
 def refuse_unresolved(data: dict | None) -> None:
@@ -1856,6 +1860,11 @@ def stop_and_settle(registry: "SessionRegistry", name: str, seen: dict, stop, se
                 return None
             invalidate_native(registry, name, wolt or seen.get("wolt") or "", seen)
             stopped = bool(stop(seen))
+            if "stock_attempt" in seen:
+                try:
+                    _settle_protected_reap(registry, name, wolt or seen.get("wolt"), seen)
+                except lifecycle.LifecycleUnknown:
+                    return False  # leave STOPPING for reconciliation
             with registry.edit(name, wolt=wolt) as current:
                 if current is not None and current.get("status") == STOPPING:
                     if stopped:
@@ -2439,6 +2448,7 @@ def _relaunch(registry: "SessionRegistry", name: str, wolt: str, harness: str, o
                              or any(unresolved_launch(r) for r in registry.records(wolt=wolt))):
             raise ResumeFailed(f"session '{name}' is no longer resting, was stopped by the owner, or the agent"
                                " is launching; the wake does not revive it")
+        _settle_protected_reap(registry, name, wolt, current)
         mode = inbox_mode(registry.wolts_dir)  # chosen afresh, before the old locator is retired
         invalidate_native(registry, name, wolt, current)
         yield mark_launching(registry, name, wolt, harness, mode, _protected_launch_enabled())
@@ -2699,18 +2709,26 @@ def _protected_stock_enabled():
     return protected_launcher.stock_enabled()
 
 
-def _await_protected_reap(data):
-    if not _protected_stock_enabled():
+def _settle_protected_reap(registry, name, wolt, data):
+    # The published marker stays until this exact attempt is verified. It is
+    # independent of the current profile and of the launcher's bounded receipts.
+    if "stock_attempt" not in data:
         return
     from woltspace import protected_launcher
-    name = data["name"]
-    attempt = (data.get("launching") or {}).get("attempt") or data.get("attempt")
-    if attempt and _launch_control("launch-cancel", name, attempt) == {"result": "ok"}:
+    attempt = data["stock_attempt"]
+    if attempt and attempt == data.get("attempt") and _launch_control(
+        "launch-cancel", name, attempt
+    ) == {"result": "ok"}:
         deadline = time.monotonic() + 8
         while (remaining := deadline - time.monotonic()) > 0:
             status = protected_launcher.reap_status(name, attempt, min(1, remaining))
             if status == "reaped":
-                return
+                with registry.edit(name, wolt=wolt) as current:
+                    if (current is not None and current.get("stock_attempt") == attempt
+                            and current.get("attempt") == attempt):
+                        del current["stock_attempt"]
+                        return
+                break
             if status != "pending":
                 break
             time.sleep(min(.05, remaining))
@@ -2727,11 +2745,14 @@ def _ending(registry: "SessionRegistry", data: dict):
         data = registry.get(data["name"], wolt=wolt, check_alive=False) or data
         invalidate_native(registry, data["name"], wolt, data)
         tmux_alive = _tmux_alive(data)
-        if _protected_stock_enabled() and (tmux_alive or data.get("status") == "running"):
+        if "stock_attempt" in data:
             registry.update(data["name"], wolt=wolt, status=STOPPING)
         if tmux_alive:
             _tmux_stop(data)
-        _await_protected_reap(data)
+        marker = data.get("launching") or {}
+        if marker.get("stock") is True:
+            _launch_control("launch-cancel", data["name"], marker["attempt"])
+        _settle_protected_reap(registry, data["name"], wolt, data)
         refuse_unresolved(data)
         yield wolt, tmux_alive
 

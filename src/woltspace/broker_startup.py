@@ -160,6 +160,7 @@ def supervise(node_argv: list[str]) -> int:
                 if served:  # only the socket directory this start validated
                     dummy_broker.SOCKET.unlink(missing_ok=True)
                     dummy_broker.SOCKET.with_name(dummy_broker.CREATE).unlink(missing_ok=True)
+                    dummy_broker.SOCKET.with_name(dummy_broker.LAUNCH).unlink(missing_ok=True)
                     dummy_broker.SOCKET.parent.rmdir()
             except OSError:
                 cleanup_failed = True

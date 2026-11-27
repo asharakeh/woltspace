@@ -14,6 +14,7 @@ from concurrent.futures import Future
 import hashlib
 import json
 import os
+import pwd
 import queue
 import re
 import secrets
@@ -30,6 +31,7 @@ from typing import NamedTuple
 
 POLICY_DIR = Path("/var/lib/woltspace-secrets")
 SOCKET = Path("/run/woltspace-broker/admin.sock")  # 0600 in a 0711 directory: only the service and root
+LAUNCH = "launch.sock"
 CREATE = "create.sock"  # 0666 beside it: the ordinary create route, nothing else
 ACTION, ADMIN_UID, MAX_REQUEST, CAPACITY, PENDING, GROUP = "dummy.ping", 0, 512, 64, 16, 8
 WORKERS, WAITING, PER_WOLT, BINDINGS = 2, 6, 3, 128
@@ -38,6 +40,9 @@ ACTIONS = {ACTION: ("secret", "dummy", "ping")}  # allowlisted action -> (resour
 FIELDS = {"enroll": ("wolt",), "rename": ("wolt", "to"), "retire": ("wolt",), "register": ("action",),
           "grant": ("wolt", "action"), "revoke": ("wolt", "action"), "run": ("wolt", "action")}
 NAME = re.compile(r"[a-z][a-z0-9-]{0,39}")
+SESSION = re.compile(r"[a-z][a-z0-9-]{0,127}")
+ATTEMPT = re.compile(r"[0-9a-f]{12}")
+ATTEMPT_TTL = 15
 PRINCIPAL = re.compile(r"p-[0-9a-f]{32}")
 # Protected create: the ordinary node may only ask and report; the owner reviews and approves exact terms.
 ORDINARY = {"create-request": ("request", "terms"), "create-status": ("request",), "create-report": ("request", "stage")}
@@ -630,8 +635,72 @@ def _receive_admin(conn: socket.socket, owner: bool, descriptors: list[int]):
     return None
 
 
+class LaunchAttempts:
+    """Bounded ephemeral selectors. Access to these methods is checked by the transport."""
+
+    def __init__(self, authz, channels):
+        self.authz, self.channels = authz, channels
+        self.lock = threading.Lock()
+        self.pending = {}
+        self.seen = {}  # reject repeated registration during the selector lifetime
+
+    def open(self, wolt, session, attempt):
+        with self.lock:
+            now = time.monotonic()
+            self.pending = {key: value for key, value in self.pending.items() if value[2] > now}
+            self.seen = {key: deadline for key, deadline in self.seen.items() if deadline > now}
+            with self.authz.lock:
+                principal = self.authz.names.get(wolt)
+                bound = self.authz.bindings.get(session)
+            current = self.pending.get(session)
+            if (principal is None or (current and current[0] != principal)
+                    or (bound and bound.principal != principal)):
+                return {"result": "denied"}
+            selector = session, attempt
+            if selector in self.seen:
+                return {"result": "denied"}
+            if len(self.seen) >= BINDINGS:
+                return {"result": "busy"}
+            deadline = now + ATTEMPT_TTL
+            self.seen[selector] = deadline
+            self.pending[session] = principal, attempt, deadline
+            return {"result": "ok"}
+
+    def redeem(self, session, attempt):
+        with self.lock:
+            current = self.pending.get(session)
+            if not current or current[1] != attempt:
+                return {"result": "denied"}, None
+            del self.pending[session]
+            principal, _, expires = current
+            if expires <= time.monotonic():
+                return {"result": "denied"}, None
+            try:
+                issuer, worker = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            except OSError:
+                return {"result": "unavailable"}, None
+            try:
+                with issuer:
+                    result = self.channels.attach(principal, session, issuer.fileno())
+                if result == {"result": "ok"}:
+                    return result, worker
+            except BaseException:
+                worker.close()
+                raise
+            worker.close()
+            return result, None
+
+    def cancel(self, session, attempt):
+        with self.lock:
+            current = self.pending.get(session)
+            if current and current[1] == attempt:
+                del self.pending[session]
+        return {"result": "ok"}
+
+
 class Broker:
-    def __init__(self, policy_dir: Path):
+    def __init__(self, policy_dir: Path, node_uid: int | None = None):
+        self.node_uid = node_uid
         self.policy_dir, db = policy_dir, open_registry(policy_dir)
         if not (policy_dir / "action.key").exists() and not (policy_dir / "action.key").is_symlink():
             _write_key(policy_dir)
@@ -645,6 +714,7 @@ class Broker:
         self.writer = Writer(db, self.authz)
         self.dispatch = Dispatcher(self.authz, self.writer)
         self.worker_channels = WorkerChannels(self.dispatch)
+        self.launch_attempts = LaunchAttempts(self.authz, self.worker_channels)
 
     def apply(self, request) -> dict:
         op = request.get("op") if isinstance(request, dict) else None
@@ -671,6 +741,7 @@ class Broker:
         _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         owner = uid == ADMIN_UID
         caller, request, descriptors = ("host-admin" if owner else "worker"), None, []
+        endpoint = None
         conn.settimeout(2)
         try:
             try:
@@ -679,7 +750,14 @@ class Broker:
                 pass  # a silent or slow caller is malformed too
             op = request.get("op") if isinstance(request, dict) else None
             op = op if isinstance(op, str) else None
-            if route == "create":  # any caller, ordinary create steps only; approval stays on the admin route
+            if route == "launch":
+                reply = (self.launch_control(request) if uid == self.node_uid and not descriptors
+                         else {"result": "denied"})
+            elif route == "admin" and op == "launch-redeem" and owner and not descriptors:
+                selector = self.launch_selector(request)
+                reply, endpoint = (self.launch_attempts.redeem(*selector) if selector
+                                   else ({"result": "invalid"}, None))
+            elif route == "create":  # any caller, ordinary create steps only; approval stays on the admin route
                 reply = (self.create("worker", request) if op in ORDINARY and not descriptors
                          else self.record("worker", "other", "denied"))
             elif op in OWNER and owner and not descriptors:
@@ -695,7 +773,37 @@ class Broker:
         finally:
             for descriptor in descriptors:
                 os.close(descriptor)
-        conn.sendall(json.dumps(reply).encode() + b"\n")
+        raw = json.dumps(reply).encode() + b"\n"
+        if endpoint is None:
+            conn.sendall(raw)
+        else:
+            with endpoint:
+                count = conn.sendmsg([raw], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array("i", [endpoint.fileno()]))])
+                if count != len(raw):
+                    raise OSError("short launch response")
+
+    @staticmethod
+    def launch_selector(request, *extra):
+        if not isinstance(request, dict) or request.keys() != {"op", "session", "attempt", *extra}:
+            return None
+        session, attempt = request["session"], request["attempt"]
+        if (isinstance(session, str) and SESSION.fullmatch(session)
+                and isinstance(attempt, str) and ATTEMPT.fullmatch(attempt)):
+            return session, attempt
+        return None
+
+    def launch_control(self, request):
+        op = request.get("op") if isinstance(request, dict) else None
+        if op == "launch-open":
+            selector = self.launch_selector(request, "wolt")
+            wolt = request.get("wolt")
+            if selector and isinstance(wolt, str) and NAME.fullmatch(wolt):
+                return self.launch_attempts.open(wolt, *selector)
+        elif op == "launch-cancel":
+            selector = self.launch_selector(request)
+            if selector:
+                return self.launch_attempts.cancel(*selector)
+        return {"result": "invalid"}
 
 
     def create(self, caller: str, request: dict) -> dict:
@@ -718,7 +826,7 @@ class Broker:
             principal = None
         session = request.get("session")
         if (request.keys() != {"op", "principal", "session"} or len(descriptors) != 1
-                or principal is None or not isinstance(session, str) or not NAME.fullmatch(session)):
+                or principal is None or not isinstance(session, str) or not SESSION.fullmatch(session)):
             return self.worker_channels.decision(principal, "invalid")
         return self.worker_channels.attach(principal, session, descriptors[0])
 
@@ -769,10 +877,12 @@ if __name__ == "__main__":
     store, policy_dir, path = map(Path, sys.argv[1:4])  # fixed by the root startup owner
     try:
         action(store)
-        broker = Broker(policy_dir)
+        broker = Broker(policy_dir, pwd.getpwnam("node").pw_uid)
         server, ordinary = listen(path), listen(path.with_name(CREATE), 0o666)
+        launch = listen(path.with_name(LAUNCH), 0o666)
         print(json.dumps({"result": "accepted"}), flush=True)
     except (OSError, ValueError):
         sys.exit(1)  # never print the store or exception text
     threading.Thread(target=serve, args=(broker, ordinary, "create"), daemon=True).start()
+    threading.Thread(target=serve, args=(broker, launch, "launch"), daemon=True).start()
     serve(broker, server)

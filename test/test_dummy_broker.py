@@ -707,3 +707,70 @@ def test_attach_audit_failure_keeps_previous_binding_and_denies_new_channel(stor
         assert rows(store, "SELECT caller, op, principal, action, result FROM audit WHERE op = 'attach'") == [
             ("host-admin", "attach", principal, "other", "ok"),
         ]
+
+
+def launch_exchange(b, request, route):
+    server, client = socket.socketpair()
+    with server, client:
+        client.sendall(json.dumps(request).encode() + b"\n")
+        b.answer(server, route)
+        raw, ancillary, flags, _ = client.recvmsg(
+            512, socket.CMSG_SPACE(array("i").itemsize), socket.MSG_CMSG_CLOEXEC,
+        )
+        assert not flags & socket.MSG_CTRUNC
+        result = json.loads(raw)["result"]
+        if not ancillary:
+            return result, None
+        [(level, kind, data)] = ancillary
+        assert (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
+        descriptors = array("i")
+        descriptors.frombytes(data)
+        [fd] = descriptors
+        return result, socket.socket(fileno=fd)
+
+
+def test_launch_selector_issues_audited_private_socket_once(store, owner, monkeypatch):
+    b = broker.Broker(store, node_uid=os.getuid())
+    principal = enrolled(b, "alpha")
+    assert op(b, "register") == "ok" and op(b, "grant", "alpha") == "ok"
+    session = "alpha-" + "a" * 34 + "-sleepy-waterfall-abcdef"
+    request = {"session": session, "attempt": "a" * 12}
+    launch_open = dict(request, op="launch-open", wolt="alpha")
+    redeem = dict(request, op="launch-redeem")
+    assert launch_exchange(b, launch_open, "create") == ("denied", None)
+    assert launch_exchange(b, launch_open, "launch") == ("ok", None)
+    with monkeypatch.context() as patch:
+        patch.setattr(broker, "ADMIN_UID", -1)
+        assert launch_exchange(b, redeem, "admin") == ("denied", None)
+    result, endpoint = launch_exchange(b, redeem, "admin")
+    assert result == "ok"
+    with endpoint:
+        endpoint.settimeout(3)
+        hello = json.loads(endpoint.recv(512))
+        assert hello["principal"] == principal
+        assert packet(endpoint, hello) == "ok"
+        assert launch_exchange(b, redeem, "admin") == ("denied", None)
+        assert launch_exchange(b, launch_open, "launch") == ("denied", None)
+        assert rows(store, "SELECT result FROM audit WHERE op = 'attach'") == [("ok",)]
+    until(lambda: not b.authz.bindings)
+
+
+def test_launch_selectors_refuse_wrong_peer_replaced_cancelled_and_expired(store, owner, monkeypatch):
+    b = broker.Broker(store, node_uid=-1)
+    enrolled(b, "alpha")
+    request = {"session": "alpha-sleepy-bog-abcdef", "attempt": "a" * 12}
+    launch_open = dict(request, op="launch-open", wolt="alpha")
+    assert launch_exchange(b, launch_open, "launch") == ("denied", None)
+    b.node_uid = os.getuid()
+    assert launch_exchange(b, launch_open, "launch") == ("ok", None)
+    replacement = dict(launch_open, attempt="b" * 12)
+    assert launch_exchange(b, replacement, "launch") == ("ok", None)
+    assert launch_exchange(b, dict(request, op="launch-redeem"), "admin") == ("denied", None)
+    second = {"session": replacement["session"], "attempt": replacement["attempt"]}
+    assert launch_exchange(b, dict(second, op="launch-cancel"), "launch") == ("ok", None)
+    assert launch_exchange(b, dict(second, op="launch-redeem"), "admin") == ("denied", None)
+    monkeypatch.setattr(broker, "ATTEMPT_TTL", 0)
+    expired = dict(request, attempt="c" * 12)
+    assert launch_exchange(b, dict(expired, op="launch-open", wolt="alpha"), "launch") == ("ok", None)
+    assert launch_exchange(b, dict(expired, op="launch-redeem"), "admin") == ("denied", None)
+    assert not b.authz.bindings

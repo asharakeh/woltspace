@@ -2311,10 +2311,11 @@ def _launch_control(op, name, attempt, **fields):
     )
 
 
-def _open_launch(name, wolt, attempt, prompt="", *, resume=False):
+def _open_launch(name, wolt, attempt, prompt="", *, resume=False, conversation=None):
     if not _protected_launch_enabled():
         return build_session_command(name, prompt, resume=True) if resume else build_session_command(name, prompt)
-    if _launch_control("launch-open", name, attempt, wolt=wolt) != {"result": "ok"}:
+    identity = {"conversation": conversation} if conversation is not None else {}
+    if _launch_control("launch-open", name, attempt, wolt=wolt, **identity) != {"result": "ok"}:
         raise subprocess.CalledProcessError(1, "protected session launch")
     return shlex.join([sys.executable, "-I", "-m", "woltspace.protected_launcher", "bridge", name, attempt])
 
@@ -2330,7 +2331,7 @@ def _create_and_launch(registry, name, wolt, harness, target, prompt, fields, tr
         registry.update(name, wolt=wolt, harness_session_id=conversation)
     attempt = mark_launching(registry, name, wolt, harness, mode, track or protected)
     with _launch_step(registry, name, wolt, attempt, name, settle=True):
-        command = _open_launch(name, wolt, attempt, prompt)
+        command = _open_launch(name, wolt, attempt, prompt, conversation=conversation)
         handle = _tmux_spawn(name, str(target.canonical_workdir), command)
         if protected and not _await_agent(handle, harness):
             if _tmux_exists(handle) is not False:
@@ -2586,7 +2587,8 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
                 try:
                     with _launch_step(registry, name, wolt, attempt, target, settle=False), \
                             _paste_lock(name, registry.db_dir):
-                        command = resume_cmd if not protected else _open_launch(name, wolt, attempt)
+                        command = resume_cmd if not protected else _open_launch(
+                            name, wolt, attempt, conversation=data.get("harness_session_id"))
                         _tmux_paste(target, command)
                 except subprocess.CalledProcessError as exc:
                     raise ResumeFailed(f"session '{name}': the resume command could not be pasted ({exc})") from exc
@@ -2600,7 +2602,8 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
             with _relaunch(registry, name, wolt, harness, only_resting) as attempt:
                 try:
                     with _launch_step(registry, name, wolt, attempt, target, settle=False):
-                        command = resume_cmd if not protected else _open_launch(name, wolt, attempt)
+                        command = resume_cmd if not protected else _open_launch(
+                            name, wolt, attempt, conversation=data.get("harness_session_id"))
                         target = _tmux_spawn_in_session(target, work_dir or "/workspace", command)
                 except subprocess.CalledProcessError as exc:
                     raise ResumeFailed(f"session '{name}': no window could be opened for the resume ({exc})") from exc
@@ -2647,7 +2650,8 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
     # session) — create a fresh tmux session running the wrapper.
     with _relaunch(registry, name, wolt, harness, only_resting) as attempt:
         with _launch_step(registry, name, wolt, attempt, name, settle=True):  # a fresh new-session
-            command = resume_cmd if not protected else _open_launch(name, wolt, attempt)
+            command = resume_cmd if not protected else _open_launch(
+                name, wolt, attempt, conversation=data.get("harness_session_id"))
             handle = _tmux_spawn(name, work_dir or "/workspace", command)
         publish_runtime(registry, name, wolt, attempt, handle.to_record(), status="running")
     _schedule_pickup(wolt)

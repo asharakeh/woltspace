@@ -9,6 +9,7 @@ import pwd
 import select
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import tty
 from . import dummy_broker
 
 PATH = Path("/run/woltspace-launch.sock")
+ENGINE_STATE = Path("/run/woltspace-engine")
 WORKER_UID = 991
 PROCESS = b"wolt-dummy"
 WOLTS = Path("/workspace/wolts")  # the lodge's tree inside the container
@@ -70,13 +72,48 @@ def redeem(raw):
                 if not chunk:
                     break
                 reply += chunk
-            if (flags & socket.MSG_CTRUNC or len(fds) != 1 or not reply.endswith(b"\n")
-                    or json.loads(reply) != {"result": "ok"}):
+            if flags & socket.MSG_CTRUNC or len(fds) != 1 or not reply.endswith(b"\n"):
                 raise ValueError("protected launch refused")
-            return fds.pop()
+            result = json.loads(reply, object_pairs_hook=dummy_broker._unique)
+            if result == {"result": "ok"}:
+                return fds.pop(), None
+            if not isinstance(result, dict) or result.keys() != {"result", "principal", "conversation"}:
+                raise ValueError("protected launch refused")
+            principal, conversation = result["principal"], result["conversation"]
+            if result["result"] != "ok" or not valid_identity(principal, conversation):
+                raise ValueError("protected launch refused")
+            return fds.pop(), (principal, conversation)
         finally:
             for fd in fds:
                 os.close(fd)
+
+
+def valid_identity(principal, conversation):
+    return (isinstance(principal, str) and dummy_broker.PRINCIPAL.fullmatch(principal) is not None
+            and isinstance(conversation, str)
+            and dummy_broker.CHECKS["conversation"].fullmatch(conversation) is not None)
+
+
+def private_engine_state(principal, conversation):
+    """Root-owned parents prevent the worker from substituting a state directory."""
+    if not valid_identity(principal, conversation):
+        raise ValueError("protected launch refused")
+    parent = ENGINE_STATE / principal
+    state = parent / conversation
+    for directory, mode, uid in ((ENGINE_STATE, 0o711, 0), (parent, 0o711, 0),
+                                 (state, 0o700, WORKER_UID)):
+        try:
+            directory.mkdir(mode)
+        except FileExistsError:
+            pass
+        else:
+            os.chmod(directory, mode)
+            os.chown(directory, uid, uid)
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != mode
+                or (info.st_uid, info.st_gid) != (uid, uid)):
+            raise ValueError("unsafe protected state")
+    return state
 
 
 def spawn(conn, node_uid):
@@ -92,7 +129,7 @@ def spawn(conn, node_uid):
     if (not isinstance(selector, dict) or selector.get("op") != "launch-redeem"
             or not dummy_broker.Broker.launch_selector(selector)):
         raise ValueError("protected launch refused")
-    fd = redeem(json.dumps(selector).encode() + b"\n")
+    fd, _identity = redeem(json.dumps(selector).encode() + b"\n")
     try:
         conn.setblocking(True)
         return subprocess.Popen(

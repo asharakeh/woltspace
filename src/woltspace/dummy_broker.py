@@ -693,7 +693,7 @@ class LaunchAttempts:
             return {"result": result} if logged == "suppressed" else reply, None
         return self.channels.dispatch.writer.submit(record)
 
-    def open(self, wolt, session, attempt):
+    def open(self, wolt, session, attempt, conversation=None):
         with self.lock:
             now = time.monotonic()
             self.pending = {key: value for key, value in self.pending.items() if value[2] > now}
@@ -715,7 +715,7 @@ class LaunchAttempts:
                 return reply
             deadline = now + ATTEMPT_TTL
             self.seen[selector] = deadline
-            self.pending[session] = principal, attempt, deadline
+            self.pending[session] = principal, attempt, deadline, conversation
             return reply
 
     def redeem(self, session, attempt):
@@ -724,7 +724,7 @@ class LaunchAttempts:
             if not current or current[1] != attempt:
                 return self.decision("host-admin", "launch-redeem", "denied"), None
             del self.pending[session]
-            principal, _, expires = current
+            principal, _, expires, conversation = current
             if expires <= time.monotonic():
                 return self.decision("host-admin", "launch-redeem", "denied", principal), None
             try:
@@ -735,6 +735,8 @@ class LaunchAttempts:
                 with issuer:
                     result = self.channels.attach(principal, session, issuer.fileno())
                 if result == {"result": "ok"}:
+                    if conversation is not None:
+                        result = {**result, "principal": principal, "conversation": conversation}
                     return result, worker
             except BaseException:
                 worker.close()
@@ -858,10 +860,16 @@ class Broker:
     def launch_control(self, request):
         op = request.get("op") if isinstance(request, dict) else None
         if op == "launch-open":
-            selector = self.launch_selector(request, "wolt")
+            fields = ("wolt",)
+            conversation = request.get("conversation")
+            if "conversation" in request:
+                if not isinstance(conversation, str) or not CHECKS["conversation"].fullmatch(conversation):
+                    return self.launch_attempts.decision("node", op, "invalid")
+                fields += ("conversation",)
+            selector = self.launch_selector(request, *fields)
             wolt = request.get("wolt")
             if selector and isinstance(wolt, str) and NAME.fullmatch(wolt):
-                return self.launch_attempts.open(wolt, *selector)
+                return self.launch_attempts.open(wolt, *selector, conversation=conversation)
         elif op == "launch-cancel":
             selector = self.launch_selector(request)
             if selector:

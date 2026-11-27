@@ -709,7 +709,7 @@ def test_attach_audit_failure_keeps_previous_binding_and_denies_new_channel(stor
         ]
 
 
-def launch_exchange(b, request, route):
+def launch_exchange(b, request, route, *, metadata=False):
     server, client = socket.socketpair()
     with server, client:
         client.sendall(json.dumps(request).encode() + b"\n")
@@ -718,7 +718,8 @@ def launch_exchange(b, request, route):
             512, socket.CMSG_SPACE(array("i").itemsize), socket.MSG_CMSG_CLOEXEC,
         )
         assert not flags & socket.MSG_CTRUNC
-        result = json.loads(raw)["result"]
+        reply = json.loads(raw)
+        result = reply if metadata else reply["result"]
         if not ancillary:
             return result, None
         [(level, kind, data)] = ancillary
@@ -752,6 +753,24 @@ def test_launch_selector_issues_audited_private_socket_once(store, owner, monkey
         assert launch_exchange(b, redeem, "admin") == ("denied", None)
         assert launch_exchange(b, launch_open, "launch") == ("denied", None)
         assert rows(store, "SELECT result FROM audit WHERE op = 'attach'") == [("ok",)]
+    until(lambda: not b.authz.bindings)
+
+
+def test_launch_selector_carries_only_the_bound_conversation(store, owner):
+    b = broker.Broker(store, node_uid=os.getuid())
+    principal = enrolled(b, "alpha")
+    conversation = "11223344-5566-7788-99aa-bbccddeeff00"
+    selector = {"session": "alpha-protected", "attempt": "a" * 12}
+    request = dict(selector, op="launch-open", wolt="alpha", conversation=conversation)
+    assert launch_exchange(b, dict(request, conversation="../other"), "launch") == ("invalid", None)
+    assert launch_exchange(b, request, "launch") == ("ok", None)
+    redeem = dict(selector, op="launch-redeem")
+    assert launch_exchange(b, dict(redeem, conversation=conversation), "admin") == ("invalid", None)
+    reply, endpoint = launch_exchange(b, redeem, "admin", metadata=True)
+    with endpoint:
+        assert reply == {"result": "ok", "principal": principal, "conversation": conversation}
+        assert json.loads(endpoint.recv(512))["principal"] == principal
+        assert launch_exchange(b, redeem, "admin") == ("denied", None)
     until(lambda: not b.authz.bindings)
 
 

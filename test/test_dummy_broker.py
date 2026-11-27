@@ -817,6 +817,14 @@ def test_refusals_from_non_owners_are_audited_up_to_a_budget_per_window(store, o
 
     assert flood(broker.DENIALS + 20) == {"denied"}  # always refused ...
     assert (counted("denied"), counted("suppressed")) == (broker.DENIALS, 1)  # ... recorded up to the budget
+    status = {"op": "create-status", "request": "f" * 32}  # well formed, refused by the lifecycle itself
+    assert {b.create("worker", status)["result"] for _ in range(broker.DENIALS + 5)} == {"unknown-request"}
+    assert rows(store, "SELECT result, count(*) FROM audit WHERE op = 'create-status' GROUP BY result ORDER BY result") == [
+        ("suppressed", 1), ("unknown-request", broker.DENIALS)]
+    request = {"op": "create-request", "request": "e" * 32, "terms": {k: "" for k in broker.TERMS} | {
+        "name": "wolt-z", "type": "beaver"}}
+    assert b.create("worker", request)["result"] == "ok"  # successful transitions are never limited,
+    assert b.create("worker", dict(status, request="e" * 32))["status"] == "pending"  # even past a spent budget
     clock[0] += broker.DENIAL_WINDOW
     assert flood(1) == {"denied"} and counted("denied") == broker.DENIALS + 1  # a new window records again
     assert [op(b, "enroll", f"w{i}") for i in range(broker.DENIALS + 2)] == ["ok"] * (broker.DENIALS + 2)

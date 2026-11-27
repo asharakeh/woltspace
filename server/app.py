@@ -1375,16 +1375,20 @@ async def session_new_create(request: Request):
                     display_name=typed_name, linkage=linkage),  # the approved engine is pinned
                 lambda: start_session(
                     wolt=wolt_name, harness=selected_harness, execution_policy=level, track_attempt=True,
+                    create_request=request_id,
                     prompt=platform_skill_invoke(selected_harness, "create-wolt",
                                                  delivery=wolt_skills_delivery(WOLTS_DIR / wolt_name)),
                     routing={"adapter": "lodge"}))
         except Exception as e:  # the broker keeps the step reached and the principal for a retry
             return JSONResponse({"detail": str(e)}, status_code=500)
-        if reply.get("status") == "launched" and "session" not in reply:  # a rejoin: name the first session
+        if reply.get("status") == "launched" and "session" not in reply:  # a rejoin: the exact first session
             from sessions import SessionRegistry
-            rows = SessionRegistry(WOLTS_DIR).stored(wolt_name)  # read only; nothing is launched again
-            if rows:
-                reply["session"] = {"name": min(rows, key=lambda row: row.get("created_at") or 0)["name"]}
+            started = [row["name"] for row in SessionRegistry(WOLTS_DIR).stored(wolt_name)  # read only
+                       if row.get("create_request") == request_id and row.get("stop_reason") != "launch_failed"]
+            if len(started) != 1:  # never a guess, never a relaunch: the page and tui show this as an error
+                return JSONResponse({**reply, "session": None,
+                                     "detail": "the first session of this create is unavailable"}, status_code=409)
+            reply["session"] = {"name": started[0]}
         status = {"ok": {"launched": 200, "pending": 202}.get(reply.get("status"), 409),
                   "unavailable": 503}.get(reply["result"], 409)
         if status != 200:  # shown as is by the lodge page and the tui

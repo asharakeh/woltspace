@@ -314,7 +314,7 @@ def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
     return ({**reply, "id": pid} if op == "enroll" else reply), change
 
 
-def lifecycle(db, caller: str, request: dict) -> tuple:
+def lifecycle(db, caller: str, request: dict, denials=None) -> tuple:
     """Create reservation states: pending -> approved (one stable ID) -> scaffolded -> launched or launch-failed."""
     op, column = request["op"], "request" if "request" in request else "code"
     row = db.execute(f"SELECT request, code, terms, status, principal FROM creates WHERE {column} = ?",
@@ -322,8 +322,11 @@ def lifecycle(db, caller: str, request: dict) -> tuple:
 
     def done(result, row=row, change=None, **extra):
         state = {"status": row[3], "code": row[1], **({"id": row[4]} if row[4] else {})} if row else {}
-        reply, change = audit(db, caller, op, row[4] if row else None, "other", result, change)
-        return ({**reply, **state, **extra} if result == "ok" else reply), change
+        logged = denials.admit(caller, op, result) if denials else result  # refusals stay bounded
+        if logged is None:
+            return {"result": result}, None
+        reply, change = audit(db, caller, op, row[4] if row else None, "other", logged, change)
+        return ({**reply, **state, **extra} if result == "ok" else {"result": result}), change
 
     if op == "create-request":
         terms = json.dumps(request["terms"], sort_keys=True)
@@ -645,7 +648,7 @@ class DenialBudget:
         self.lock, self.windows = threading.Lock(), {}  # keys come from fixed caller and op labels
 
     def admit(self, caller: str, op: str, result: str) -> str | None:
-        if caller == "host-admin" or result not in {"denied", "invalid"}:
+        if caller == "host-admin" or result == "ok":  # every refusal of a non-owner counts
             return result
         with self.lock:
             now = time.monotonic()
@@ -864,7 +867,7 @@ class Broker:
 
         if request.keys() != {"op", *fields} or not all(valid(f, request[f]) for f in fields):
             return self.record(caller, request["op"], "invalid")
-        return self.writer.submit(lambda db: lifecycle(db, caller, request))
+        return self.writer.submit(lambda db: lifecycle(db, caller, request, self.denials))
 
     def attach(self, request: dict, descriptors: list[int]) -> dict:
         principal = request.get("principal")

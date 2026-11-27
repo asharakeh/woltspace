@@ -217,7 +217,7 @@ def test_only_a_definite_non_start_releases_the_first_launch(lodge, monkeypatch,
     def create():
         return protected_create.create(RID, TERMS, lodge.wolts, lambda linkage: (lodge.wolts / "wolt-a" / "wolt").mkdir(
             parents=True) or (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").write_text("{}"),
-            lambda: sessions.start_session(wolt="wolt-a", prompt="hi", track_attempt=True))
+            lambda: sessions.start_session(wolt="wolt-a", prompt="hi", track_attempt=True, create_request=RID))
 
     code = request_and_approve()["code"]
     with pytest.raises((OSError, subprocess.CalledProcessError)):
@@ -228,6 +228,9 @@ def test_only_a_definite_non_start_releases_the_first_launch(lodge, monkeypatch,
     else:
         assert ordinary(op="create-status", request=RID)["status"] == "launch-failed"
     assert create()["status"] == "launched" and len(spawned) == 2
+    rows = sessions.SessionRegistry(lodge.wolts).stored("wolt-a")  # the retained attempt and the success
+    assert [row.get("create_request") for row in rows] == [RID, RID]
+    assert len([row for row in rows if row.get("stop_reason") != "launch_failed"]) == (2 if failure == "after-spawn" else 1)
     (lodge.wolts / "wolt-u" / "wolt").mkdir(parents=True)
     (lodge.wolts / "wolt-u" / "wolt" / "wolt.json").write_text("{}")
     ordinary_start = sessions.start_session(wolt="wolt-u", prompt="hi")  # every unprotected launch: unchanged
@@ -377,11 +380,18 @@ def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypa
     assert (lodge.wolts / "wolt-a" / protected_create.MARKER).read_text() == f"{RID} {pid}\n"
     assert (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").is_file()
     import sessions
-    monkeypatch.setattr(sessions.SessionRegistry, "stored", lambda self, wolt: [
-        {"name": "wolt-a-later", "created_at": 9}, {"name": "wolt-a-first", "created_at": 1}] if wolt == "wolt-a" else [])
-    rejoin = asyncio.run(post(request_id=RID))  # the page or tui coming back after a completed create
-    assert rejoin.json()["status"] == "launched" and rejoin.json()["session"] == {"name": "wolt-a-first"}
-    assert len(launched) == 1  # a replay names the first session and starts nothing new
+    assert launched[0]["create_request"] == RID  # the first launch records its request on the session row
+    failed = {"name": "wolt-a-1", "created_at": 1, "create_request": RID, "stop_reason": "launch_failed"}
+    later = {"name": "wolt-a-3", "created_at": 9}  # an ordinary later session, no create request
+    for rows, expected in (([failed, {"name": "wolt-a-2", "created_at": 1, "create_request": RID}, later], {"name": "wolt-a-2"}),
+                           ([failed, later], None),  # the original is gone: unavailable, never a substitute
+                           ([{"name": "x", "create_request": RID}, {"name": "y", "create_request": RID}], None)):
+        monkeypatch.setattr(sessions.SessionRegistry, "stored", lambda self, wolt, rows=rows: rows)
+        rejoin = asyncio.run(post(request_id=RID))  # the page or tui coming back after a completed create
+        assert rejoin.json()["status"] == "launched" and rejoin.json()["session"] == expected
+        assert rejoin.status_code == (200 if expected else 409)  # unavailable takes the clients' error path
+        assert expected or rejoin.json()["detail"] == "the first session of this create is unavailable"
+    assert len(launched) == 1  # a rejoin never starts anything
 
     def cli(*argv):
         monkeypatch.setattr(sys, "argv", [str(CLI), *argv])

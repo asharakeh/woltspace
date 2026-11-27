@@ -756,3 +756,26 @@ def test_protected_resume_timeout_cancels_without_settling_uncertain_launch(tmp_
     stored = registry.get("alpha-protected", wolt="alpha", check_alive=False)
     assert stored["status"] == "running" and stored["attempt"] == opened[2]
     assert stored["runtime"]["pane_id"] == ("%1" if saved_pane else "%2")
+
+
+@pytest.mark.parametrize("status", ["reaped", "unavailable"])
+def test_stock_stop_requires_the_exact_receipt(monkeypatch, status):
+    import sessions
+    from woltspace import protected_launcher
+
+    monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
+    monkeypatch.setattr(protected_launcher, "stock_enabled", lambda: True)
+    effects = []
+    replies = iter(("pending", status))
+    monkeypatch.setattr(sessions, "_launch_control",
+                        lambda *args: effects.append(args) or {"result": "ok"})
+    monkeypatch.setattr(protected_launcher, "reap_status",
+                        lambda name, attempt, _: effects.append((name, attempt)) or next(replies))
+    data = {"name": "alpha", "attempt": "a" * 12}
+    if status == "reaped":
+        sessions._await_protected_reap(data)
+    else:
+        with pytest.raises(sessions.lifecycle.LifecycleUnknown):
+            sessions._await_protected_reap(data)
+    assert effects == [("launch-cancel", "alpha", "a" * 12),
+                       ("alpha", "a" * 12), ("alpha", "a" * 12)]

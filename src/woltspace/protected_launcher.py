@@ -1,5 +1,6 @@
 """Protected offline launcher and node-owned terminal bridge for Docker."""
 from array import array
+from collections import OrderedDict
 import ctypes
 import errno
 import json
@@ -20,11 +21,15 @@ from . import dummy_broker
 
 PATH = Path("/run/woltspace-launch.sock")
 ENGINE_STATE = Path("/run/woltspace-engine")
+STOCK = Path("/usr/local/lib/woltspace-stock-fixture")
+PROFILE = Path("/etc/woltspace/stock-fixture")
 WORKER_UID = 991
 PROCESS = b"wolt-dummy"
 WOLTS = Path("/workspace/wolts")  # the lodge's tree inside the container
 OUTPUT = (b"dummy ok", b"dummy refused", b"dummy fenced", b"dummy open")  # all the bridge shows
 READY = b"protected dummy ready\n"
+STOCK_READY = b"protected stock ready\n"
+STOCK_OUTPUT = (b"fixture complete", b"fixture refused")
 
 
 def deny_new_channels():
@@ -101,7 +106,8 @@ def private_engine_state(principal, conversation):
     parent = ENGINE_STATE / principal
     state = parent / conversation
     for directory, mode, uid in ((ENGINE_STATE, 0o711, 0), (parent, 0o711, 0),
-                                 (state, 0o700, WORKER_UID)):
+                                 (state, 0o711, 0), (state / "control", 0o700, 0),
+                                 (state / "home", 0o700, WORKER_UID)):
         try:
             directory.mkdir(mode)
         except FileExistsError:
@@ -116,7 +122,21 @@ def private_engine_state(principal, conversation):
     return state
 
 
-def spawn(conn, node_uid):
+def stock_enabled():
+    """Only the root-installed opt-in selects the disposable stock profile."""
+    from .broker_startup import protected
+
+    try:
+        PROFILE.lstat()
+    except FileNotFoundError:
+        return False
+    protected(PROFILE)
+    if not PROFILE.is_file() or PROFILE.read_bytes() != b"stock-fixture\n":
+        raise ValueError("invalid protected stock profile")
+    return True
+
+
+def request(conn, node_uid):
     _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
     if uid != node_uid:
         raise ValueError("protected launch refused")
@@ -126,12 +146,51 @@ def spawn(conn, node_uid):
     if len(raw) > dummy_broker.MAX_REQUEST or not raw.endswith(b"\n"):
         raise ValueError("protected launch refused")
     selector = json.loads(raw, object_pairs_hook=dummy_broker._unique)
-    if (not isinstance(selector, dict) or selector.get("op") != "launch-redeem"
-            or not dummy_broker.Broker.launch_selector(selector)):
+    if (not dummy_broker.Broker.launch_selector(selector)
+            or selector["op"] not in {"launch-redeem", "launch-receipt"}):
         raise ValueError("protected launch refused")
-    fd, _identity = redeem(json.dumps(selector).encode() + b"\n")
+    return selector
+
+
+def reap_status(session, attempt, timeout):
+    """Node-facing lookup verifies the launcher peer before accepting a receipt."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(timeout)
+            conn.connect(str(PATH))
+            _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid != 0:
+                return "unavailable"
+            selector = {"op": "launch-receipt", "session": session, "attempt": attempt}
+            conn.sendall(json.dumps(selector).encode() + b"\n")
+            with conn.makefile("rb") as stream:
+                reply = json.loads(stream.readline(128), object_pairs_hook=dummy_broker._unique)
+            for status in ("pending", "reaped"):
+                if reply == {"result": status}:
+                    return status
+    except (OSError, ValueError, RecursionError):
+        pass
+    return "unavailable"
+
+
+def spawn(conn, node_uid, selector=None, stock=False):
+    selector = request(conn, node_uid) if selector is None else selector
+    if selector["op"] != "launch-redeem":
+        raise ValueError("protected launch refused")
+    fd, identity = redeem(json.dumps(selector).encode() + b"\n")
     try:
         conn.setblocking(True)
+        if stock:
+            if identity is None:
+                raise ValueError("protected launch refused")
+            state = private_engine_state(*identity)
+            return subprocess.Popen(
+                [sys.executable, "-I", "-m", "woltspace.protected_stock",
+                 str(fd), str(state), identity[0]],
+                cwd="/", env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                start_new_session=True, stdin=conn, stdout=conn, stderr=subprocess.DEVNULL,
+                pass_fds=(fd,),
+            )
         return subprocess.Popen(
             [sys.executable, "-I", "-m", "woltspace.protected_launcher", "worker", str(fd)],
             cwd="/", env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
@@ -151,28 +210,50 @@ def serve():
         stopped = True
 
     signal.signal(signal.SIGTERM, stop)
-    children = []
+    stock = stock_enabled()
+    children, receipts = {}, OrderedDict()
     with dummy_broker.listen(PATH, 0o666) as listener:
         listener.settimeout(.1)
         print("accepted", flush=True)
         try:
             while not stopped:
-                children = [p for p in children if p.poll() is None]
+                for key, child in list(children.items()):
+                    code = child.poll()
+                    if code is not None:
+                        del children[key]
+                        if stock:
+                            receipts[key] = "reaped" if code == 0 else "unavailable"
+                            if len(receipts) > dummy_broker.BINDINGS:
+                                receipts.popitem(last=False)
                 try:
                     conn, _ = listener.accept()
                 except TimeoutError:
                     continue
                 with conn:
                     try:
-                        if len(children) < dummy_broker.BINDINGS:
-                            children.append(spawn(conn, node_uid))
+                        selector = request(conn, node_uid)
+                        key = selector["session"], selector["attempt"]
+                        if selector["op"] == "launch-receipt":
+                            if stock:
+                                result = ("pending" if key in children
+                                          else receipts.get(key, "unavailable"))
+                                conn.sendall(json.dumps({"result": result}).encode() + b"\n")
+                        elif (len(children) < dummy_broker.BINDINGS and key not in children
+                              and (not stock or not any(name == key[0] for name, _ in children))):
+                            children[key] = spawn(conn, node_uid, selector, stock)
+                            if stock:
+                                for previous in [saved for saved in receipts if saved[0] == key[0]]:
+                                    del receipts[previous]
                     except (OSError, ValueError, RecursionError):
                         pass  # close this connection; the node reports a fixed refusal
         finally:
-            for child in children:
-                child.kill()
-            for child in children:
-                child.wait()
+            for child in children.values():
+                if stock:
+                    child.terminate()  # supervisor receives the signal and owns teardown
+                else:
+                    child.kill()
+            for child in children.values():
+                child.wait(timeout=10)
             PATH.unlink(missing_ok=True)
 
 
@@ -229,8 +310,10 @@ def bridge(session, attempt):
         req = {"op": "launch-redeem", "session": session, "attempt": attempt}
         conn.sendall(json.dumps(req).encode() + b"\n")
         with conn.makefile("rb", buffering=0) as io:
-            if io.readline(len(READY) + 1) != READY:
+            ready_message = io.readline(max(len(READY), len(STOCK_READY)) + 1)
+            if ready_message not in (READY, STOCK_READY):
                 return 1
+        allowed = OUTPUT + STOCK_OUTPUT if ready_message == STOCK_READY else OUTPUT
         conn.settimeout(None)
         # The worker gets no PTY or terminal pathname. Flush queued input on
         # both transitions so leftover worker keystrokes cannot reach a shell.
@@ -240,7 +323,7 @@ def bridge(session, attempt):
             tty.setcbreak(fd, termios.TCSAFLUSH)
             if prctl(15, ctypes.c_char_p(PROCESS), 0, 0, 0):
                 return 1
-            sys.stdout.buffer.write(READY)
+            sys.stdout.buffer.write(ready_message)
             sys.stdout.buffer.flush()
             pending = b""
             while True:
@@ -252,11 +335,11 @@ def bridge(session, attempt):
                     pending += chunk
                     while b"\n" in pending:
                         line, pending = pending.split(b"\n", 1)
-                        if line not in OUTPUT:
+                        if line not in allowed:
                             return 1
                         sys.stdout.buffer.write(line + b"\n")
                         sys.stdout.buffer.flush()
-                    if len(pending) > len(b"dummy refused"):
+                    if len(pending) > max(map(len, allowed)):
                         return 1
                 if fd in ready:
                     chunk = os.read(fd, 4096)

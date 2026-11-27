@@ -878,6 +878,10 @@ class SessionRegistry:
         handle = RuntimeHandle.from_record(data)
         if runtime.is_alive(handle):
             runtime.stop(handle)
+        try:
+            _await_protected_reap(data)
+        except lifecycle.LifecycleUnknown:
+            return {"session": name, "wolt": wolt, "status": STOPPING}
         now = int(time.time())
         with self.edit(name, wolt=wolt) as current:
             if current is not None and current.get("status") == STOPPING:
@@ -2687,6 +2691,32 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
             "detail": respawn_detail}
 
 
+def _protected_stock_enabled():
+    if not _protected_launch_enabled():
+        return False
+    from woltspace import protected_launcher
+
+    return protected_launcher.stock_enabled()
+
+
+def _await_protected_reap(data):
+    if not _protected_stock_enabled():
+        return
+    from woltspace import protected_launcher
+    name = data["name"]
+    attempt = (data.get("launching") or {}).get("attempt") or data.get("attempt")
+    if attempt and _launch_control("launch-cancel", name, attempt) == {"result": "ok"}:
+        deadline = time.monotonic() + 8
+        while (remaining := deadline - time.monotonic()) > 0:
+            status = protected_launcher.reap_status(name, attempt, min(1, remaining))
+            if status == "reaped":
+                return
+            if status != "pending":
+                break
+            time.sleep(min(.05, remaining))
+    raise lifecycle.LifecycleUnknown("protected engine reap could not be confirmed")
+
+
 @contextmanager
 def _ending(registry: "SessionRegistry", data: dict):
     """Stop, archive or delete under the agent's lock: retire the native locator,
@@ -2697,8 +2727,11 @@ def _ending(registry: "SessionRegistry", data: dict):
         data = registry.get(data["name"], wolt=wolt, check_alive=False) or data
         invalidate_native(registry, data["name"], wolt, data)
         tmux_alive = _tmux_alive(data)
+        if _protected_stock_enabled() and (tmux_alive or data.get("status") == "running"):
+            registry.update(data["name"], wolt=wolt, status=STOPPING)
         if tmux_alive:
             _tmux_stop(data)
+        _await_protected_reap(data)
         refuse_unresolved(data)
         yield wolt, tmux_alive
 

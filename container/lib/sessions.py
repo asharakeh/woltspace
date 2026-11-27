@@ -2478,6 +2478,20 @@ def _relaunch(registry: "SessionRegistry", name: str, wolt: str, harness: str, o
         yield mark_launching(registry, name, wolt, harness, mode, _protected_launch_enabled())
 
 
+def _settle_resume_timeout(registry, name, wolt, attempt):
+    with lifecycle.agent_lock(registry.wolts_dir, wolt):
+        row = registry.get(name, wolt=wolt, check_alive=False)
+        if row is None or row.get("attempt") != attempt:
+            return
+        if "stock_attempt" in row:
+            try:
+                _settle_protected_reap(registry, name, wolt, row)
+            except lifecycle.LifecycleUnknown:
+                pass  # a failed readiness check cannot settle an outstanding attempt
+        else:
+            _launch_control("launch-cancel", name, attempt)
+
+
 def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -> dict:
     """Resume an existing Claude Code session.
 
@@ -2657,7 +2671,7 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
             return {"name": name, "url": session_url,
                     "status": "revived", "detail": detail}
         if protected:
-            _launch_control("launch-cancel", name, attempt)
+            _settle_resume_timeout(registry, name, wolt, attempt)
             raise ResumeFailed("protected session startup could not be confirmed in its existing tmux session")
         # In-place revival did not take. The pane we pasted into may be a
         # leftover login shell in a state that swallows the command, or the
@@ -2695,7 +2709,7 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
     _schedule_pickup(wolt)
     if not _await_agent(handle, harness):
         if protected:
-            _launch_control("launch-cancel", name, attempt)
+            _settle_resume_timeout(registry, name, wolt, attempt)
             if resolve_agent_handle(handle, harness, include_launching=False) is None:
                 raise ResumeFailed("protected session startup could not be confirmed in its new tmux session")
         # run-session.sh may have exited before an agent appeared: a prepare
@@ -2733,19 +2747,24 @@ def _protected_stock_enabled():
     return protected_launcher.stock_enabled()
 
 
-def _stock_stop_evidence(name, attempt, epoch, *, not_opened=False):
+def _stock_stop_evidence(name, attempt, epoch, *, not_opened=False, cancelled=False,
+                         record_cancellation=None):
     """Cancellation and authoritative launcher evidence must agree on the attempt lifetime."""
     from woltspace import protected_launcher
 
     if attempt and epoch:
         cancellation = _launch_control("launch-cancel", name, attempt, proof=True)
         if cancellation in ({"result": "ok"}, {"result": "cancelled-before-redeem"}):
+            if cancellation == {"result": "cancelled-before-redeem"}:
+                cancelled = True
+                if record_cancellation is not None:
+                    record_cancellation()
             deadline = time.monotonic() + 8
             while (remaining := deadline - time.monotonic()) > 0:
                 status = protected_launcher.reap_status(name, attempt, min(1, remaining), epoch)
                 if status in ("reaped", "no-owned-launch"):
                     return status
-                if status == "unrecorded" and (not_opened or cancellation == {"result": "cancelled-before-redeem"}):
+                if status == "unrecorded" and (not_opened or cancelled):
                     return "no-owned-launch"
                 if status != "pending":
                     break
@@ -2759,13 +2778,24 @@ def _settle_protected_reap(registry, name, wolt, data):
     attempt, epoch = data["stock_attempt"], data.get("stock_epoch")
     if attempt != data.get("attempt"):
         raise lifecycle.LifecycleUnknown("protected attempt identity changed")
-    _stock_stop_evidence(name, attempt, epoch)
-    with registry.edit(name, wolt=wolt) as current:
+    def require_exact(current):
         if (current is None or current.get("stock_attempt") != attempt
                 or current.get("attempt") != attempt or current.get("stock_epoch") != epoch):
             raise lifecycle.LifecycleUnknown("protected attempt identity changed")
+
+    def record_cancellation():
+        with registry.edit(name, wolt=wolt) as current:
+            require_exact(current)
+            current["stock_cancelled_attempt"] = attempt
+
+    _stock_stop_evidence(name, attempt, epoch,
+                         cancelled=data.get("stock_cancelled_attempt") == attempt,
+                         record_cancellation=record_cancellation)
+    with registry.edit(name, wolt=wolt) as current:
+        require_exact(current)
         del current["stock_attempt"]
         del current["stock_epoch"]
+        current.pop("stock_cancelled_attempt", None)
 
 
 @contextmanager

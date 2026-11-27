@@ -722,13 +722,21 @@ def test_protected_start_cancels_and_settles_definite_launch_failure(tmp_path, m
 
 
 @pytest.mark.parametrize("saved_pane", [False, True])
-def test_protected_resume_timeout_cancels_without_settling_uncertain_launch(tmp_path, monkeypatch, saved_pane):
+@pytest.mark.parametrize("stock", [False, True])
+def test_protected_resume_timeout_cancels_without_settling_uncertain_launch(
+    tmp_path, monkeypatch, saved_pane, stock,
+):
     import sessions
+    from woltspace import protected_launcher
 
     wolt = tmp_path / "alpha" / "wolt"
     wolt.mkdir(parents=True)
     monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
     monkeypatch.setattr(sessions, "WOLTS_DIR", tmp_path)
+    monkeypatch.setattr(protected_launcher, "stock_enabled", lambda: stock)
+    monkeypatch.setattr(protected_launcher, "launcher_epoch", lambda *_: "b" * 32)
+    root_observations = iter(("unavailable", "unrecorded"))
+    monkeypatch.setattr(protected_launcher, "reap_status", lambda *_: next(root_observations))
     monkeypatch.setattr(sessions, "_tmux_alive", lambda *_: saved_pane)
     monkeypatch.setattr(sessions, "resolve_agent_handle", lambda *_, **__: None)
     monkeypatch.setattr(sessions, "_runtime", lambda: SimpleNamespace(handle_is_alive=lambda _: True))
@@ -741,6 +749,10 @@ def test_protected_resume_timeout_cancels_without_settling_uncertain_launch(tmp_
 
     def control(operation, name, attempt, **kwargs):
         effects.append((operation, name, attempt))
+        if stock and operation == "launch-cancel":
+            assert kwargs == {"proof": True}
+            if len(effects) == 2:
+                return {"result": "cancelled-before-redeem"}
         return {"result": "ok"}
 
     monkeypatch.setattr(sessions, "_launch_control", control)
@@ -756,6 +768,16 @@ def test_protected_resume_timeout_cancels_without_settling_uncertain_launch(tmp_
     stored = registry.get("alpha-protected", wolt="alpha", check_alive=False)
     assert stored["status"] == "running" and stored["attempt"] == opened[2]
     assert stored["runtime"]["pane_id"] == ("%1" if saved_pane else "%2")
+
+    if stock:
+        assert stored["stock_attempt"] == stored["stock_cancelled_attempt"] == opened[2]
+        monkeypatch.setattr(sessions, "_tmux_alive", lambda *_: False)
+        assert sessions.stop_session("alpha-protected")["status"] == "stopped"
+        retired = registry.get("alpha-protected", wolt="alpha", check_alive=False)
+        assert "stock_attempt" not in retired and "stock_cancelled_attempt" not in retired
+        assert effects[-1] == cancelled
+    else:
+        assert "stock_attempt" not in stored
 
 
 @pytest.mark.parametrize(("receipt", "cancel_result", "settled"), [

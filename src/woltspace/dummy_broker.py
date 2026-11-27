@@ -31,7 +31,7 @@ POLICY_DIR = Path("/var/lib/woltspace-secrets")
 SOCKET = Path("/run/woltspace-broker/admin.sock")
 ACTION, ADMIN_UID, MAX_REQUEST, CAPACITY, PENDING, GROUP = "dummy.ping", 0, 512, 64, 16, 8
 WORKERS, WAITING, PER_WOLT, BINDINGS = 2, 6, 3, 128
-DUMMY_DELAY = 0.25
+DUMMY_DELAY = 0.5
 ACTIONS = {ACTION: ("secret", "dummy", "ping")}  # allowlisted action -> (resource type, resource, operation)
 FIELDS = {"enroll": ("wolt",), "rename": ("wolt", "to"), "retire": ("wolt",), "register": ("action",),
           "grant": ("wolt", "action"), "revoke": ("wolt", "action"), "run": ("wolt", "action")}

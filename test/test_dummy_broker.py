@@ -490,7 +490,7 @@ def test_dispatch_limits_fairness_and_revoke_under_load(store, owner, monkeypatc
     latency = sorted(ticks)
     for label, index in (("p50_ms", 5), ("p95_ms", 10), ("p99_ms", 10)):
         record_property(label, round(latency[index] * 1000, 3))
-    record_property("workload", "11 submissions: 6 ok, 3 denied, 2 busy; fixed 250 ms plus controlled holds")
+    record_property("workload", "11 submissions: 6 ok, 3 denied, 2 busy; fixed 500 ms plus controlled holds")
     record_property("requests_per_second", round(11 / elapsed, 2))
     record_property("revoke_ms", round(revoke_latency * 1000, 3))
 

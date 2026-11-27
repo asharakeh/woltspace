@@ -277,17 +277,24 @@ echo 'PASS create' >&3
 
 phase=recover
 # The CLI entry point; a folder this request did not start is left for the owner.
-cli() { docker exec --user node "$name" create-creature-wolt "$@"; }
+# As a lodge session runs it: every lodge child gets WOLTSPACE_PYTHON = the venv interpreter
+# (container_entrypoint). A bare exec would reach the image's woltspace-python symlink, which starts the
+# base python without the woltspace package.
+cli() { docker exec --user node -e "WOLTSPACE_PYTHON=$venv_python" "$name" create-creature-wolt "$@"; }
 rid_x=$(token)
 mkdir "$WOLTSPACE_WOLTS_DIR/wolt-x"
 printf 'owner data\n' >"$WOLTSPACE_WOLTS_DIR/wolt-x/notes.md"
-code_x=$(from_json "$(cli wolt-x beaver --request "$rid_x")" code)
+out=$(cli wolt-x beaver --request "$rid_x")  # exit 0: a pending request
+[[ $(from_json "$out" status) == pending ]]
+code_x=$(from_json "$out" code)
+[[ $code_x =~ ^c-[0-9a-f]{8}$ ]]
 approve "$code_x" >/dev/null
 out=$(cli wolt-x beaver --request "$rid_x") && exit 1
 [[ $(from_json "$out" status) == ambiguous && $(cat "$WOLTSPACE_WOLTS_DIR/wolt-x/notes.md") == 'owner data' ]]
 [[ $(from_json "$(admin reconcile "$code_x")" status) == approved ]]
 mv "$WOLTSPACE_WOLTS_DIR/wolt-x" "$root/owner-kept"
-[[ $(from_json "$(cli wolt-x beaver --request "$rid_x")" status) == scaffolded ]]  # first launch stays separate
+out=$(cli wolt-x beaver --request "$rid_x")
+[[ $(from_json "$out" status) == scaffolded ]]  # first launch stays separate
 [[ -f $WOLTSPACE_WOLTS_DIR/wolt-x/wolt/wolt.json ]]
 echo 'PASS recover' >&3
 

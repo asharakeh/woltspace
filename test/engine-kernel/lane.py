@@ -21,18 +21,34 @@ from types import SimpleNamespace
 
 PROBE = {"sibling_state": "EACCES", "control_state": "EACCES", "lodge_file": "EACCES",
          "sibling_tcp": "EACCES", "decoy_tcp": "EACCES", "tcp_bind": "EACCES",
-         "udp": "EPERM", "unix": "EPERM", "signal_sibling": "EPERM",
+         "udp": "EPERM", "unix": "EPERM", "stream_sctp": "EPERM", "stream_mptcp": "EPERM",
+         "signal_sibling": "EPERM",
          "signal_launcher": "EPERM", "sibling_proc": "EACCES"}
 
 
 def ident(pid):
-    """(ppid, start time) of a live, non-zombie pid, else None."""
+    """(ppid, start time) of a live process (any task not a zombie), else None."""
     try:
         with open(f"/proc/{pid}/stat") as stat:
             fields = stat.read().rsplit(")", 1)[1].split()
     except OSError:
         return None
-    return None if fields[0] == "Z" else (int(fields[1]), fields[19])
+    if fields[0] == "Z":  # an exited leader: the process lives while any of its tasks does
+        try:
+            tasks = os.listdir(f"/proc/{pid}/task")
+        except OSError:
+            return None
+        if not any(_state(f"/proc/{pid}/task/{task}/stat") not in (None, "Z", "X") for task in tasks):
+            return None
+    return int(fields[1]), fields[19]
+
+
+def _state(path):
+    try:
+        with open(path) as stat:
+            return stat.read().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return None
 
 
 def born(pid):

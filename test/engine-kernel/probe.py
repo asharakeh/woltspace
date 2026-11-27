@@ -1,10 +1,13 @@
 """Fixed defensive permission checks, run under the worker fence. Prints one JSON line."""
+import ctypes
 import errno
 import json
 import os
 import signal
 import socket
 import sys
+import threading
+import time
 
 
 def outcome(action):
@@ -13,6 +16,11 @@ def outcome(action):
         return "ok"
     except OSError as error:
         return errno.errorcode.get(error.errno, "other")
+
+
+def sleeper():
+    while True:
+        time.sleep(3600)
 
 
 def tcp(port, bind=False):
@@ -31,6 +39,8 @@ def checks(own, sibling, control, lodge, port, sibling_port, decoy, sibling_pid,
         "tcp_bind": outcome(lambda: tcp(0, bind=True)),
         "udp": outcome(lambda: socket.socket(socket.AF_INET, socket.SOCK_DGRAM).close()),
         "unix": outcome(lambda: socket.socket(socket.AF_UNIX).close()),
+        "stream_sctp": outcome(lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM, 132).close()),
+        "stream_mptcp": outcome(lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM, 262).close()),
         "signal_sibling": outcome(lambda: os.kill(sibling_pid, 0)),
         "signal_launcher": outcome(lambda: os.kill(launcher, 0)),
         "sibling_proc": outcome(lambda: open(f"/proc/{sibling_pid}/environ", "rb").close()),
@@ -59,8 +69,9 @@ def main(own, sibling, control, lodge, port, sibling_port, decoy, sibling_pid, c
             os.close(write)
             for fd in (0, 1, 2):
                 os.close(fd)
-            while True:
-                signal.pause()
+            # Benign workload whose leader thread exits while one thread lives on.
+            threading.Thread(target=sleeper).start()
+            ctypes.CDLL(None).pthread_exit(None)
         finally:
             os._exit(1)
     os.close(write)

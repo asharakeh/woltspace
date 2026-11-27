@@ -48,11 +48,13 @@ def abi():
     return checked(LIB.syscall(CREATE, None, 0, 1))
 
 
-# socket() only for AF_INET/AF_INET6 SOCK_STREAM; io_uring_setup, foreign arch, x32 -> EPERM.
-SECCOMP = [(0x20, 0, 0, 4), (0x15, 0, 11, 0xC000003E), (0x20, 0, 0, 0),
-           (0x35, 9, 0, 0x40000000), (0x15, 8, 0, 425), (0x15, 0, 6, 41),
-           (0x20, 0, 0, 16), (0x15, 1, 0, 2), (0x15, 0, 4, 10),
-           (0x20, 0, 0, 24), (0x54, 0, 0, 0xF), (0x15, 0, 1, 1),
+# socket() only for AF_INET/AF_INET6, SOCK_STREAM, protocol 0 or IPPROTO_TCP;
+# io_uring_setup, foreign arch, x32 -> EPERM.
+SECCOMP = [(0x20, 0, 0, 4), (0x15, 0, 14, 0xC000003E), (0x20, 0, 0, 0),
+           (0x35, 12, 0, 0x40000000), (0x15, 11, 0, 425), (0x15, 0, 9, 41),
+           (0x20, 0, 0, 16), (0x15, 1, 0, 2), (0x15, 0, 7, 10),
+           (0x20, 0, 0, 24), (0x54, 0, 0, 0xF), (0x15, 0, 4, 1),
+           (0x20, 0, 0, 32), (0x15, 1, 0, 0), (0x15, 0, 1, 6),
            (0x06, 0, 0, 0x7FFF0000), (0x06, 0, 0, 0x00050000 | errno.EPERM)]
 
 

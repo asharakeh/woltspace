@@ -59,3 +59,17 @@ def terminal_line(fd):
         assert select.select([fd], [], [], 5)[0]
         line += os.read(fd, 128)
     return line
+
+
+def test_launcher_rejects_non_node_before_redemption(monkeypatch):
+    import pytest
+
+    def unexpected(*_):
+        pytest.fail("non-node peer reached broker redemption")
+
+    monkeypatch.setattr(launcher, "redeem", unexpected)
+    server, client = socket.socketpair()
+    with server, client:
+        client.sendall(b'{"op":"launch-redeem","session":"alpha","attempt":"aaaaaaaaaaaa"}\n')
+        with pytest.raises(ValueError, match="protected launch refused"):
+            launcher.spawn(server, os.getuid() + 1)

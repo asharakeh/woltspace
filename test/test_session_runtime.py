@@ -681,3 +681,41 @@ def test_host_tmux_paste_is_bracketed_then_submitted(tmp_path):
     body = received[len(start):-len(end + b"\r")]
     # tmux turns LF into CR inside a paste; inside brackets that is text, not submit.
     assert body.replace(b"\r", b"\n") == message.encode()
+
+
+@pytest.mark.parametrize("spawn_error", [False, True])
+def test_protected_start_cancels_and_settles_definite_launch_failure(tmp_path, monkeypatch, spawn_error):
+    import sessions
+
+    wolt = tmp_path / "alpha" / "wolt"
+    wolt.mkdir(parents=True)
+    (wolt / "wolt.json").write_text('{"name":"alpha","type":"beaver"}')
+    monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
+    monkeypatch.setattr(sessions, "WOLTS_DIR", tmp_path)
+    monkeypatch.setattr(sessions, "harness_install_problem", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sessions, "_await_agent", lambda *args: False)
+    effects = []
+
+    def control(operation, name, attempt, **kwargs):
+        effects.append((operation, name, attempt))
+        return {"result": "ok"}
+
+    def spawn(name, *_):
+        if spawn_error:
+            raise subprocess.CalledProcessError(1, "tmux")
+        return RuntimeHandle(name, name, "%1")
+
+    monkeypatch.setattr(sessions, "_launch_control", control)
+    monkeypatch.setattr(sessions, "_tmux_spawn", spawn)
+    monkeypatch.setattr(sessions, "_tmux_stop", lambda _: effects.append("stopped") or True)
+    monkeypatch.setattr(sessions, "_tmux_exists", lambda _: "stopped" not in effects)
+    error = subprocess.CalledProcessError if spawn_error else RuntimeError
+    with pytest.raises(error):
+        sessions.start_session(wolt="alpha", name="alpha-protected")
+
+    opened, *middle, cancelled = effects
+    assert opened[0] == "launch-open" and cancelled == ("launch-cancel", *opened[1:])
+    assert middle == ([] if spawn_error else ["stopped"])
+    stored = sessions.SessionRegistry(tmp_path).get("alpha-protected", wolt="alpha", check_alive=False)
+    assert stored["status"] == "stopped" and stored["stop_reason"] == "launch_failed"
+    assert "launching" not in stored

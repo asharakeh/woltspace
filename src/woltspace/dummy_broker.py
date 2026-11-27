@@ -644,6 +644,12 @@ class LaunchAttempts:
         self.pending = {}
         self.seen = {}  # reject repeated registration during the selector lifetime
 
+    def decision(self, caller, op, result, principal=None):
+        def record(db):
+            stored = db.execute("SELECT id FROM principals WHERE id = ?", (principal,)).fetchone()
+            return audit(db, caller, op, stored[0] if stored else None, "other", result)
+        return self.channels.dispatch.writer.submit(record)
+
     def open(self, wolt, session, attempt):
         with self.lock:
             now = time.monotonic()
@@ -655,30 +661,33 @@ class LaunchAttempts:
             current = self.pending.get(session)
             if (principal is None or (current and current[0] != principal)
                     or (bound and bound.principal != principal)):
-                return {"result": "denied"}
+                return self.decision("node", "launch-open", "denied", principal)
             selector = session, attempt
             if selector in self.seen:
-                return {"result": "denied"}
+                return self.decision("node", "launch-open", "denied", principal)
             if len(self.seen) >= BINDINGS:
-                return {"result": "busy"}
+                return self.decision("node", "launch-open", "busy", principal)
+            reply = self.decision("node", "launch-open", "ok", principal)
+            if reply != {"result": "ok"}:
+                return reply
             deadline = now + ATTEMPT_TTL
             self.seen[selector] = deadline
             self.pending[session] = principal, attempt, deadline
-            return {"result": "ok"}
+            return reply
 
     def redeem(self, session, attempt):
         with self.lock:
             current = self.pending.get(session)
             if not current or current[1] != attempt:
-                return {"result": "denied"}, None
+                return self.decision("host-admin", "launch-redeem", "denied"), None
             del self.pending[session]
             principal, _, expires = current
             if expires <= time.monotonic():
-                return {"result": "denied"}, None
+                return self.decision("host-admin", "launch-redeem", "denied", principal), None
             try:
                 issuer, worker = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             except OSError:
-                return {"result": "unavailable"}, None
+                return self.decision("host-admin", "launch-redeem", "unavailable", principal), None
             try:
                 with issuer:
                     result = self.channels.attach(principal, session, issuer.fileno())
@@ -693,9 +702,11 @@ class LaunchAttempts:
     def cancel(self, session, attempt):
         with self.lock:
             current = self.pending.get(session)
+            principal = None
             if current and current[1] == attempt:
-                del self.pending[session]
-        return {"result": "ok"}
+                principal = current[0]
+                del self.pending[session]  # a failed audit does not reopen cancelled authority
+            return self.decision("node", "launch-cancel", "ok", principal)
 
 
 class Broker:
@@ -752,11 +763,15 @@ class Broker:
             op = op if isinstance(op, str) else None
             if route == "launch":
                 reply = (self.launch_control(request) if uid == self.node_uid and not descriptors
-                         else {"result": "denied"})
-            elif route == "admin" and op == "launch-redeem" and owner and not descriptors:
+                         else self.launch_attempts.decision("worker", "launch-control", "denied"))
+            elif route == "admin" and op == "launch-redeem":
                 selector = self.launch_selector(request)
-                reply, endpoint = (self.launch_attempts.redeem(*selector) if selector
-                                   else ({"result": "invalid"}, None))
+                if not owner:
+                    reply = self.launch_attempts.decision("worker", "launch-redeem", "denied")
+                elif not selector or descriptors:
+                    reply = self.launch_attempts.decision(caller, "launch-redeem", "invalid")
+                else:
+                    reply, endpoint = self.launch_attempts.redeem(*selector)
             elif route == "create":  # any caller, ordinary create steps only; approval stays on the admin route
                 reply = (self.create("worker", request) if op in ORDINARY and not descriptors
                          else self.record("worker", "other", "denied"))
@@ -803,8 +818,8 @@ class Broker:
             selector = self.launch_selector(request)
             if selector:
                 return self.launch_attempts.cancel(*selector)
-        return {"result": "invalid"}
-
+        label = op if op in ("launch-open", "launch-cancel") else "launch-control"
+        return self.launch_attempts.decision("node", label, "invalid")
 
     def create(self, caller: str, request: dict) -> dict:
         fields = (OWNER if caller == "host-admin" else ORDINARY)[request["op"]]

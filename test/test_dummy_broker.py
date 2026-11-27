@@ -774,3 +774,31 @@ def test_launch_selectors_refuse_wrong_peer_replaced_cancelled_and_expired(store
     assert launch_exchange(b, dict(expired, op="launch-open", wolt="alpha"), "launch") == ("ok", None)
     assert launch_exchange(b, dict(expired, op="launch-redeem"), "admin") == ("denied", None)
     assert not b.authz.bindings
+
+
+def test_launch_audit_gates_selector_publication_and_records_refusals(store, owner, monkeypatch):
+    b = broker.Broker(store, node_uid=os.getuid())
+    principal = enrolled(b, "alpha")
+    selector = {"session": "alpha-audit", "attempt": "a" * 12}
+    request = dict(selector, op="launch-open", wolt="alpha")
+    redeem = dict(selector, op="launch-redeem")
+    original = broker.audit
+
+    def fail_open(db, caller, operation, *args):
+        if operation == "launch-open":
+            raise sqlite3.OperationalError("injected audit failure")
+        return original(db, caller, operation, *args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(broker, "audit", fail_open)
+        assert launch_exchange(b, request, "launch") == ("storage-error", None)
+    assert launch_exchange(b, redeem, "admin") == ("denied", None)
+    assert launch_exchange(b, request, "launch") == ("ok", None)
+    assert launch_exchange(b, dict(selector, op="launch-cancel"), "launch") == ("ok", None)
+    assert launch_exchange(b, redeem, "admin") == ("denied", None)
+    assert rows(store, "SELECT caller, op, principal, result FROM audit WHERE op LIKE 'launch-%' ORDER BY seq") == [
+        ("host-admin", "launch-redeem", None, "denied"),
+        ("node", "launch-open", principal, "ok"),
+        ("node", "launch-cancel", principal, "ok"),
+        ("host-admin", "launch-redeem", None, "denied"),
+    ]

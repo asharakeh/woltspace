@@ -2612,7 +2612,8 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
             return {"name": name, "url": session_url,
                     "status": "revived", "detail": detail}
         if protected:
-            raise ResumeFailed("protected session did not start in its existing tmux session")
+            _launch_control("launch-cancel", name, attempt)
+            raise ResumeFailed("protected session startup could not be confirmed in its existing tmux session")
         # In-place revival did not take. The pane we pasted into may be a
         # leftover login shell in a state that swallows the command, or the
         # wrapper died on arrival. Escalate to a clean tmux — but only after
@@ -2647,6 +2648,8 @@ def resume_session(name: str, prompt: str = "", *, only_resting: bool = False) -
         publish_runtime(registry, name, wolt, attempt, handle.to_record(), status="running")
     _schedule_pickup(wolt)
     if not _await_agent(handle, harness):
+        if protected:
+            _launch_control("launch-cancel", name, attempt)
         # run-session.sh may have exited before an agent appeared: a prepare
         # failure, a missing harness binary, an auth wall. Reporting
         # "respawned" here is what let the TUI attach to an empty shell and

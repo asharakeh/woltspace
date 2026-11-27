@@ -42,7 +42,7 @@ def main():
     parser.add_argument("--request", default="", help="Create request ID (32 hex; an isolated lodge only)")
     args = parser.parse_args()
     if protected_create.enabled():  # the host owner approves; rerun with the same ID once approved
-        terms = {"name": args.name, "type": args.type, "harness": "", "model": "", "display": "",
+        terms = {"name": args.name, "type": args.type, "harness": "", "model": "", "display": "", "policy": "",
                  "role": args.role, "description": args.description}
         reply = protected_create.create(args.request, terms, None, lambda linkage: create_creature_wolt(
             args.name, args.type, role=args.role, description=args.description, linkage=linkage))

@@ -197,6 +197,8 @@ def _create_creature_wolt(name: str, creature_type: str, role: str,
     if in_archive(name, wolts_dir=WOLTS_DIR):
         raise ValueError(f"an archived wolt is named {name}: unarchive or delete it first")
 
+    wolt_dir.mkdir()  # exclusive: a folder that appeared since the check is never written into
+
     # Check singleton constraint
     demoted = None
     if creature_type in SINGLETON_TYPES:

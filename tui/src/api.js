@@ -76,10 +76,12 @@ export const spawnSession = (wolt, workdir, executionPolicy) =>
     ...(workdir ? { workdir } : {}),
     ...(executionPolicy ? { execution_policy: executionPolicy } : {}),
   });
-export const createWolt = (name, type, workdir, executionPolicy) =>
+// request_id makes a retry the same create request (an isolated lodge waits for its owner).
+export const createWolt = (name, type, workdir, executionPolicy, requestId) =>
   post('/sessions/new/create', {
     name,
     type,
+    ...(requestId ? { request_id: requestId } : {}),
     ...(workdir ? { workdir } : {}),
     ...(executionPolicy ? { execution_policy: executionPolicy } : {}),
   });

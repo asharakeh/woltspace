@@ -3,7 +3,9 @@ import asyncio
 import json
 import os
 import runpy
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -18,7 +20,8 @@ import wolts
 from woltspace import dummy_broker as broker
 
 RID, OTHER = "a" * 32, "b" * 32
-TERMS = {"name": "wolt-a", "type": "beaver", "harness": "", "model": "", "display": "Wolt A", "role": "", "description": ""}
+TERMS = {"name": "wolt-a", "type": "beaver", "harness": "", "model": "", "display": "Wolt A", "policy": "", "role": "",
+         "description": ""}
 CLI = Path(__file__).parent.parent / "container" / "bin" / "create-creature-wolt"
 
 
@@ -184,11 +187,66 @@ def test_concurrent_retries_launch_once_and_an_uncertain_launch_waits_for_the_ow
     assert create(OTHER, other)["status"] == "launched" and calls[-1] == "launch"
 
 
+def test_a_retry_that_read_approved_never_touches_a_live_scaffold(lodge, monkeypatch):
+    request_and_approve()
+    read, scaffolding, finished, out = threading.Event(), threading.Event(), threading.Event(), {}
+    real_call = protected_create._call
+
+    def call(request):
+        reply = real_call(request)
+        if threading.current_thread().name == "late" and request["op"] == "create-request":
+            read.set()  # the late retry has seen "approved" ...
+            assert scaffolding.wait(5)  # ... and resumes only once the other one is inside its scaffold
+        return reply
+
+    def scaffold(linkage):
+        (lodge.wolts / "wolt-a").mkdir()
+        scaffolding.set()
+        assert finished.wait(5)
+
+    def late():
+        out["late"] = protected_create.create(RID, TERMS, lodge.wolts, scaffold, dict)
+        finished.set()
+
+    monkeypatch.setattr(protected_create, "_call", call)
+    thread = threading.Thread(target=late, name="late")
+    thread.start()
+    assert read.wait(5)
+    first = protected_create.create(RID, TERMS, lodge.wolts, scaffold, dict)
+    thread.join(5)
+    assert out["late"]["status"] == "scaffolding" and first["status"] == "launched"
+
+
+def test_a_folder_that_appears_after_the_check_is_never_written(tmp_path, monkeypatch):
+    import wolt_archive
+
+    monkeypatch.setattr(wolts, "WOLTS_DIR", tmp_path)
+
+    def appears(name, wolts_dir=None):  # runs after the existence check, before the scaffold
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "owner.txt").write_text("kept")
+        return False
+
+    monkeypatch.setattr(wolt_archive, "in_archive", appears)
+    with pytest.raises(FileExistsError):
+        wolts.create_creature_wolt("wolt-a", "beaver")
+    assert [p.name for p in (tmp_path / "wolt-a").iterdir()] == ["owner.txt"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_lodge_page_and_tui_keep_one_request_id_and_read_both_session_shapes():
+    test = Path(__file__).with_name("create-request.test.mjs")
+    run = subprocess.run(["node", "--test", str(test)], capture_output=True, text=True, timeout=60)
+    assert run.returncode == 0, run.stdout + run.stderr
+
+
 def test_name_is_held_until_retirement_and_restore_keeps_the_approved_id(lodge):
     pid = request_and_approve()["id"]
     snapshot = (lodge.store / "registry.db").read_bytes()  # old media: approved, not yet scaffolded
-    assert [ordinary(op="create-report", request=RID, stage=s)["status"] for s in ("scaffolding", "scaffolded")] == [
-        "scaffolding", "scaffolded"]
+    for stage in ("scaffolding", "scaffolded", "launching", "launched"):
+        if stage != "launched":  # an unfinished create keeps its name: before scaffold and before first launch
+            assert owner(op="rename", wolt="wolt-a", to="wolt-r") == {"result": "creating"}
+        assert ordinary(op="create-report", request=RID, stage=stage)["status"] == stage
     assert owner(op="rename", wolt="wolt-a", to="wolt-r") == {"result": "ok"}
     assert owner(op="enroll", wolt="wolt-r")["id"] == pid  # rename keeps the stable ID
     assert ordinary(op="create-request", request=OTHER, terms={**TERMS, "name": "wolt-r"}) == {"result": "name-held"}
@@ -223,11 +281,15 @@ def test_an_exact_stage_two_registry_migrates_once_and_keeps_its_rows(tmp_path):
 
 
 def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypatch, capsys):
+    import harnesses
     from server import app as app_module
+    from runtime_context import RuntimeContext
 
     for module in (app_module, wolts):
         monkeypatch.setattr(module, "WOLTS_DIR", lodge.wolts)
-    monkeypatch.setattr(app_module, "start_session", lambda **kwargs: {"name": f"{kwargs['wolt']}-session"})
+    launched = []
+    monkeypatch.setattr(app_module, "start_session",
+                        lambda **kwargs: launched.append(kwargs) or {"name": f"{kwargs['wolt']}-session"})
 
     async def post(**body):
         transport = httpx.ASGITransport(app=app_module.app)
@@ -238,12 +300,24 @@ def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypa
     with pytest.raises(PermissionError):
         wolts.create_creature_wolt("wolt-z", "beaver")  # no direct scaffold while isolation is on
     assert asyncio.run(post()).status_code == 409  # no request ID: refused, nothing reserved
+    assert asyncio.run(post(request_id=RID, workdir=str(lodge.wolts))).status_code == 400
     pending = asyncio.run(post(request_id=RID))
     assert pending.status_code == 202 and pending.json()["status"] == "pending" and not any(lodge.wolts.iterdir())
+    assert pending.json()["detail"] == f"waiting for the host owner: woltspace secrets review {pending.json()['code']}"
+    terms = owner(op="review", code=pending.json()["code"])["terms"]
+    assert terms["harness"] == "claude" and terms["policy"]  # the effective engine and level are approved terms
+    other_level = next(level for level in harnesses.levels(RuntimeContext.from_env().isolation)["claude"]
+                       if level != terms["policy"])
+    assert asyncio.run(post(request_id=RID, execution_policy=other_level)).json()["result"] == "conflict"
+    monkeypatch.setattr(app_module, "get_default_harness", lambda: "codex")  # the lodge default moved on
+    monkeypatch.setattr(app_module, "harness_install_problem", lambda *args, **kwargs: None)
+    assert asyncio.run(post(request_id=RID)).json()["result"] == "conflict"
+    monkeypatch.setattr(app_module, "get_default_harness", lambda: "claude")
     fingerprint = owner(op="review", code=pending.json()["code"])["fingerprint"]
     pid = owner(op="approve", code=pending.json()["code"], terms=fingerprint)["id"]
     done = asyncio.run(post(request_id=RID))
     assert done.status_code == 200 and done.json()["session"] == {"name": "wolt-a-session"}
+    assert [(k["harness"], k["execution_policy"]) for k in launched] == [(terms["harness"], terms["policy"])]
     assert (lodge.wolts / "wolt-a" / protected_create.MARKER).read_text() == f"{RID} {pid}\n"
     assert (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").is_file()
     assert asyncio.run(post(request_id=RID)).json()["status"] == "launched"  # a replay starts nothing new

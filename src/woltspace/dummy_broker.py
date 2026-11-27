@@ -42,7 +42,7 @@ PRINCIPAL = re.compile(r"p-[0-9a-f]{32}")
 # Protected create: the ordinary node may only ask and report; the owner reviews and approves exact terms.
 ORDINARY = {"create-request": ("request", "terms"), "create-status": ("request",), "create-report": ("request", "stage")}
 OWNER = {"review": ("code",), "approve": ("code", "terms"), "reconcile": ("code",), "reject": ("code",)}
-TERMS = ("name", "type", "harness", "model", "display", "role", "description")
+TERMS = ("name", "type", "harness", "model", "display", "policy", "role", "description")
 CHECKS = {"request": re.compile(r"[0-9a-f]{32}"), "code": re.compile(r"c-[0-9a-f]{8}"),
           "stage": re.compile(r"scaffolding|scaffolded|ambiguous|launching|launched|launch-failed"),
           "terms": re.compile(r"[0-9a-f]{12}")}
@@ -285,6 +285,9 @@ def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
     elif op == "rename":
         if db.execute("SELECT 1 FROM principals WHERE name = ?", (to,)).fetchone():  # keep the old name
             return audit(db, "host-admin", op, pid, label, "exists", lambda authz: authz.widen({wolt: pid}))
+        if db.execute("SELECT 1 FROM creates WHERE principal = ? AND status NOT IN ('launched', 'retired')",
+                      (pid,)).fetchone():  # an unfinished create still scaffolds or launches under this name
+            return audit(db, "host-admin", op, pid, label, "creating", lambda authz: authz.widen({wolt: pid}))
         db.execute("UPDATE principals SET name = ? WHERE id = ?", (to, pid))
         change = lambda authz: (authz.drop(op, pid, wolt), authz.widen({to: pid}))
     elif op == "retire":

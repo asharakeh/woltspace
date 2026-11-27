@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { spawnTarget } from './session-view.js';
 
 export const woltTypes = ['raccoon', 'beaver', 'otter'];
@@ -10,6 +11,18 @@ export function validateWoltName(value) {
     return 'use lowercase letters, numbers, and hyphens; start with a letter';
   }
   return '';
+}
+
+// One request ID for the whole wait: a pending answer is resubmitted unchanged until the
+// host owner approves it; the first session's name is top level or under `session`.
+export async function createUntilStarted(create, action, { say, wait, newId = () => randomUUID().replaceAll('-', '') }) {
+  const requestId = newId();
+  for (;;) {
+    const r = await create(action.name, action.woltType, action.workdir, action.executionPolicy, requestId);
+    if (r?.status !== 'pending') return (r?.session || r)?.name;
+    say(r.detail);
+    await wait();
+  }
 }
 
 export function createWoltAction(name, type, capabilities, launchCwd, level = '') {

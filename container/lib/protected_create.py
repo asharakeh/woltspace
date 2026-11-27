@@ -39,13 +39,13 @@ def create(request_id: str, terms: dict, wolts_dir: Path | None, scaffold, launc
     if reply.get("result") != "ok" or reply["status"] not in {"approved", "scaffolded", "launch-failed"}:
         return reply  # pending, claimed, ambiguous, launched, retired or a refusal: recorded state only
     if reply["status"] == "approved":
+        if lost := _claim(request_id, "scaffolding"):  # claimed before the folder is even looked at
+            return lost
         folder = wolts_dir / terms["name"]
         if folder.exists() or folder.is_symlink():
             # Nothing in the ordinary writable tree proves which request made a folder, a partial
             # scaffold of this one included: leave it untouched for protected owner reconciliation.
             return _report(request_id, "ambiguous") | {"status": "ambiguous"}
-        if lost := _claim(request_id, "scaffolding"):
-            return lost
         try:
             scaffold(f"{request_id} {reply['id']}\n")
         except Exception:

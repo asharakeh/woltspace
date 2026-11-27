@@ -992,6 +992,20 @@ function updateCreatePreview() {
   showCreateNameWarning(createNameWarning());
 }
 
+// An isolated lodge answers a create with a pending request for the host owner to approve.
+// One request ID per exact form, kept across "check again", so a retry is the same request.
+let createRequest = null;
+function createRequestBody(payload, newId = () => crypto.randomUUID().replaceAll('-', '')) {
+  const key = JSON.stringify(payload);
+  if (!createRequest || createRequest.key !== key) createRequest = { key, id: newId() };
+  return { ...payload, request_id: createRequest.id };
+}
+
+// The first session's name: top level on an ordinary lodge, under `session` on an isolated one.
+function createdSessionName(data) {
+  return (data.session || data).name;
+}
+
 // Create is never a dead button: pressed too early, it says what is missing.
 async function submitCreateWolt() {
   const name = createWoltName();
@@ -1013,14 +1027,21 @@ async function submitCreateWolt() {
     const res = await fetch('/sessions/new/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      body: JSON.stringify(createRequestBody({
         name,
         type: createSelectedType,
         harness: createSelectedHarness,
         ...(createSelectedModel() ? { model: createSelectedModel() } : {}),
-      }),
+      })),
     });
     const data = await res.json();
+    if (res.status === 202) {  // pending: show the code and how the owner approves it, keep the form
+      error.textContent = data.detail;
+      error.style.display = 'block';
+      submit.textContent = 'Check again';
+      submit.disabled = false;
+      return;
+    }
     if (!res.ok) {
       error.textContent = data.detail || 'failed to create wolt';
       error.style.display = 'block';
@@ -1029,7 +1050,9 @@ async function submitCreateWolt() {
       return;
     }
     closeCreateWolt();
-    if (data.name) WoltspaceNavigation.internal('/tui?session=' + encodeURIComponent(data.name));
+    createRequest = null;
+    const session = createdSessionName(data);
+    if (session) WoltspaceNavigation.internal('/tui?session=' + encodeURIComponent(session));
     loadWolts();
   } catch (e) {
     error.textContent = 'network error — try again';

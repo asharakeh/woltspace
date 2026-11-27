@@ -1,0 +1,16 @@
+name: Ordinary protected stock Codex
+on:
+  push:
+    branches: [test/identity-broker-stock]
+permissions:
+  contents: read
+jobs:
+  ordinary-stock:
+    if: github.event.repository.fork == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: env -i PATH=/usr/local/bin:/usr/bin:/bin bash test/ordinary-stock-fixture/hosted.sh

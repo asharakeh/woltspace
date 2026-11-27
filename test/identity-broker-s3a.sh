@@ -11,7 +11,7 @@ annotate_failure() {
         *) failed_phase=setup ;;
     esac
     [[ $source_line =~ ^[1-9][0-9]{0,5}$ ]] || source_line=1
-    printf '::error::identity-broker-s3a phase=%s line=%s\n' "$failed_phase" "$source_line" >&3
+    printf '::error::broker-smoke phase=%s line=%s\n' "$failed_phase" "$source_line" >&3
 }
 trap 'failure_line=$LINENO' ERR
 root=$(mktemp -d) || { annotate_failure setup "$LINENO"; echo 'FAIL setup' >&3; exit 1; }
@@ -84,10 +84,31 @@ broker_uids() {
         awk '$3 == "-I" && $4 == "-S" && $5 ~ /\/dummy_broker\.py$/ { print $1 }'
 }
 
+dummy_engine() {
+    [[ $(docker exec --user node "$name" sh -c 'command -v claude') == /home/node/.local/bin/claude ]]
+    # The image's engine binary, replaced in this disposable container by an offline stand-in:
+    # no provider, credentials or network. Without a terminal (boot's `claude plugin`) it exits at once;
+    # in a session's tmux pane it records one start in its working folder and stays up.
+    docker exec -i -u 0 "$name" sh -ec '
+        engine=/home/node/.local/bin/claude
+        [ -e "$engine" ] || [ -L "$engine" ]
+        rm -f "$engine"
+        cat >"$engine"
+        chmod 0755 "$engine"
+    ' <<'ENGINE'
+#!/bin/sh
+[ -t 0 ] || exit 0
+printf 'start\n' >>.dummy-engine
+while :; do sleep 60; done
+ENGINE
+}
+starts_of() { wc -l <"$WOLTSPACE_WOLTS_DIR/$1/.dummy-engine"; }
+
 phase=flag-off
 printf 'DEV_MODE=false\nWOLTSPACE_PUBLIC_TUNNEL=false\n' >"$WOLTSPACE_WOLTS_DIR/.env"
 ./woltspace start
 health
+dummy_engine
 uids=$(broker_uids)
 [[ -z $uids ]]
 docker exec "$name" test ! -e "${store%/*}"
@@ -95,6 +116,9 @@ docker exec "$name" test ! -e "${store%/*}"
 flag_off=$(curl --noproxy '*' -sS --max-time 30 -o /dev/null -w '%{http_code}' -H 'content-type: application/json' \
     -d '{"name": "wolt-o", "type": "beaver"}' http://127.0.0.1:17777/sessions/new/create)
 [[ $flag_off == 200 && -f $WOLTSPACE_WOLTS_DIR/wolt-o/wolt/wolt.json && ! -e $WOLTSPACE_WOLTS_DIR/wolt-o/.state/create-request ]]
+deadline=$((SECONDS + 30))
+until [[ -s $WOLTSPACE_WOLTS_DIR/wolt-o/.dummy-engine ]]; do (( SECONDS < deadline )); sleep 1; done
+[[ $(starts_of wolt-o) == 1 ]]  # the ordinary create really started its first session, once
 [[ $(curl --noproxy '*' -fsS --max-time 5 http://127.0.0.1:17777/sessions |
     python3 -c 'import json,sys; print(sum(s.get("wolt") == "wolt-o" for s in json.load(sys.stdin)))') == 1 ]]
 ./woltspace stop
@@ -126,6 +150,7 @@ export WOLTSPACE_FEATURE_ISOLATION=true
 printf 'DEV_MODE="true"\nWOLTSPACE_PUBLIC_TUNNEL=false\n' >"$WOLTSPACE_WOLTS_DIR/.env"
 ./woltspace start
 check_isolation
+dummy_engine
 docker logs "$name" 2>&1 | grep -E '^setup complete: .* dev=True$' >/dev/null
 echo 'PASS flag-on' >&3
 
@@ -230,7 +255,8 @@ s = json.load(sys.stdin); sys.exit(0 if (s["status"], s.get("tmux_alive"), s.get
         (( SECONDS < deadline )) || return 1
         sleep 1
     done
-    [[ $(sessions_of "$1") == 1 ]]
+    until [[ -s $WOLTSPACE_WOLTS_DIR/$1/.dummy-engine ]]; do (( SECONDS < deadline )) || return 1; sleep 1; done
+    [[ $(sessions_of "$1") == 1 && $(starts_of "$1") == 1 ]]  # one registry session, one engine start
 }
 rid_a=$(token)
 body=$(printf '{"name": "wolt-p", "type": "beaver", "request_id": "%s"}' "$rid_a")
@@ -246,7 +272,7 @@ result_of creating rename wolt-p wolt-q  # an unfinished create keeps its name
 [[ $(api "$body") == 200 && $(field status) == launched && $(field id) == "$pid" ]]
 first_session wolt-p
 [[ $(cat "$WOLTSPACE_WOLTS_DIR/wolt-p/.state/create-request") == "$rid_a $pid" ]]
-[[ $(api "$body") == 200 && $(field status) == launched && $(sessions_of wolt-p) == 1 ]]  # a replay starts nothing
+[[ $(api "$body") == 200 && $(field status) == launched && $(sessions_of wolt-p) == 1 && $(starts_of wolt-p) == 1 ]]  # a replay starts nothing
 echo 'PASS create' >&3
 
 phase=recover

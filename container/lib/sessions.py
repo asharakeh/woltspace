@@ -775,11 +775,10 @@ class SessionRegistry:
         """Check all 'running' sessions against tmux. Mark dead ones as orphaned."""
         live_sessions = _tmux_sessions()
         orphaned = []
-        markers = _markers_on(self.wolts_dir)
         with self._tx() as conn:
             for data in self._rows(conn):
                 if (data.get("status") == "running" and data.get("name") not in live_sessions
-                        and not (markers and data.get("launching"))):  # an unresolved launch stays unknown
+                        and not unresolved_launch(data, self.wolts_dir)):
                     data["status"] = "orphaned"
                     data["orphaned_reason"] = ORPHAN_TMUX_MISSING
                     data["last_activity"] = int(time.time())

@@ -894,3 +894,21 @@ def test_dummy_resume_ignores_a_legacy_conversation_id(monkeypatch):
                         lambda *args, **kwargs: calls.append((args, kwargs)) or {"result": "ok"})
     assert "bridge" in sessions._open_launch("alpha", "alpha", "a" * 12, conversation="legacy-id")
     assert calls == [(("launch-open", "alpha", "a" * 12), {"wolt": "alpha"})]
+
+
+
+def test_reconcile_keeps_unresolved_stock_launch_with_inbox_off(tmp_path, monkeypatch):
+    import sessions
+
+    (tmp_path / "alpha" / "wolt").mkdir(parents=True)
+    monkeypatch.setattr(sessions, "_markers_on", lambda *_: False)
+    monkeypatch.setattr(sessions, "_tmux_sessions", lambda: set())
+    registry = sessions.SessionRegistry(tmp_path)
+    registry.create("alpha-stock", wolt="alpha")
+    registry.create("alpha-dummy", wolt="alpha")
+    registry.update("alpha-stock", wolt="alpha", status="running",
+                    launching={"attempt": "a" * 12, "stock": True})
+    registry.update("alpha-dummy", wolt="alpha", status="running",
+                    launching={"attempt": "b" * 12})
+    assert registry.reconcile() == ["alpha-dummy"]
+    assert registry.get("alpha-stock", check_alive=False)["status"] == "running"

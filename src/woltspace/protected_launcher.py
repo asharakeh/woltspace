@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
+import secrets
 import select
 import signal
 import socket
@@ -15,6 +17,7 @@ import struct
 import subprocess
 import sys
 import termios
+import time
 import tty
 
 from . import dummy_broker
@@ -152,38 +155,62 @@ def request(conn, node_uid):
     return selector
 
 
-def reap_status(session, attempt, timeout):
-    """Node-facing lookup verifies the launcher peer before accepting a receipt."""
+def _receipt(session, attempt, timeout):
+    """Read a bounded, root-peer launcher observation."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
             conn.settimeout(timeout)
             conn.connect(str(PATH))
             _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
             if uid != 0:
-                return "unavailable"
+                return {}
             selector = {"op": "launch-receipt", "session": session, "attempt": attempt}
             conn.sendall(json.dumps(selector).encode() + b"\n")
             with conn.makefile("rb") as stream:
                 reply = json.loads(stream.readline(128), object_pairs_hook=dummy_broker._unique)
-            for status in ("pending", "reaped"):
-                if reply == {"result": status}:
-                    return status
+            if (isinstance(reply, dict) and reply.keys() == {"result", "epoch"}
+                    and isinstance(reply["epoch"], str) and re.fullmatch(r"[0-9a-f]{32}", reply["epoch"])
+                    and reply["result"] in ("pending", "reaped", "no-owned-launch", "unrecorded", "unavailable")):
+                return reply
     except (OSError, ValueError, RecursionError):
         pass
+    return {}
+
+
+def launcher_epoch(session, attempt):
+    return _receipt(session, attempt, 1).get("epoch")
+
+
+def reap_status(session, attempt, timeout, epoch=None):
+    reply = _receipt(session, attempt, timeout)
+    if epoch is not None and reply.get("epoch") == epoch:
+        return reply["result"]
     return "unavailable"
+
+
+class NoOwnedLaunch(ValueError):
+    """The exact launch could not reach process creation."""
 
 
 def spawn(conn, node_uid, selector=None, stock=False):
     selector = request(conn, node_uid) if selector is None else selector
     if selector["op"] != "launch-redeem":
         raise ValueError("protected launch refused")
-    fd, identity = redeem(json.dumps(selector).encode() + b"\n")
+    try:
+        fd, identity = redeem(json.dumps(selector).encode() + b"\n")
+    except (OSError, ValueError, RecursionError) as error:
+        if stock:
+            raise NoOwnedLaunch("protected launch refused") from error
+        raise
     try:
         conn.setblocking(True)
         if stock:
-            if identity is None:
-                raise ValueError("protected launch refused")
-            state = private_engine_state(*identity)
+            try:
+                if identity is None:
+                    raise ValueError("protected launch refused")
+                state = private_engine_state(*identity)
+            except (OSError, ValueError) as error:
+                raise NoOwnedLaunch("protected launch refused") from error
             return subprocess.Popen(
                 [sys.executable, "-I", "-m", "woltspace.protected_stock",
                  str(fd), str(state), identity[0]],
@@ -212,6 +239,14 @@ def serve():
     signal.signal(signal.SIGTERM, stop)
     stock = stock_enabled()
     children, receipts = {}, OrderedDict()
+    epoch = secrets.token_hex(16)
+
+    def remember(key, result):
+        receipts[key] = result
+        receipts.move_to_end(key)
+        if len(receipts) > dummy_broker.BINDINGS:
+            receipts.popitem(last=False)
+
     with dummy_broker.listen(PATH, 0o666) as listener:
         listener.settimeout(.1)
         print("accepted", flush=True)
@@ -222,9 +257,7 @@ def serve():
                     if code is not None:
                         del children[key]
                         if stock:
-                            receipts[key] = "reaped" if code == 0 else "unavailable"
-                            if len(receipts) > dummy_broker.BINDINGS:
-                                receipts.popitem(last=False)
+                            remember(key, "reaped" if code == 0 else "unavailable")
                 try:
                     conn, _ = listener.accept()
                 except TimeoutError:
@@ -236,25 +269,41 @@ def serve():
                         if selector["op"] == "launch-receipt":
                             if stock:
                                 result = ("pending" if key in children
-                                          else receipts.get(key, "unavailable"))
-                                conn.sendall(json.dumps({"result": result}).encode() + b"\n")
+                                          else receipts.get(key, "unrecorded"))
+                                conn.sendall(json.dumps({"result": result, "epoch": epoch}).encode() + b"\n")
                         elif (len(children) < dummy_broker.BINDINGS and key not in children
                               and (not stock or not any(name == key[0] for name, _ in children))):
-                            children[key] = spawn(conn, node_uid, selector, stock)
                             if stock:
-                                for previous in [saved for saved in receipts if saved[0] == key[0]]:
-                                    del receipts[previous]
+                                if key in receipts:
+                                    continue
+                                remember(key, "unavailable")
+                            try:
+                                children[key] = spawn(conn, node_uid, selector, stock)
+                            except NoOwnedLaunch:
+                                remember(key, "no-owned-launch")
+                                continue
+                            if stock:
+                                for previous in [saved for saved in receipts
+                                                 if saved[0] == key[0] and saved != key]:
+                                    receipts[previous] = "unavailable"
                     except (OSError, ValueError, RecursionError):
                         pass  # close this connection; the node reports a fixed refusal
         finally:
+            failed = False
             for child in children.values():
-                if stock:
-                    child.terminate()  # supervisor receives the signal and owns teardown
-                else:
-                    child.kill()
+                try:
+                    child.terminate() if stock else child.kill()
+                except OSError:
+                    failed = True
+            deadline = time.monotonic() + 10
             for child in children.values():
-                child.wait(timeout=10)
+                try:
+                    child.wait(timeout=max(0, deadline - time.monotonic()))
+                except (OSError, subprocess.TimeoutExpired):
+                    failed = True
             PATH.unlink(missing_ok=True)
+            if failed:
+                raise RuntimeError("protected launcher shutdown unconfirmed")
 
 
 def fenced() -> bool:

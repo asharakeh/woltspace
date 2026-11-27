@@ -702,10 +702,14 @@ class LaunchAttempts:
                 principal = self.authz.names.get(wolt)
                 bound = self.authz.bindings.get(session)
             current = self.pending.get(session)
+            selector = session, attempt
             if (principal is None or (current and current[0] != principal)
                     or (bound and bound.principal != principal)):
-                return self.decision("node", "launch-open", "denied", principal)
-            selector = session, attempt
+                reply = self.decision("node", "launch-open", "denied", principal)
+                if (conversation is not None and reply == {"result": "denied"}
+                        and selector not in self.seen and (not current or current[1] != attempt)):
+                    return {"result": "not-opened"}
+                return reply
             if selector in self.seen:
                 return self.decision("node", "launch-open", "denied", principal)
             if len(self.seen) >= BINDINGS:
@@ -744,14 +748,17 @@ class LaunchAttempts:
             worker.close()
             return result, None
 
-    def cancel(self, session, attempt):
+    def cancel(self, session, attempt, proof=False):
         with self.lock:
             current = self.pending.get(session)
             principal = None
             if current and current[1] == attempt:
                 principal = current[0]
                 del self.pending[session]  # a failed audit does not reopen cancelled authority
-            return self.decision("node", "launch-cancel", "ok", principal)
+            reply = self.decision("node", "launch-cancel", "ok", principal)
+            if proof and reply == {"result": "ok"} and principal is not None:
+                return {"result": "cancelled-before-redeem"}
+            return reply
 
 
 class Broker:
@@ -871,9 +878,10 @@ class Broker:
             if selector and isinstance(wolt, str) and NAME.fullmatch(wolt):
                 return self.launch_attempts.open(wolt, *selector, conversation=conversation)
         elif op == "launch-cancel":
-            selector = self.launch_selector(request)
+            proof = request.get("proof") is True
+            selector = self.launch_selector(request, *(("proof",) if proof else ()))
             if selector:
-                return self.launch_attempts.cancel(*selector)
+                return self.launch_attempts.cancel(*selector, proof=proof)
         label = op if op in ("launch-open", "launch-cancel") else "launch-control"
         return self.launch_attempts.decision("node", label, "invalid")
 

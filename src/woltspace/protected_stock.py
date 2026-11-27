@@ -45,7 +45,10 @@ def serve(fd, state, principal):
     worker.ROOT, worker.WORKDIR = control, home
     with socket.socket(fileno=fd) as channel, HTTPServer(("127.0.0.1", 0), worker.Endpoint) as endpoint:
         channel.settimeout(2)
-        hello = json.loads(channel.recv(512))
+        raw, _, flags, _ = channel.recvmsg(512)
+        if flags & socket.MSG_TRUNC:
+            return 1
+        hello = json.loads(raw)
         if hello.pop("result") != "ok" or hello.get("principal") != principal:
             return 1
         endpoint.accepted = []

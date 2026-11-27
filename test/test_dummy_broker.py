@@ -852,3 +852,18 @@ def test_refusals_from_non_owners_are_audited_up_to_a_budget_per_window(store, o
     assert {ask(b, b"not json\n")["result"] for _ in range(broker.DENIALS + 2)} == {"invalid"}
     assert rows(store, "SELECT count(*) FROM audit WHERE caller = 'host-admin' AND result = 'invalid'") == [
         (broker.DENIALS + 2,)]
+
+
+def test_launch_cancel_proof_only_when_it_wins_before_redeem(store, owner):
+    b = broker.Broker(store, node_uid=os.getuid())
+    enrolled(b, "alpha")
+    selector = {"session": "alpha-stock", "attempt": "a" * 12}
+    cancel = dict(selector, op="launch-cancel", proof=True)
+    refused = dict(selector, op="launch-open", wolt="absent",
+                   conversation="11223344-5566-7788-99aa-bbccddeeff00")
+    assert launch_exchange(b, refused, "launch") == ("not-opened", None)
+    assert launch_exchange(b, cancel, "launch") == ("ok", None)
+    assert launch_exchange(b, dict(selector, op="launch-open", wolt="alpha"), "launch") == ("ok", None)
+    assert launch_exchange(b, cancel, "launch") == ("cancelled-before-redeem", None)
+    assert launch_exchange(b, dict(selector, op="launch-redeem"), "admin") == ("denied", None)
+    assert launch_exchange(b, cancel, "launch") == ("ok", None)

@@ -1763,10 +1763,17 @@ def mark_launching(registry: "SessionRegistry", name: str, wolt: str, harness: s
     if not mode and not track:
         return ""
     attempt = lifecycle.new_attempt()
+    stock = track and _protected_stock_enabled()
+    epoch = None
+    if stock:
+        from woltspace import protected_launcher
+        epoch = protected_launcher.launcher_epoch(name, attempt)
+        if epoch is None:
+            raise lifecycle.LifecycleUnknown("protected launcher unavailable")
     native = _native_adapters() if mode == "native" else None
     registry.update(name, wolt=wolt, launching={
         "attempt": attempt, "at": int(time.time()), "inbox_adapter": mode,
-        **({"stock": True} if track and _protected_stock_enabled() else {}),
+        **({"stock": True, "stock_epoch": epoch} if stock else {}),
         # {kind, addr: a new private attempt dir, attempt}, or None: no native input
         "native": native.prepare(registry.wolts_dir, name, resolve_harness(harness), attempt)
         if native else None})
@@ -1788,7 +1795,7 @@ def publish_runtime(registry: "SessionRegistry", name: str, wolt: str, attempt: 
             return False
         current.update(fields, runtime=runtime, attempt=attempt, last_activity=int(time.time()))
         if marker.get("stock") is True:
-            current["stock_attempt"] = attempt
+            current.update(stock_attempt=attempt, stock_epoch=marker["stock_epoch"])
         current.pop("launching")
         for key in ("native", "inbox_adapter"):
             if marker.get(key):
@@ -2324,11 +2331,18 @@ def _launch_control(op, name, attempt, **fields):
     )
 
 
+class _ProtectedLaunchNotOpened(subprocess.CalledProcessError):
+    """The exact request was refused before issuing launch authority."""
+
+
 def _open_launch(name, wolt, attempt, prompt="", *, resume=False, conversation=None):
     if not _protected_launch_enabled():
         return build_session_command(name, prompt, resume=True) if resume else build_session_command(name, prompt)
-    identity = {"conversation": conversation} if conversation is not None else {}
-    if _launch_control("launch-open", name, attempt, wolt=wolt, **identity) != {"result": "ok"}:
+    identity = {"conversation": conversation} if _protected_stock_enabled() else {}
+    reply = _launch_control("launch-open", name, attempt, wolt=wolt, **identity)
+    if reply != {"result": "ok"}:
+        if reply == {"result": "not-opened"}:
+            raise _ProtectedLaunchNotOpened(1, "protected session launch")
         raise subprocess.CalledProcessError(1, "protected session launch")
     return shlex.join([sys.executable, "-I", "-m", "woltspace.protected_launcher", "bridge", name, attempt])
 
@@ -2370,10 +2384,20 @@ def _launch_step(registry, name: str, wolt: str, attempt: str, where, *, settle:
     try:
         yield
     except Exception as exc:
-        if attempt and _protected_launch_enabled():
-            _launch_control("launch-cancel", name, attempt)
-        if attempt and (isinstance(exc, subprocess.CalledProcessError) or _tmux_exists(where) is False):
+        row = registry.get(name, wolt=wolt, check_alive=False) if attempt else None
+        marker = (row or {}).get("launching") or {}
+        if marker.get("attempt") == attempt and marker.get("stock") is True:
+            try:
+                _stock_stop_evidence(name, attempt, marker.get("stock_epoch"),
+                                     not_opened=isinstance(exc, _ProtectedLaunchNotOpened))
+            except lifecycle.LifecycleUnknown:
+                raise exc from None  # preserve the unresolved attempt and the launch error
             _launch_failed(registry, name, wolt, attempt, settle=settle)
+        else:
+            if attempt and _protected_launch_enabled():
+                _launch_control("launch-cancel", name, attempt)
+            if attempt and (isinstance(exc, subprocess.CalledProcessError) or _tmux_exists(where) is False):
+                _launch_failed(registry, name, wolt, attempt, settle=settle)
         raise
 
 
@@ -2709,30 +2733,39 @@ def _protected_stock_enabled():
     return protected_launcher.stock_enabled()
 
 
+def _stock_stop_evidence(name, attempt, epoch, *, not_opened=False):
+    """Cancellation and authoritative launcher evidence must agree on the attempt lifetime."""
+    from woltspace import protected_launcher
+
+    if attempt and epoch:
+        cancellation = _launch_control("launch-cancel", name, attempt, proof=True)
+        if cancellation in ({"result": "ok"}, {"result": "cancelled-before-redeem"}):
+            deadline = time.monotonic() + 8
+            while (remaining := deadline - time.monotonic()) > 0:
+                status = protected_launcher.reap_status(name, attempt, min(1, remaining), epoch)
+                if status in ("reaped", "no-owned-launch"):
+                    return status
+                if status == "unrecorded" and (not_opened or cancellation == {"result": "cancelled-before-redeem"}):
+                    return "no-owned-launch"
+                if status != "pending":
+                    break
+                time.sleep(min(.05, remaining))
+    raise lifecycle.LifecycleUnknown("protected engine teardown could not be confirmed")
+
+
 def _settle_protected_reap(registry, name, wolt, data):
-    # The published marker stays until this exact attempt is verified. It is
-    # independent of the current profile and of the launcher's bounded receipts.
     if "stock_attempt" not in data:
         return
-    from woltspace import protected_launcher
-    attempt = data["stock_attempt"]
-    if attempt and attempt == data.get("attempt") and _launch_control(
-        "launch-cancel", name, attempt
-    ) == {"result": "ok"}:
-        deadline = time.monotonic() + 8
-        while (remaining := deadline - time.monotonic()) > 0:
-            status = protected_launcher.reap_status(name, attempt, min(1, remaining))
-            if status == "reaped":
-                with registry.edit(name, wolt=wolt) as current:
-                    if (current is not None and current.get("stock_attempt") == attempt
-                            and current.get("attempt") == attempt):
-                        del current["stock_attempt"]
-                        return
-                break
-            if status != "pending":
-                break
-            time.sleep(min(.05, remaining))
-    raise lifecycle.LifecycleUnknown("protected engine reap could not be confirmed")
+    attempt, epoch = data["stock_attempt"], data.get("stock_epoch")
+    if attempt != data.get("attempt"):
+        raise lifecycle.LifecycleUnknown("protected attempt identity changed")
+    _stock_stop_evidence(name, attempt, epoch)
+    with registry.edit(name, wolt=wolt) as current:
+        if (current is None or current.get("stock_attempt") != attempt
+                or current.get("attempt") != attempt or current.get("stock_epoch") != epoch):
+            raise lifecycle.LifecycleUnknown("protected attempt identity changed")
+        del current["stock_attempt"]
+        del current["stock_epoch"]
 
 
 @contextmanager
@@ -2751,9 +2784,11 @@ def _ending(registry: "SessionRegistry", data: dict):
             _tmux_stop(data)
         marker = data.get("launching") or {}
         if marker.get("stock") is True:
-            _launch_control("launch-cancel", data["name"], marker["attempt"])
+            _stock_stop_evidence(data["name"], marker["attempt"], marker.get("stock_epoch"))
+            _launch_failed(registry, data["name"], wolt, marker["attempt"], settle=False)
+        else:
+            refuse_unresolved(data)
         _settle_protected_reap(registry, data["name"], wolt, data)
-        refuse_unresolved(data)
         yield wolt, tmux_alive
 
 

@@ -190,3 +190,33 @@ def test_stock_replacement_waits_and_invalidates_the_old_receipt(monkeypatch):
     launcher.serve()
     assert spawned == [old, new]
     assert replies == ["pending", "between", "reaped", "unavailable"]
+
+
+def test_reap_status_rejects_another_launcher_epoch(monkeypatch):
+    import io
+    import struct
+    from unittest.mock import MagicMock
+
+    conn = MagicMock()
+    conn.__enter__.return_value = conn
+    conn.getsockopt.return_value = struct.pack("3i", 42, 0, 0)
+    conn.makefile.side_effect = lambda *_: io.BytesIO(
+        b'{"result":"no-owned-launch","epoch":"' + b'a' * 32 + b'"}\n')
+    monkeypatch.setattr(launcher.socket, "socket", lambda *_: conn)
+    assert launcher.reap_status("alpha", "a" * 12, 1, "b" * 32) == "unavailable"
+    assert launcher.reap_status("alpha", "a" * 12, 1, "a" * 32) == "no-owned-launch"
+
+
+def test_stock_refused_redeem_is_an_exact_pre_spawn_failure(monkeypatch):
+    import pytest
+
+    def refused(_):
+        raise ValueError("broker refused")
+
+    monkeypatch.setattr(launcher, "redeem", refused)
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *_a, **_kw: pytest.fail("unexpected spawn"))
+    server, client = socket.socketpair()
+    with server, client:
+        selector = {"op": "launch-redeem", "session": "alpha", "attempt": "a" * 12}
+        with pytest.raises(launcher.NoOwnedLaunch):
+            launcher.spawn(server, os.getuid(), selector, stock=True)

@@ -758,12 +758,18 @@ def test_protected_resume_timeout_cancels_without_settling_uncertain_launch(tmp_
     assert stored["runtime"]["pane_id"] == ("%1" if saved_pane else "%2")
 
 
-@pytest.mark.parametrize("receipt", ["reaped", "unavailable"])
-def test_stock_stop_settles_only_a_verified_attempt(tmp_path, monkeypatch, receipt):
+@pytest.mark.parametrize(("receipt", "cancel_result", "settled"), [
+    ("reaped", "ok", True),
+    ("no-owned-launch", "ok", True),
+    ("unrecorded", "cancelled-before-redeem", True),
+    ("unrecorded", "ok", False),
+    ("unavailable", "cancelled-before-redeem", False),
+])
+def test_stock_stop_settles_only_a_verified_attempt(tmp_path, monkeypatch, receipt, cancel_result, settled):
     import sessions
     from woltspace import protected_launcher
 
-    name, attempt = "alpha-stock", "a" * 12
+    name, attempt, epoch = "alpha-stock", "a" * 12, "b" * 32
     (tmp_path / "alpha" / "wolt").mkdir(parents=True)
     monkeypatch.setattr(sessions, "WOLTS_DIR", tmp_path)
     monkeypatch.setattr(sessions, "_tmux_alive", lambda *_: False)
@@ -771,14 +777,15 @@ def test_stock_stop_settles_only_a_verified_attempt(tmp_path, monkeypatch, recei
     effects = []
     replies = iter(("pending", receipt))
     monkeypatch.setattr(sessions, "_launch_control",
-                        lambda *args: effects.append(args) or {"result": "ok"})
+                        lambda *args, **kwargs: effects.append((args, kwargs)) or {"result": cancel_result})
     monkeypatch.setattr(protected_launcher, "reap_status",
-                        lambda name, attempt, _: effects.append((name, attempt)) or next(replies))
+                        lambda name, attempt, _, epoch: effects.append((name, attempt, epoch)) or next(replies))
     registry = sessions.SessionRegistry(tmp_path)
     registry.create(name, wolt="alpha")
-    registry.update(name, wolt="alpha", status="running", attempt=attempt, stock_attempt=attempt)
+    registry.update(name, wolt="alpha", status="running", attempt=attempt,
+                    stock_attempt=attempt, stock_epoch=epoch)
 
-    if receipt == "reaped":
+    if settled:
         assert sessions.stop_session(name)["status"] == "stopped"
         assert "stock_attempt" not in registry.get(name, check_alive=False)
         # The launcher may have restarted or evicted the now-unneeded receipt.
@@ -790,7 +797,8 @@ def test_stock_stop_settles_only_a_verified_attempt(tmp_path, monkeypatch, recei
         row = registry.get(name, check_alive=False)
         assert row["status"] == sessions.STOPPING and row["stock_attempt"] == attempt
 
-    assert effects == [("launch-cancel", name, attempt), (name, attempt), (name, attempt)]
+    assert effects == [(("launch-cancel", name, attempt), {"proof": True}),
+                       (name, attempt, epoch), (name, attempt, epoch)]
 
 
 @pytest.mark.parametrize("attempt", [None, "a" * 12])
@@ -818,7 +826,10 @@ def test_only_published_stock_launch_records_reap_obligation(tmp_path, monkeypat
     import sessions
 
     (tmp_path / "alpha" / "wolt").mkdir(parents=True)
+    from woltspace import protected_launcher
+
     monkeypatch.setattr(sessions, "_protected_stock_enabled", lambda: stock)
+    monkeypatch.setattr(protected_launcher, "launcher_epoch", lambda *_: "b" * 32)
     registry = sessions.SessionRegistry(tmp_path)
     registry.create("alpha", wolt="alpha")
     attempt = sessions.mark_launching(registry, "alpha", "alpha", "codex", None, track=True)
@@ -830,3 +841,34 @@ def test_only_published_stock_launch_records_reap_obligation(tmp_path, monkeypat
     assert sessions.publish_runtime(registry, "alpha", "alpha", attempt, runtime)
     row = registry.get("alpha", check_alive=False)
     assert row.get("stock_attempt") == (attempt if stock else None)
+
+
+def test_stock_failed_redeem_can_be_stopped_without_claiming_reap(tmp_path, monkeypatch):
+    import sessions
+    from woltspace import protected_launcher
+
+    (tmp_path / "alpha" / "wolt").mkdir(parents=True)
+    monkeypatch.setattr(sessions, "WOLTS_DIR", tmp_path)
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda *_: False)
+    monkeypatch.setattr(sessions, "_markers_on", lambda *_: False)
+    monkeypatch.setattr(sessions, "_schedule_pickup", lambda *_: None)
+    monkeypatch.setattr(sessions, "_launch_control", lambda *_, **__: {"result": "ok"})
+    monkeypatch.setattr(protected_launcher, "reap_status", lambda *_: "no-owned-launch")
+    registry = sessions.SessionRegistry(tmp_path)
+    registry.create("alpha-stock", wolt="alpha")
+    registry.update("alpha-stock", wolt="alpha",
+                    launching={"attempt": "a" * 12, "stock": True, "stock_epoch": "b" * 32})
+    assert sessions.stop_session("alpha-stock")["status"] == "stopped"
+    assert "launching" not in registry.get("alpha-stock", check_alive=False)
+
+
+def test_dummy_resume_ignores_a_legacy_conversation_id(monkeypatch):
+    import sessions
+
+    monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
+    monkeypatch.setattr(sessions, "_protected_stock_enabled", lambda: False)
+    calls = []
+    monkeypatch.setattr(sessions, "_launch_control",
+                        lambda *args, **kwargs: calls.append((args, kwargs)) or {"result": "ok"})
+    assert "bridge" in sessions._open_launch("alpha", "alpha", "a" * 12, conversation="legacy-id")
+    assert calls == [(("launch-open", "alpha", "a" * 12), {"wolt": "alpha"})]

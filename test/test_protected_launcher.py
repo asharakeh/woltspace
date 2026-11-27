@@ -73,3 +73,28 @@ def test_launcher_rejects_non_node_before_redemption(monkeypatch):
         client.sendall(b'{"op":"launch-redeem","session":"alpha","attempt":"aaaaaaaaaaaa"}\n')
         with pytest.raises(ValueError, match="protected launch refused"):
             launcher.spawn(server, os.getuid() + 1)
+
+
+def test_the_dummy_probe_reports_its_own_fence(tmp_path, monkeypatch):
+    import errno
+    import pytest
+
+    monkeypatch.setattr(launcher, "WOLTS", tmp_path)
+    assert launcher.fenced() is False  # an ordinary process: sockets open, tree writable
+    assert not list(tmp_path.iterdir())  # the probe file is removed again
+
+    def refused(*_, **__):
+        raise PermissionError(errno.EPERM, "denied")
+
+    tmp_path.chmod(0o555)
+    try:
+        if os.access(tmp_path, os.W_OK):
+            pytest.skip("this uid writes through directory modes")
+        assert launcher.fenced() is False  # a read-only tree, but sockets still open
+        monkeypatch.setattr(launcher.socket, "socket", refused)
+        monkeypatch.setattr(launcher.socket, "socketpair", refused)
+        assert launcher.fenced() is True
+    finally:
+        tmp_path.chmod(0o755)
+    assert launcher.fenced() is False  # no sockets, but the tree is writable again
+    assert set(launcher.OUTPUT) >= {b"dummy fenced", b"dummy open"}  # both answers pass the bridge

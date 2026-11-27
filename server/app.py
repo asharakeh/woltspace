@@ -1380,6 +1380,11 @@ async def session_new_create(request: Request):
                     routing={"adapter": "lodge"}))
         except Exception as e:  # the broker keeps the step reached and the principal for a retry
             return JSONResponse({"detail": str(e)}, status_code=500)
+        if reply.get("status") == "launched" and "session" not in reply:  # a rejoin: name the first session
+            from sessions import SessionRegistry
+            rows = SessionRegistry(WOLTS_DIR).stored(wolt_name)  # read only; nothing is launched again
+            if rows:
+                reply["session"] = {"name": min(rows, key=lambda row: row.get("created_at") or 0)["name"]}
         status = {"ok": {"launched": 200, "pending": 202}.get(reply.get("status"), 409),
                   "unavailable": 503}.get(reply["result"], 409)
         if status != 200:  # shown as is by the lodge page and the tui

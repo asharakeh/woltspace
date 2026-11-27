@@ -376,7 +376,12 @@ def test_api_and_cli_submit_and_resume_only_through_the_approval(lodge, monkeypa
         (terms["harness"], terms["policy"], True)]
     assert (lodge.wolts / "wolt-a" / protected_create.MARKER).read_text() == f"{RID} {pid}\n"
     assert (lodge.wolts / "wolt-a" / "wolt" / "wolt.json").is_file()
-    assert asyncio.run(post(request_id=RID)).json()["status"] == "launched"  # a replay starts nothing new
+    import sessions
+    monkeypatch.setattr(sessions.SessionRegistry, "stored", lambda self, wolt: [
+        {"name": "wolt-a-later", "created_at": 9}, {"name": "wolt-a-first", "created_at": 1}] if wolt == "wolt-a" else [])
+    rejoin = asyncio.run(post(request_id=RID))  # the page or tui coming back after a completed create
+    assert rejoin.json()["status"] == "launched" and rejoin.json()["session"] == {"name": "wolt-a-first"}
+    assert len(launched) == 1  # a replay names the first session and starts nothing new
 
     def cli(*argv):
         monkeypatch.setattr(sys, "argv", [str(CLI), *argv])

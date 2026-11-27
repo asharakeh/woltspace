@@ -802,3 +802,26 @@ def test_launch_audit_gates_selector_publication_and_records_refusals(store, own
         ("node", "launch-cancel", principal, "ok"),
         ("host-admin", "launch-redeem", None, "denied"),
     ]
+
+
+def test_refusals_from_non_owners_are_audited_up_to_a_budget_per_window(store, owner, monkeypatch):
+    b = broker.Broker(store, node_uid=-1)  # this caller is no node: every launch-route call is refused
+    clock = [100.0]
+    monkeypatch.setattr(broker.time, "monotonic", lambda: clock[0])
+
+    def flood(n, route="launch"):
+        return {launch_exchange(b, {"op": "launch-open"}, route)[0] for _ in range(n)}
+
+    def counted(result):
+        return rows(store, f"SELECT count(*) FROM audit WHERE op = 'launch-control' AND result = '{result}'")[0][0]
+
+    assert flood(broker.DENIALS + 20) == {"denied"}  # always refused ...
+    assert (counted("denied"), counted("suppressed")) == (broker.DENIALS, 1)  # ... recorded up to the budget
+    clock[0] += broker.DENIAL_WINDOW
+    assert flood(1) == {"denied"} and counted("denied") == broker.DENIALS + 1  # a new window records again
+    assert [op(b, "enroll", f"w{i}") for i in range(broker.DENIALS + 2)] == ["ok"] * (broker.DENIALS + 2)
+    assert rows(store, "SELECT count(*) FROM audit WHERE caller = 'host-admin' AND op = 'enroll'") == [
+        (broker.DENIALS + 2,)]  # the owner is never limited, refusals included:
+    assert {ask(b, b"not json\n")["result"] for _ in range(broker.DENIALS + 2)} == {"invalid"}
+    assert rows(store, "SELECT count(*) FROM audit WHERE caller = 'host-admin' AND result = 'invalid'") == [
+        (broker.DENIALS + 2,)]

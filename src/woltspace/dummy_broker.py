@@ -43,6 +43,7 @@ NAME = re.compile(r"[a-z][a-z0-9-]{0,39}")
 SESSION = re.compile(r"[a-z][a-z0-9-]{0,127}")
 ATTEMPT = re.compile(r"[0-9a-f]{12}")
 ATTEMPT_TTL = 15
+DENIAL_WINDOW, DENIALS = 60.0, 32  # audited refusals per caller class and operation per window
 PRINCIPAL = re.compile(r"p-[0-9a-f]{32}")
 # Protected create: the ordinary node may only ask and report; the owner reviews and approves exact terms.
 ORDINARY = {"create-request": ("request", "terms"), "create-status": ("request",), "create-report": ("request", "stage")}
@@ -635,19 +636,44 @@ def _receive_admin(conn: socket.socket, owner: bool, descriptors: list[int]):
     return None
 
 
+class DenialBudget:
+    """Bound what a non-owner caller can add to the audit by being refused. Each caller class and
+    operation gets DENIALS audited refusals per window, then one "suppressed" row marks the window
+    and further refusals in it are still refused but not recorded. Owner actions are never limited."""
+
+    def __init__(self):
+        self.lock, self.windows = threading.Lock(), {}  # keys come from fixed caller and op labels
+
+    def admit(self, caller: str, op: str, result: str) -> str | None:
+        if caller == "host-admin" or result not in {"denied", "invalid"}:
+            return result
+        with self.lock:
+            now = time.monotonic()
+            start, used = self.windows.get((caller, op), (now, 0))
+            if now - start >= DENIAL_WINDOW:
+                start, used = now, 0
+            self.windows[(caller, op)] = start, used + 1
+        return result if used < DENIALS else "suppressed" if used == DENIALS else None
+
+
 class LaunchAttempts:
     """Bounded ephemeral selectors. Access to these methods is checked by the transport."""
 
-    def __init__(self, authz, channels):
-        self.authz, self.channels = authz, channels
+    def __init__(self, authz, channels, denials=None):
+        self.authz, self.channels, self.denials = authz, channels, denials or DenialBudget()
         self.lock = threading.Lock()
         self.pending = {}
         self.seen = {}  # reject repeated registration during the selector lifetime
 
     def decision(self, caller, op, result, principal=None):
+        logged = self.denials.admit(caller, op, result)
+        if logged is None:
+            return {"result": result}
+
         def record(db):
             stored = db.execute("SELECT id FROM principals WHERE id = ?", (principal,)).fetchone()
-            return audit(db, caller, op, stored[0] if stored else None, "other", result)
+            reply, _ = audit(db, caller, op, stored[0] if stored else None, "other", logged)
+            return {"result": result} if logged == "suppressed" else reply, None
         return self.channels.dispatch.writer.submit(record)
 
     def open(self, wolt, session, attempt):
@@ -725,7 +751,8 @@ class Broker:
         self.writer = Writer(db, self.authz)
         self.dispatch = Dispatcher(self.authz, self.writer)
         self.worker_channels = WorkerChannels(self.dispatch)
-        self.launch_attempts = LaunchAttempts(self.authz, self.worker_channels)
+        self.denials = DenialBudget()
+        self.launch_attempts = LaunchAttempts(self.authz, self.worker_channels, self.denials)
 
     def apply(self, request) -> dict:
         op = request.get("op") if isinstance(request, dict) else None
@@ -746,7 +773,11 @@ class Broker:
         with self.authz.lock:
             pid = self.authz.names.get(wolt) if wolt else None
         name = ACTION if op in {"register", "grant", "revoke", "run"} and result != "unknown-action" else "other"
-        return self.writer.submit(lambda db: audit(db, caller, op, pid, name, result))  # none unaudited
+        logged = self.denials.admit(caller, op, result)  # every refusal is recorded up to the budget
+        if logged is None:
+            return {"result": result}
+        reply = self.writer.submit(lambda db: audit(db, caller, op, pid, name, logged))  # none unaudited
+        return {"result": result} if reply == {"result": "suppressed"} else reply
 
     def answer(self, conn: socket.socket, route: str = "admin") -> None:
         _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))

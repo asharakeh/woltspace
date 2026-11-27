@@ -20,6 +20,8 @@ from . import dummy_broker
 PATH = Path("/run/woltspace-launch.sock")
 WORKER_UID = 991
 PROCESS = b"wolt-dummy"
+WOLTS = Path("/workspace/wolts")  # the lodge's tree inside the container
+OUTPUT = (b"dummy ok", b"dummy refused", b"dummy fenced", b"dummy open")  # all the bridge shows
 READY = b"protected dummy ready\n"
 
 
@@ -137,6 +139,27 @@ def serve():
             PATH.unlink(missing_ok=True)
 
 
+def fenced() -> bool:
+    """The dummy's own boundary check, from inside its fence: no new channel of any kind (so no lodge
+    route, tmux server, peer pane or broker socket) and no write into the lodge's tree."""
+    for make in (lambda: socket.socket(socket.AF_UNIX), lambda: socket.socket(socket.AF_INET),
+                 lambda: socket.socket(socket.AF_INET6), socket.socketpair):
+        try:
+            made = make()
+        except PermissionError:
+            continue
+        for sock in made if isinstance(made, tuple) else (made,):
+            sock.close()
+        return False
+    probe = WOLTS / f".fence-probe-{os.getpid()}"
+    try:
+        os.close(os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    except PermissionError:
+        return True
+    probe.unlink()
+    return False
+
+
 def worker(fd):
     if os.geteuid() != WORKER_UID or os.getgroups() or os.isatty(0) or os.isatty(1):
         return 1
@@ -150,6 +173,8 @@ def worker(fd):
         for line in iter(lambda: sys.stdin.buffer.readline(4096), b""):
             if line == b"exit\n":
                 return 0
+            if line == b"probe\n":
+                print("dummy fenced" if fenced() else "dummy open", flush=True)
             if line == b"ping\n":
                 channel.send(json.dumps({**hello, "action": dummy_broker.ACTION}).encode())
                 result = json.loads(channel.recv(512)).get("result")
@@ -190,7 +215,7 @@ def bridge(session, attempt):
                     pending += chunk
                     while b"\n" in pending:
                         line, pending = pending.split(b"\n", 1)
-                        if line not in (b"dummy ok", b"dummy refused"):
+                        if line not in OUTPUT:
                             return 1
                         sys.stdout.buffer.write(line + b"\n")
                         sys.stdout.buffer.flush()

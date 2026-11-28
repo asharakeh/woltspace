@@ -174,7 +174,9 @@ resume=$(status_of "/sessions/$d/resume" '{"prompt":"fixture-notice"}')
 (( $(gates) == before + 1 ))  # the resume really reached the gate, and was refused there
 [[ $(rows_of delta) == stopped ]]
 for wolt in gamma delta; do [[ ! -e $WOLTSPACE_WOLTS_DIR/$wolt/.ordinary-engine ]]; done
-! inside pgrep -f '/home/node/.local/bin/claude|/usr/local/bin/codex'
+census=0  # pgrep: 1 is "no match"; a match (0), a pgrep error (2, 3) or a docker error (125+) all fail
+inside pgrep -f '/home/node/.local/bin/claude|/usr/local/bin/codex' || census=$?
+(( census == 1 ))
 printf 'PASS unfenced refused (gamma create=%s rows=%s; delta create=%s resume=%s)\n' \
     "$gamma" "$(rows_of gamma)" "$delta" "$resume" >&3
 

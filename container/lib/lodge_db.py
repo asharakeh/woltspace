@@ -302,12 +302,16 @@ def connect(wolts_dir, *, readonly: bool = False, durable: bool = False,
     return conn
 
 
+_NO_LINKS = {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK}  # what link says without hard links
+
+
 def _create(db: Path) -> None:
     """Session prompts live here: a new file is owner-only from birth (SQLite gives -wal and
-    -shm the main file's mode); an existing one keeps its own. No descriptor of the published
-    file is ever opened here: closing one drops every POSIX lock this process holds on it,
-    other connections' included, and another process may then checkpoint the WAL away under
-    them (SQLITE_IOERR_SHORT_READ). A new file is closed under a private name, then linked."""
+    -shm the main file's mode); an existing one keeps its own and is never opened here: closing
+    a descriptor of it drops every POSIX lock this process holds on it, other connections'
+    included, and another process may then checkpoint the WAL away under them
+    (SQLITE_IOERR_SHORT_READ). A new file is closed under a private name, then linked, so not
+    even a first create holds one; only a filesystem without hard links creates it in place."""
     if not os.path.lexists(db):
         fd, private = tempfile.mkstemp(prefix=f".{db.name}.", dir=db.parent)  # 0600
         os.close(fd)
@@ -316,7 +320,10 @@ def _create(db: Path) -> None:
             return
         except FileExistsError:  # another opener created it first
             pass
-        except OSError:  # no hard links here: create in place (only a first open can race)
+        except OSError as exc:
+            if exc.errno not in _NO_LINKS:
+                raise
+            # no hard links here: in place, its descriptor open for a moment while published
             with contextlib.suppress(FileExistsError):
                 os.close(os.open(db, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
         finally:

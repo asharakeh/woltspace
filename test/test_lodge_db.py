@@ -1,5 +1,6 @@
 """lodge_db: the one SQLite file that holds the lodge's changing state."""
 
+import errno
 import json
 import os
 import sqlite3
@@ -303,6 +304,20 @@ def test_a_writable_connect_never_opens_a_descriptor_of_the_file_itself(tmp_path
     assert db not in opened and len(opened) == (0 if exists else 1)
     assert stat.S_IMODE(os.stat(db).st_mode) == 0o600
     assert not [n for n in os.listdir(tmp_path / ".space") if n.startswith(".lodge.db.")]  # no private name left
+
+@pytest.mark.parametrize("code", [errno.EPERM, errno.EIO])
+def test_only_a_filesystem_without_hard_links_creates_the_file_in_place(tmp_path, monkeypatch, code):
+    def link(src, dst):
+        raise OSError(code, os.strerror(code))
+    monkeypatch.setattr(os, "link", link)
+    if code == errno.EIO:  # any other link failure is the connect's failure
+        with pytest.raises(OSError, match=os.strerror(code)):
+            lodge_db.connect(tmp_path)
+        assert not lodge_db.path(tmp_path).exists()
+    else:
+        lodge_db.connect(tmp_path).close()
+        assert stat.S_IMODE(lodge_db.path(tmp_path).stat().st_mode) == 0o600
+    assert not [n for n in os.listdir(tmp_path / ".space") if n.startswith(".lodge.db.")]
 
 def test_a_new_connection_never_drops_the_locks_of_this_processs_others(tmp_path):
     """Closing any descriptor of the file drops every POSIX lock this process holds on it,

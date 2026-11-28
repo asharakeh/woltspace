@@ -912,11 +912,82 @@ def test_telegram_fixed_action_uses_one_owner_arm(store, owner):
             fake.sendall(b"o")
             fake.sendall(b"k\n")
             assert fake.recv(1) == b""
-        assert sorted(json.loads(channel.recv(256))["result"] for channel in (a, duplicate)) == [
-            "ok", "unavailable"]
-        assert op(b, "revoke", "alpha", action) == op(b, "grant", "alpha", action) == "ok"
-        assert packet(a, first, action=action) == "unavailable"
+        # The consumed arm must block both the duplicate and regrant even after a reconnect.
+        next_effect, next_fake = socket.socketpair()
+        b.dispatch.offer(next_effect)
+        with next_effect, next_fake:
+            assert sorted(json.loads(channel.recv(256))["result"] for channel in (a, duplicate)) == [
+                "ok", "unavailable"]
+            assert packet(duplicate, second, action=action) == "unavailable"
+            assert op(b, "revoke", "alpha", action) == op(b, "grant", "alpha", action) == "ok"
+            assert packet(a, first, action=action) == "unavailable"
+            assert b.dispatch.peer is next_effect  # the ready peer was not taken
+            with pytest.raises(BlockingIOError):
+                next_fake.recv(5, socket.MSG_DONTWAIT)
         assert rows(store, f"SELECT principal, result FROM audit WHERE op = '{arm['id']}'") == [(alpha, "ok")]
+
+
+def test_telegram_rechecks_binding_retired_after_enqueue(store, owner, monkeypatch):
+    b = broker.Broker(store, effect=True)
+    alpha = enrolled(b, "alpha")
+    for action in (A, broker.TELEGRAM):
+        assert op(b, "register", action=action) == op(b, "grant", "alpha", action) == "ok"
+    assert op(b, "arm", action=broker.TELEGRAM) == "ok"
+    binding = b.dispatch.bind(alpha, "a")
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_dummy():
+        entered.set()
+        assert release.wait(3)
+        return "ok"
+
+    monkeypatch.setattr(b.dispatch, "_dummy", hold_dummy)
+    effect, fake = socket.socketpair()
+    with effect, fake:
+        b.dispatch.offer(effect)
+        blocker = b.dispatch.submit(binding, A)
+        try:
+            assert entered.wait(3)
+            queued = b.dispatch.submit(binding, broker.TELEGRAM)
+            assert not queued.done()
+            b.dispatch.end(binding)
+        finally:
+            release.set()
+        assert blocker.result(3) == "ok"
+        assert queued.result(3) == "denied"
+        assert op(b, "arm", action=broker.TELEGRAM) == "busy"
+        assert b.dispatch.peer is effect
+        with pytest.raises(BlockingIOError):
+            fake.recv(5, socket.MSG_DONTWAIT)
+
+
+def test_telegram_effect_listener_refuses_wrong_kernel_peer(store, owner, monkeypatch):
+    monkeypatch.chdir(store)
+    b = broker.Broker(store, node_uid=os.getuid() + 1, effect=True)
+    alpha = enrolled(b, "alpha")
+    action = broker.TELEGRAM
+    assert op(b, "register", action=action) == op(b, "grant", "alpha", action) == "ok"
+    assert op(b, "arm", action=action) == "ok"
+    with broker.listen(Path(broker.EFFECT)) as listener:
+        thread = threading.Thread(target=broker.serve_effect, args=(b, listener), daemon=True)
+        thread.start()
+        try:
+            with socket.socket(socket.AF_UNIX) as wrong:
+                wrong.settimeout(2)
+                wrong.connect(broker.EFFECT)
+                try:
+                    wrong.sendall(b"ready\n")
+                    assert wrong.recv(1) == b""
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # the kernel may report the refusal as a reset
+            binding = b.dispatch.bind(alpha, "a")
+            assert b.dispatch.submit(binding, action).result(3) == "unavailable"
+            assert b.dispatch.peer is None
+            assert op(b, "arm", action=action) == "busy"
+        finally:
+            listener.shutdown(socket.SHUT_RDWR)
+            thread.join(3)
+        assert not thread.is_alive()
 
 
 @pytest.mark.parametrize("interruption", ["intent-failure", "revoke-during-intent", "outcome-failure"])

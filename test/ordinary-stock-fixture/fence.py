@@ -58,8 +58,8 @@ SECCOMP = [(0x20, 0, 0, 4), (0x15, 0, 14, 0xC000003E), (0x20, 0, 0, 0),
            (0x06, 0, 0, 0x7FFF0000), (0x06, 0, 0, 0x00050000 | errno.EPERM)]
 
 
-def fence(own, port, reads=()):
-    """Own dir read/write (no exec), system and `reads` read/exec, TCP connect to `port` only."""
+def fence(own, port, reads=(), writes=()):
+    """Own dir read/write (no exec), system and `reads` read/exec, `writes` write only, TCP to `port` only."""
     version = abi()
     assert version >= 6, "landlock abi below 6"
     rights = (1 << 16) - 1
@@ -71,6 +71,7 @@ def fence(own, port, reads=()):
         grants += [(Path(p), READ) for p in ("/usr", "/bin", "/lib", "/lib64", "/etc/ssl/openssl.cnf")
                    if Path(p).exists()]
         grants += [(Path(p), READ) for p in reads]
+        grants += [(Path(p), WRITE) for p in writes]  # files only: the launch's own notice request pipe
         for path, access in grants:
             if not path.is_dir():
                 access &= FILE_ONLY

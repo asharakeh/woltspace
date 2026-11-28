@@ -52,8 +52,10 @@ def completed(response_id, output):
     return sse(events + [("response.completed", {"response": response})])
 
 
-def shell_call(tools, nonce):
+def shell_call(tools, nonce, command=None):
     """A function call for the engine's own shell tool, shaped by the schema it sent us."""
+    if command:
+        return "exec_command", {"cmd": command}
     for tool in tools:
         name = tool.get("name") or tool.get("type")
         properties = (tool.get("parameters") or {}).get("properties") or {}
@@ -74,7 +76,7 @@ class Stub(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.requests.append(body)
         if len(self.server.requests) == 1:
-            name, arguments = shell_call(body.get("tools") or [], self.server.nonce)
+            name, arguments = shell_call(body.get("tools") or [], self.server.nonce, self.server.command)
             self.server.tool = name
             output = ([{"id": "fc_1", "type": "function_call", "status": "completed", "call_id": "call_1",
                         "name": name, "arguments": json.dumps(arguments)}] if name else
@@ -89,14 +91,15 @@ class Stub(BaseHTTPRequestHandler):
         self.wfile.write(completed(f"resp_{len(self.server.requests)}", output))
 
 
-def run_turn(tmp_path, sandbox):
+def run_turn(tmp_path, sandbox, command=None, reads=(), writes=(), home=None):
     sys.path.insert(0, str(FIXTURE))
     import fence
 
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
+    home = home or tmp_path / "home"
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
     server = HTTPServer(("127.0.0.1", 0), Stub)
     server.requests, server.tool, server.nonce = [], None, "nonce-" + secrets.token_hex(8)
+    server.command = command
     threading.Thread(target=server.serve_forever, daemon=True).start()
     (home / "config.toml").write_text(f"""
 model = "fixture"
@@ -126,7 +129,7 @@ enabled = false
             os.dup2(os.open("/dev/null", os.O_WRONLY), 2)
             os.chdir(home)
             os.closerange(3, os.sysconf("SC_OPEN_MAX"))
-            fence.fence(home, server.server_port, (STOCK,))
+            fence.fence(home, server.server_port, (STOCK, *reads), writes)
             os.execve(str(STOCK / "codex"), [str(STOCK / "codex"), "app-server", "--listen", "stdio://"], env)
         finally:
             os._exit(127)
@@ -198,3 +201,34 @@ def test_stock_engine_dispatches_its_shell_tool_under_the_fence(tmp_path, sandbo
     assert len(returned) == 1  # the engine answered our one call, ran or refused
     assert (server.nonce in str(returned[0].get("output"))) == runs
     assert report["marker"] == (server.nonce if runs else None)  # written only in the worker's own directory
+
+
+def test_stock_tool_runs_the_packaged_helper_only_through_its_own_launch(tmp_path, monkeypatch):
+    """A's tool reaches A's pipes through its fence grant; B's tool, fenced without one, reaches neither."""
+    from woltspace import protected_stock as supervisor
+    from test_telegram_notice import HELLO, HELPER, Broker
+
+    monkeypatch.setattr(supervisor.os, "chown", lambda *_: None)  # not root here: ownership is the image's
+    (tmp_path / "a" / "home").mkdir(parents=True)
+    action, pipes = supervisor.notice_endpoint(tmp_path / "a")
+    broker, stopped = Broker(["ok"]), threading.Event()
+    relay = threading.Thread(target=supervisor.relay_notices,
+                             args=(*pipes, supervisor.Channel(broker.theirs, HELLO), stopped), daemon=True)
+    relay.start()
+    helper = f"/usr/bin/python3 -I {HELPER}"
+    try:
+        intruder = (f"HOME={tmp_path}/a/home {helper}; echo n > {action}/request; "
+                    f"cat {action}/reply; ls {tmp_path}/a; echo done")
+        server, _, _ = run_turn(tmp_path / "b", "danger-full-access", intruder, (HELPER,), (),
+                                tmp_path / "b" / "home")
+        output = str(server.requests[1]["input"][-1]["output"])
+        assert "unavailable" in output and output.count("Permission denied") == 3 and broker.requests == []
+        server, _, _ = run_turn(tmp_path / "a", "danger-full-access", helper,
+                                (HELPER, action / "reply"), (action / "request",), tmp_path / "a" / "home")
+        output = str(server.requests[1]["input"][-1]["output"])
+        assert "Process exited with code 0" in output and "\nok\n" in output
+        assert broker.requests == [{**HELLO, "action": "telegram.notice"}]
+    finally:
+        stopped.set()
+        relay.join(5)
+        supervisor.remove_endpoint(action, pipes)

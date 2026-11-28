@@ -1,0 +1,56 @@
+#!/usr/bin/python3 -I
+"""Ask this Wolt's protected supervisor for the one fixed Telegram notice. Takes no arguments or input.
+
+The request and reply pipes sit beside this launch's home; only this launch's fence grants them.
+Prints one fixed word: ok, denied, unavailable, unknown or refused.
+"""
+import fcntl
+import os
+from pathlib import Path
+import select
+import sys
+import time
+
+EXIT = {"ok": 0, "denied": 3, "unavailable": 4, "unknown": 5, "refused": 6}
+
+
+def ask():
+    action = Path(os.environ.get("HOME", "/nonexistent")).parent / "action"
+    try:
+        request = os.open(action / "request", os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        reply = os.open(action / "reply", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return "unavailable"  # not a protected launch, or not this launch's pipes
+    try:
+        fcntl.flock(request, fcntl.LOCK_EX)  # one request in flight per launch
+        try:
+            while os.read(reply, 512):  # a word left by an earlier, abandoned request is not ours
+                pass
+        except BlockingIOError:
+            pass
+        os.write(request, b"n")
+        line, deadline = b"", time.monotonic() + 30
+        while b"\n" not in line and len(line) <= 16:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([reply], [], [], remaining)[0]:
+                return "unknown"  # asked, but no answer: the request may still have been spent
+            try:
+                line += os.read(reply, 17 - len(line))
+            except BlockingIOError:
+                continue
+        word = line.split(b"\n", 1)[0].decode("ascii", "replace")
+        return word if word in EXIT else "refused"
+    except OSError:
+        return "unknown"
+    finally:
+        os.close(request)
+        os.close(reply)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 1:
+        print("usage: telegram-notice", file=sys.stderr)
+        sys.exit(2)
+    word = ask()
+    print(word)
+    sys.exit(EXIT[word])

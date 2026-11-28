@@ -32,7 +32,8 @@ WOLTS = Path("/workspace/wolts")  # the lodge's tree inside the container
 OUTPUT = (b"dummy ok", b"dummy refused", b"dummy fenced", b"dummy open")  # all the bridge shows
 READY = b"protected dummy ready\n"
 STOCK_READY = b"protected stock ready\n"
-STOCK_OUTPUT = (b"fixture complete", b"fixture refused")
+STOCK_OUTPUT = (b"fixture complete", b"fixture refused",
+                *(b"fixture notice " + word for word in (b"ok", b"denied", b"unavailable", b"unknown", b"refused")))
 
 
 def deny_new_channels():

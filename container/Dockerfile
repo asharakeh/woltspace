@@ -215,6 +215,8 @@ RUN set -eux; \
     ln -s "$BUNDLE" /workspace/woltspace; \
     ln -s "${UV_TOOL_DIR}/woltspace/bin/python" /usr/local/bin/woltspace-python; \
     chmod +x "$BUNDLE"/container/bin/*; \
+    if [ -f "$BUNDLE/container/telegram-notice" ]; then \
+      install -o root -g root -m 0755 "$BUNDLE/container/telegram-notice" /usr/bin/telegram-notice; fi; \
     /usr/local/bin/woltspace --version | awk '{print $2}' > "$BUNDLE/.version"; \
     gosu node /usr/local/bin/woltspace --version; \
     ln -sf /workspace/woltspace/container/config/tmux.conf /etc/tmux.conf

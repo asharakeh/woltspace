@@ -1097,7 +1097,7 @@ def serve(broker: "Broker", server: socket.socket, route: str = "admin") -> None
 def admin(argv: list[str], path: Path | None = None) -> int:
     fields = {**FIELDS, **OWNER}.get(argv[0], ()) if argv else ()
     if argv[:1] == ["provision"]:  # chat and token from stdin only, never argv or the environment
-        argv = argv + sys.stdin.read(256).split()
+        argv = argv + sys.stdin.read(256).split() if len(argv) == 2 else []  # extra argv: refused, stdin unread
     if not fields or len(argv) != 1 + len(fields):
         print("usage: woltspace secrets enroll|retire WOLT | rename WOLT NEW | register ACTION"
               " | arm ACTION | provision ACTION <CHAT TOKEN | grant|revoke|run WOLT ACTION"

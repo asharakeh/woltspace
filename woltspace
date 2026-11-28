@@ -710,6 +710,10 @@ case "$cmd" in
     # provision ACTION (chat and token on stdin, never argv: only that op keeps stdin open with -i).
     shift
     if [ "${1:-}" = provision ]; then
+      if [ $# -ne 2 ]; then
+        echo "usage: woltspace secrets provision ACTION <CHAT TOKEN (on stdin only)" >&2
+        exit 2
+      fi
       exec docker exec -i -u 0 "$CONTAINER_NAME" /opt/woltspace/tools/woltspace/bin/python -I -m woltspace.dummy_broker admin "$@"
     fi
     exec docker exec -u 0 "$CONTAINER_NAME" /opt/woltspace/tools/woltspace/bin/python -I -m woltspace.dummy_broker admin "$@"

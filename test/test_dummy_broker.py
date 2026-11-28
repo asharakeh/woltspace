@@ -1173,7 +1173,8 @@ def test_telegram_fixed_tls_request(provider, monkeypatch, case, reply, expected
                                   {"chat_id": 42, "text": "Woltspace broker notice."})]
 
 
-@pytest.mark.parametrize("argv,interactive", [(["provision", broker.TELEGRAM], True), (["arm", broker.TELEGRAM], False)])
+@pytest.mark.parametrize("argv,interactive", [(["provision", broker.TELEGRAM], True), (["arm", broker.TELEGRAM], False),
+                                              (["provision", broker.TELEGRAM, "42", TOKEN], None)])
 def test_secrets_wrapper_forwards_stdin_only_for_provision(tmp_path, argv, interactive):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -1182,12 +1183,24 @@ def test_secrets_wrapper_forwards_stdin_only_for_provision(tmp_path, argv, inter
     env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp_path), "WOLTSPACE_WOLTS_DIR": str(tmp_path / "wolts")}
     done = subprocess.run(["bash", str(Path(broker.__file__).parents[2] / "woltspace"), "secrets", *argv],
                           input=f"42\n{TOKEN}\n".encode(), env=env, capture_output=True, timeout=30)
+    if interactive is None:  # a token on argv is refused before docker, and never echoed
+        assert done.returncode == 2 and not (bin_dir / "docker.args").exists()
+        assert TOKEN.split(":")[1].encode() not in done.stdout + done.stderr
+        return
     assert done.returncode == 0, done.stderr
     args = (bin_dir / "docker.args").read_text().split()
     assert args[:3] == (["exec", "-i", "-u"] if interactive else ["exec", "-u", "0"])
     assert args[-len(argv) - 1:] == ["admin", *argv] and TOKEN not in args  # chat and token never on argv
     if interactive:  # the wrapper hands its own stdin to docker exec untouched
         assert (bin_dir / "docker.stdin").read_text() == f"42\n{TOKEN}\n"
+
+
+def test_admin_refuses_provision_args_before_reading_stdin(monkeypatch, capsys):
+    monkeypatch.setattr(broker, "call", lambda *a: pytest.fail("nothing may be sent"))
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(read=lambda *a: pytest.fail("stdin must stay unread")))
+    for extra in (["42", TOKEN], [TOKEN]):
+        assert broker.admin(["provision", broker.TELEGRAM, *extra]) == 2
+    assert TOKEN.split(":")[1] not in "".join(capsys.readouterr())
 
 
 def test_telegram_tls_setup_failure_settles_the_dispatch_as_unknown(store, owner, tmp_path, monkeypatch):

@@ -108,9 +108,13 @@ def test_actual_core_action_and_executable(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("mode", ["stop", "interrupt", "lost", "node-exit", "missing-ready", "bad-ready",
-    "startup-stop", "early-loss", "ready-timeout", "kill", "cleanup-failure", "resume"])
-def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, mode):
+    "startup-stop", "early-loss", "ready-timeout", "kill", "cleanup-failure", "resume", "telegram"])
+def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, config, mode):
     events, children, handlers = [], [], {}
+    if mode == "telegram":
+        config.write_text("dummy\ntelegram\n")
+        monkeypatch.setattr(boot.pwd, "getpwnam", lambda name: SimpleNamespace(pw_gid=1000))
+    monkeypatch.setenv("WOLTSPACE_BROKER_TELEGRAM", "inherited")
     class Child:
         def __init__(self, role):
             self.role, self.returncode = role, None
@@ -136,8 +140,11 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, mode):
             assert kw["env"] == {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
             assert kw["close_fds"] and kw["cwd"] == "/"
             assert kw["user"] == kw["group"] == 990 and kw["extra_groups"] == []
+            assert (argv[-1] == "telegram") == (mode == "telegram")
             if mode == "early-loss":
                 child.returncode = 7
+        if child.role == "node":
+            assert kw["env"].get("WOLTSPACE_BROKER_TELEGRAM") == ("1" if mode == "telegram" else None)
         return child
     def tick(delay):
         if mode == "lost":
@@ -167,8 +174,8 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, mode):
             handlers[signal.SIGTERM](signal.SIGTERM, None)
         return b"" if mode == "missing-ready" else (b"{}\n" if mode == "bad-ready" else b'{"result":"accepted"}\n')
     functions = {name: getattr(os, name) for name in ("open", "O_WRONLY", "O_CREAT", "O_EXCL", "O_NOFOLLOW", "fdopen", "fchmod")}
-    monkeypatch.setattr(boot, "os", SimpleNamespace(**functions, read=read,
-        chown=lambda *a: None, fchown=lambda *a: None))
+    monkeypatch.setattr(boot, "os", SimpleNamespace(**functions, read=read, environ=os.environ,
+        chown=lambda *a: events.append(a), fchown=lambda *a: None))
     clock = iter([1, 7]) if mode == "ready-timeout" else iter([])
     monkeypatch.setattr(boot, "time", SimpleNamespace(monotonic=lambda: next(clock, 9 if mode == "ready-timeout" else 1), sleep=tick))
     if mode == "cleanup-failure":
@@ -176,9 +183,10 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, mode):
             boot.supervise(["dummy-node"])
     else:
         result = boot.supervise(["dummy-node"])
-        assert result == (0 if mode in {"stop", "interrupt", "kill", "resume"} else 9 if mode == "node-exit" else 1)
+        assert result == (0 if mode in {"stop", "interrupt", "kill", "resume", "telegram"} else 9 if mode == "node-exit" else 1)
     assert len(children) == (1 if mode in {"missing-ready", "bad-ready", "startup-stop", "early-loss", "ready-timeout"} else 3)
     assert all(child.returncode is not None for child in children)
+    assert ((dummy_broker.SOCKET.with_name(dummy_broker.EFFECT), 990, 1000) in events) == (mode == "telegram")
     if len(children) == 3 and mode != "cleanup-failure":
         assert events.index(("node", "wait")) < events.index(("broker", "wait"))
     if mode == "cleanup-failure":

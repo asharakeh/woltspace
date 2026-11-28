@@ -44,7 +44,7 @@ def preflight() -> None:
     for path in (CONFIG, Path(__file__), Path(dummy_broker.__file__),
                  Path(protected_launcher.__file__), Path(sys.executable)):
         protected(path)
-    if not CONFIG.is_file() or CONFIG.read_text() != "dummy\n":
+    if not CONFIG.is_file() or CONFIG.read_text() not in {"dummy\n", "dummy\ntelegram\n"}:
         raise ValueError("missing or unsafe dummy configuration")
     if any(path.exists() for path in SUDO_PATHS):
         raise ValueError("broker startup requires the no-sudo image")
@@ -97,6 +97,7 @@ def prepare_policy() -> None:
 
 
 def supervise(node_argv: list[str]) -> int:
+    telegram = CONFIG.read_text() == "dummy\ntelegram\n"
     children = []
     stopping = False
 
@@ -113,7 +114,8 @@ def supervise(node_argv: list[str]) -> int:
         served = True
 
         broker = subprocess.Popen([sys.executable, "-I", "-S", dummy_broker.__file__, str(STORE),
-                                   str(dummy_broker.POLICY_DIR), str(dummy_broker.SOCKET)],
+                                   str(dummy_broker.POLICY_DIR), str(dummy_broker.SOCKET),
+                                   *(["telegram"] if telegram else [])],
             env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, cwd="/",
             user=SERVICE, group=SERVICE, extra_groups=[],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=True)
@@ -142,7 +144,13 @@ def supervise(node_argv: list[str]) -> int:
         if (not select.select([launcher.stdout], [], [], READY_SECONDS)[0]
                 or launcher.stdout.readline() != b"accepted\n" or stopping):
             return 1
-        node = subprocess.Popen(node_argv, close_fds=True)
+        node_env = os.environ.copy()
+        node_env.pop("WOLTSPACE_BROKER_TELEGRAM", None)
+        if telegram:
+            effect = dummy_broker.SOCKET.with_name(dummy_broker.EFFECT)
+            os.chown(effect, SERVICE, pwd.getpwnam("node").pw_gid)
+            node_env["WOLTSPACE_BROKER_TELEGRAM"] = "1"
+        node = subprocess.Popen(node_argv, env=node_env, close_fds=True)
         children.append(node)
         while not stopping and all(child.poll() is None for child in children):
             time.sleep(.05)
@@ -173,6 +181,7 @@ def supervise(node_argv: list[str]) -> int:
                     dummy_broker.SOCKET.unlink(missing_ok=True)
                     dummy_broker.SOCKET.with_name(dummy_broker.CREATE).unlink(missing_ok=True)
                     dummy_broker.SOCKET.with_name(dummy_broker.LAUNCH).unlink(missing_ok=True)
+                    dummy_broker.SOCKET.with_name(dummy_broker.EFFECT).unlink(missing_ok=True)
                     dummy_broker.SOCKET.parent.rmdir()
             except OSError:
                 cleanup_failed = True

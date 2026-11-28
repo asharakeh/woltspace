@@ -357,14 +357,14 @@ class Broker:
             frame.update(path=str(path), filename=filename, content_type=content_type)
         future = asyncio.get_running_loop().create_future()
         slot.pending[send_id] = future
-        if not await self._write(name, frame):
-            slot.pending.pop(send_id, None)
-            raise ConnectorUnavailable(f"{name} is not connected to the lodge")
         try:
+            if not await self._write(name, frame):
+                raise ConnectorUnavailable(f"{name} is not connected to the lodge")
             result = await asyncio.wait_for(future, timeout)
         except asyncio.TimeoutError:
-            slot.pending.pop(send_id, None)
             raise SendFailed("ambiguous", f"{name} did not answer in {timeout:.0f}s") from None
+        finally:
+            slot.pending.pop(send_id, None)
         if result["status"] != "delivered":
             raise SendFailed(result["status"], result.get("error") or result["status"])
         return result

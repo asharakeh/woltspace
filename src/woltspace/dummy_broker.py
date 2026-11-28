@@ -32,13 +32,14 @@ from typing import NamedTuple
 POLICY_DIR = Path("/var/lib/woltspace-secrets")
 SOCKET = Path("/run/woltspace-broker/admin.sock")  # 0600 in a 0711 directory: only the service and root
 LAUNCH = "launch.sock"
+EFFECT, TELEGRAM = "effect.sock", "telegram.notice"
 CREATE = "create.sock"  # 0666 beside it: the ordinary create route, nothing else
 ACTION, ADMIN_UID, MAX_REQUEST, CAPACITY, PENDING, GROUP = "dummy.ping", 0, 512, 64, 16, 8
 WORKERS, WAITING, PER_WOLT, BINDINGS = 2, 6, 3, 128
 DUMMY_DELAY = 0.5
-ACTIONS = {ACTION: ("secret", "dummy", "ping")}  # allowlisted action -> (resource type, resource, operation)
+ACTIONS = {ACTION: ("secret", "dummy", "ping"), TELEGRAM: ("effect", "telegram", "notice")}  # allowlisted action -> (resource type, resource, operation)
 FIELDS = {"enroll": ("wolt",), "rename": ("wolt", "to"), "retire": ("wolt",), "register": ("action",),
-          "grant": ("wolt", "action"), "revoke": ("wolt", "action"), "run": ("wolt", "action")}
+          "arm": ("action",), "grant": ("wolt", "action"), "revoke": ("wolt", "action"), "run": ("wolt", "action")}
 NAME = re.compile(r"[a-z][a-z0-9-]{0,39}")
 SESSION = re.compile(r"[a-z][a-z0-9-]{0,127}")
 ATTEMPT = re.compile(r"[0-9a-f]{12}")
@@ -401,12 +402,16 @@ class WorkerBinding(NamedTuple):
 class Dispatcher:
     """Trusted launcher interface. The transport must supply the binding for its channel."""
 
-    def __init__(self, authz: Authz, writer: Writer):
+    def __init__(self, authz: Authz, writer: Writer, effect=False):
         self.authz, self.writer = authz, writer
         self.ready = threading.Condition(authz.lock)
         self.waiting = {}  # one FIFO per principal, in ready-wolt rotation order
         self.running = set()
         self.started = False
+        self.effect = effect
+        self.peer = self.operation = None
+        self.effect_pending = False
+        self.arming = False
 
     def bind(self, principal: str, session: str) -> WorkerBinding | None:
         """Called only by the trusted launcher, with the enrolled stable ID."""
@@ -438,13 +443,13 @@ class Dispatcher:
         with self.ready:
             if self.authz.bindings.get(binding.session) != binding:
                 future.set_result("denied")
-            elif name != ACTION:
+            elif name not in ACTIONS:
                 future.set_result("unknown-action")
             elif (len(self.waiting.get(binding.principal, ())) >= PER_WOLT
                   or sum(map(len, self.waiting.values())) >= WAITING):
                 future.set_result("busy")
             else:
-                self.waiting.setdefault(binding.principal, deque()).append((binding, future, alive))
+                self.waiting.setdefault(binding.principal, deque()).append((binding, name, future, alive, self.operation))
                 if not self.started:
                     self.started = True
                     for _ in range(WORKERS):
@@ -458,12 +463,12 @@ class Dispatcher:
                 self.ready.wait_for(lambda: self.waiting.keys() - self.running)
                 principal = next(pid for pid in self.waiting if pid not in self.running)
                 queue_for_wolt = self.waiting.pop(principal)
-                binding, future, alive = queue_for_wolt.popleft()
+                binding, name, future, alive, requested = queue_for_wolt.popleft()
                 if queue_for_wolt:
                     self.waiting[principal] = queue_for_wolt
                 self.running.add(principal)
             try:
-                result = self._dispatch(binding, alive)
+                result = self._dispatch(binding, alive) if name == ACTION else self._telegram(binding, alive, requested)
             finally:
                 with self.ready:
                     self.running.remove(principal)
@@ -494,6 +499,101 @@ class Dispatcher:
             return {"result": "ok"}, None
 
         return result if self.writer.submit(outcome)["result"] == "ok" else "unknown"
+
+    def arm(self):
+        with self.ready:
+            if not self.effect:
+                return {"result": "disabled"}
+            if self.operation is not None or self.effect_pending or self.arming:
+                return {"result": "busy"}
+            self.arming = True
+        operation = "arm-" + secrets.token_hex(16)
+        reply = self.writer.submit(lambda db: audit(db, "host-admin", operation, None, TELEGRAM, "armed"))
+        with self.ready:
+            self.arming = False
+            if reply == {"result": "armed"}:
+                self.operation = operation
+                return {"result": "ok", "id": operation}
+        return reply
+
+    def offer(self, peer):
+        with self.ready:
+            if self.peer is not None:
+                self.peer.close()
+            self.peer = peer
+
+    def _telegram(self, binding, alive, requested):
+        def admitted():
+            return (self.authz.bindings.get(binding.session) == binding
+                    and (binding.principal, TELEGRAM) in self.authz.active
+                    and (alive is None or alive()))
+
+        with self.ready:
+            if not admitted():
+                return "denied"
+            if not self.effect or requested is None or requested != self.operation or self.peer is None:
+                return "unavailable"
+            try:
+                self.peer.recv(1, socket.MSG_DONTWAIT | socket.MSG_PEEK)
+            except BlockingIOError:
+                pass  # connected peer waiting for the request
+            except OSError:
+                self.peer.close()
+                self.peer = None
+                return "unavailable"
+            else:
+                self.peer.close()
+                self.peer = None
+                return "unavailable"
+            peer, operation = self.peer, self.operation
+            self.peer = self.operation = None
+            self.effect_pending = True
+
+        def update(db, result, previous):
+            changed = db.execute(
+                "UPDATE audit SET principal = ?, result = ? WHERE op = ? AND action = ? AND result = ?",
+                (binding.principal, result, operation, TELEGRAM, previous),
+            )
+            return {"result": "ok" if changed.rowcount == 1 else "storage-error"}, None
+
+        try:
+            with peer:
+                reply = self.writer.submit(lambda db: update(db, "pending", "armed"))
+                if reply["result"] != "ok":
+                    return reply["result"]
+                result = "unknown"
+                with self.ready:
+                    sent = False
+                    if admitted():
+                        try:
+                            sent = peer.send(b"send\n", socket.MSG_DONTWAIT) == 5
+                        except OSError:
+                            pass
+                    else:
+                        result = "denied"
+                if sent:
+                    result = self._effect_result(peer)
+            if self.writer.submit(lambda db: update(db, result, "pending"))["result"] == "ok":
+                return result
+            return "unknown"
+        finally:
+            with self.ready:
+                self.effect_pending = False
+
+    @staticmethod
+    def _effect_result(peer):
+        deadline = time.monotonic() + 20
+        response = bytearray()
+        try:
+            while len(response) < 3:
+                peer.settimeout(max(0.001, deadline - time.monotonic()))
+                chunk = peer.recv(3 - len(response))
+                if not chunk:
+                    break
+                response.extend(chunk)
+        except OSError:
+            return "unknown"
+        return "ok" if response == b"ok\n" and time.monotonic() <= deadline else "unknown"
 
     def _dummy(self) -> str:
         # One fixed adapter with a bounded delay. No caller-selected timeout,
@@ -762,20 +862,20 @@ class LaunchAttempts:
 
 
 class Broker:
-    def __init__(self, policy_dir: Path, node_uid: int | None = None):
+    def __init__(self, policy_dir: Path, node_uid: int | None = None, effect=False):
         self.node_uid = node_uid
         self.policy_dir, db = policy_dir, open_registry(policy_dir)
         if not (policy_dir / "action.key").exists() and not (policy_dir / "action.key").is_symlink():
             _write_key(policy_dir)
         _key(policy_dir)  # existing custody must be ours and well formed before readiness
         try:
-            db.execute("UPDATE audit SET result = 'unknown' WHERE op = 'dispatch' AND result = 'pending'")
+            db.execute("UPDATE audit SET result = 'unknown' WHERE (op = 'dispatch' OR action = 'telegram.notice') AND result = 'pending'")
         except sqlite3.Error as exc:
             db.close()
             raise ValueError("broker recovery failed") from exc
         self.authz = Authz(db, policy_dir)
         self.writer = Writer(db, self.authz)
-        self.dispatch = Dispatcher(self.authz, self.writer)
+        self.dispatch = Dispatcher(self.authz, self.writer, effect)
         self.worker_channels = WorkerChannels(self.dispatch)
         self.denials = DenialBudget()
         self.launch_attempts = LaunchAttempts(self.authz, self.worker_channels, self.denials)
@@ -789,6 +889,10 @@ class Broker:
             return {"result": "invalid"}
         if name not in ACTIONS:
             return self.record("host-admin", op, "unknown-action")
+        if op == "arm":
+            return self.dispatch.arm() if name == TELEGRAM else {"result": "unknown-action"}
+        if op == "run" and name == TELEGRAM:
+            return {"result": "denied"}
         if op == "run":
             return self.record("host-admin", op, self.authz.admit(wolt, name), wolt)
         if op in {"revoke", "retire", "rename"}:
@@ -941,11 +1045,32 @@ def serve(broker: "Broker", server: socket.socket, route: str = "admin") -> None
                 pass
 
 
+def serve_effect(broker, server):
+    while True:
+        try:
+            peer, _ = server.accept()
+        except OSError:
+            return
+        try:
+            _, uid, _ = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid == broker.node_uid:
+                peer.settimeout(1)
+                with peer.makefile("rb") as stream:
+                    ready = stream.readline(6) == b"ready\n"
+                if ready:
+                    peer.settimeout(None)
+                    broker.dispatch.offer(peer)
+                    continue
+        except OSError:
+            pass
+        peer.close()
+
+
 def admin(argv: list[str], path: Path | None = None) -> int:
     fields = {**FIELDS, **OWNER}.get(argv[0], ()) if argv else ()
     if not fields or len(argv) != 1 + len(fields):
         print("usage: woltspace secrets enroll|retire WOLT | rename WOLT NEW | register ACTION"
-              " | grant|revoke|run WOLT ACTION | review|reconcile|reject CODE | approve CODE FINGERPRINT", file=sys.stderr)
+              " | arm ACTION | grant|revoke|run WOLT ACTION | review|reconcile|reject CODE | approve CODE FINGERPRINT", file=sys.stderr)
         return 2
     reply = call({"op": argv[0], **dict(zip(fields, argv[1:]))}, path)
     print(json.dumps(reply))
@@ -958,9 +1083,13 @@ if __name__ == "__main__":
     store, policy_dir, path = map(Path, sys.argv[1:4])  # fixed by the root startup owner
     try:
         action(store)
-        broker = Broker(policy_dir, pwd.getpwnam("node").pw_uid)
+        effect = sys.argv[4:] == ["telegram"]
+        broker = Broker(policy_dir, pwd.getpwnam("node").pw_uid, effect)
         server, ordinary = listen(path), listen(path.with_name(CREATE), 0o666)
         launch = listen(path.with_name(LAUNCH), 0o666)
+        if effect:
+            endpoint = listen(path.with_name(EFFECT), 0o660)
+            threading.Thread(target=serve_effect, args=(broker, endpoint), daemon=True).start()
         print(json.dumps({"result": "accepted"}), flush=True)
     except (OSError, ValueError):
         sys.exit(1)  # never print the store or exception text

@@ -1,5 +1,7 @@
 """Identity broker stage 1: real sockets, real SQLite files; only the admin uid is mocked to this test's uid."""
 from array import array
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import json
 import os
 import socket
@@ -867,3 +869,107 @@ def test_launch_cancel_proof_only_when_it_wins_before_redeem(store, owner):
     assert launch_exchange(b, cancel, "launch") == ("cancelled-before-redeem", None)
     assert launch_exchange(b, dict(selector, op="launch-redeem"), "admin") == ("denied", None)
     assert launch_exchange(b, cancel, "launch") == ("ok", None)
+
+
+def test_telegram_fixed_action_uses_one_owner_arm(store, owner):
+    action = broker.TELEGRAM
+    disabled = broker.Broker(store)
+    assert op(disabled, "arm", action=action) == "disabled"
+    b = broker.Broker(store, effect=True)
+    alpha, beta = enrolled(b, "alpha"), enrolled(b, "beta")
+    assert op(b, "register", action=action) == op(b, "grant", "alpha", action) == "ok"
+    with ExitStack() as sockets:
+        def worker(principal, session):
+            endpoint, channel = socket.socketpair(type=socket.SOCK_SEQPACKET)
+            sockets.enter_context(channel)
+            channel.settimeout(3)
+            with endpoint:
+                assert attach_channel(b, principal, session, endpoint) == "ok"
+            return channel, json.loads(channel.recv(256))
+
+        a, first = worker(alpha, "a")
+        duplicate, second = worker(alpha, "dup")
+        denied, other = worker(beta, "b")
+        assert packet(a, first, action=action) == "unavailable"
+        arm = ask(b, {"op": "arm", "action": action})
+        assert arm["result"] == "ok" and op(b, "arm", action=action) == "busy"
+        assert packet(a, first, action=action) == "unavailable"
+        assert packet(denied, other, action=action) == "denied"
+        assert packet(a, first, action=action, instance=second["instance"]) == "denied"
+        assert packet(a, first, action="telegram.other") == "unknown-action"
+        assert packet(a, first, action=action, text="ignored") == "invalid"
+        effect, fake = socket.socketpair()
+        b.dispatch.offer(effect)
+        with fake:
+            fake.settimeout(3)
+            for channel, binding in ((a, first), (duplicate, second)):
+                channel.send(json.dumps({k: binding[k] for k in ("principal", "instance")}
+                                        | {"action": action}).encode())
+            assert fake.recv(5) == b"send\n"
+            assert rows(store, f"SELECT principal, result FROM audit WHERE op = '{arm['id']}'") == [
+                (alpha, "pending")]
+            assert op(b, "arm", action=action) == "busy"
+            fake.sendall(b"o")
+            fake.sendall(b"k\n")
+            assert fake.recv(1) == b""
+        assert sorted(json.loads(channel.recv(256))["result"] for channel in (a, duplicate)) == [
+            "ok", "unavailable"]
+        assert op(b, "revoke", "alpha", action) == op(b, "grant", "alpha", action) == "ok"
+        assert packet(a, first, action=action) == "unavailable"
+        assert rows(store, f"SELECT principal, result FROM audit WHERE op = '{arm['id']}'") == [(alpha, "ok")]
+
+
+@pytest.mark.parametrize("interruption", ["intent-failure", "revoke-during-intent", "outcome-failure"])
+def test_telegram_intent_boundary(store, owner, monkeypatch, interruption):
+    b = broker.Broker(store, effect=True)
+    action = broker.TELEGRAM
+    alpha = enrolled(b, "alpha")
+    assert op(b, "register", action=action) == op(b, "grant", "alpha", action) == "ok"
+    binding = b.dispatch.bind(alpha, "a")
+    arm = ask(b, {"op": "arm", "action": action})["id"]
+    entered, release = threading.Event(), threading.Event()
+    original = b.writer.commit
+
+    def commit():
+        state, = b.writer.db.execute("SELECT result FROM audit WHERE op = ?", (arm,)).fetchone()
+        if state == "pending":
+            if interruption == "intent-failure":
+                raise sqlite3.OperationalError("injected")
+            if interruption == "revoke-during-intent":
+                entered.set()
+                assert release.wait(3)
+        if state == "ok" and interruption == "outcome-failure":
+            raise sqlite3.OperationalError("injected")
+        original()
+
+    monkeypatch.setattr(b.writer, "commit", commit)
+    effect, fake = socket.socketpair()
+    b.dispatch.offer(effect)
+    fake.settimeout(3)
+    with fake:
+        future = b.dispatch.submit(binding, action)
+        if interruption == "revoke-during-intent":
+            assert entered.wait(3)
+            try:
+                with ThreadPoolExecutor(1) as pool:
+                    revoke = pool.submit(op, b, "revoke", "alpha", action)
+                    try:
+                        until(lambda: (alpha, action) not in b.authz.active)
+                    finally:
+                        release.set()
+                    assert revoke.result(3) == "ok"
+            finally:
+                release.set()
+        elif interruption == "outcome-failure":
+            assert fake.recv(5) == b"send\n"
+            fake.sendall(b"ok\n")
+        assert fake.recv(1) == b""
+        assert future.result(3) == {
+            "intent-failure": "storage-error", "revoke-during-intent": "denied",
+            "outcome-failure": "unknown",
+        }[interruption]
+    assert op(b, "grant", "alpha", action) == "ok"
+    assert b.dispatch.submit(binding, action).result(3) == "unavailable"
+    expected = {"intent-failure": "armed", "revoke-during-intent": "denied",
+                "outcome-failure": "pending"}[interruption]
+    assert rows(store, f"SELECT result FROM audit WHERE op = '{arm}'") == [(expected,)]

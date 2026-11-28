@@ -7,6 +7,7 @@ Prints one fixed word: ok, denied, unavailable, unknown or refused.
 import fcntl
 import os
 from pathlib import Path
+import secrets
 import select
 import sys
 import time
@@ -21,25 +22,25 @@ def ask():
         reply = os.open(action / "reply", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
         return "unavailable"  # not a protected launch, or not this launch's pipes
+    tag = secrets.token_hex(4).encode()  # the supervisor answers with it: no other call's word is ours
     try:
-        fcntl.flock(request, fcntl.LOCK_EX)  # one request in flight per launch
-        try:
-            while os.read(reply, 512):  # a word left by an earlier, abandoned request is not ours
-                pass
-        except BlockingIOError:
-            pass
-        os.write(request, b"n")
-        line, deadline = b"", time.monotonic() + 30
-        while b"\n" not in line and len(line) <= 16:
+        fcntl.flock(request, fcntl.LOCK_EX)  # one request in flight per launch, released if we are killed
+        os.write(request, tag + b"\n")
+        pending, deadline = b"", time.monotonic() + 30
+        while True:
+            *lines, pending = pending.split(b"\n")
+            for line in lines:
+                if line.startswith(tag + b" "):
+                    word = line[len(tag) + 1:].decode("ascii", "replace")
+                    return word if word in EXIT else "refused"
+            pending = pending[-64:]
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not select.select([reply], [], [], remaining)[0]:
-                return "unknown"  # asked, but no answer: the request may still have been spent
+                return "unknown"  # asked, but no answer of ours: the request may still have been spent
             try:
-                line += os.read(reply, 17 - len(line))
+                pending += os.read(reply, 512)
             except BlockingIOError:
                 continue
-        word = line.split(b"\n", 1)[0].decode("ascii", "replace")
-        return word if word in EXIT else "refused"
     except OSError:
         return "unknown"
     finally:

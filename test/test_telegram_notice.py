@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -124,8 +125,8 @@ def test_each_layer_filters_the_reply_vocabulary_on_its_own(launch, tmp_path):
     fd = os.open(action / "request", os.O_WRONLY)
     reply = os.open(action / "reply", os.O_RDONLY)
     try:
-        os.write(fd, b"n")
-        assert os.read(reply, 64) == b"refused\n"  # the relay itself, before any helper filter
+        os.write(fd, b"not-a-tag\nabcdef01\n")  # an untagged line is ignored, a tag is answered
+        assert os.read(reply, 64) == b"abcdef01 refused\n"  # the relay itself, before any helper filter
     finally:
         os.close(fd)
         os.close(reply)
@@ -140,8 +141,8 @@ def test_each_layer_filters_the_reply_vocabulary_on_its_own(launch, tmp_path):
     def forged():  # a reply side that does not keep to the vocabulary
         import select
         select.select([request], [], [], 10)
-        os.read(request, 1)
-        os.write(answer, b"sent-anyway\n")
+        tag = os.read(request, 9).strip()
+        os.write(answer, b"ffffffff ok\n" + tag + b" sent-anyway\n")  # another tag's word, then ours
 
     thread = threading.Thread(target=forged, daemon=True)
     thread.start()
@@ -151,3 +152,21 @@ def test_each_layer_filters_the_reply_vocabulary_on_its_own(launch, tmp_path):
         thread.join(5)
         os.close(request)
         os.close(answer)
+
+
+def test_an_interrupted_call_never_hands_its_answer_to_the_next(launch):
+    """The first helper is killed while its request is in flight; the next one must read only its own word."""
+    start, state, _ = launch
+    broker = Broker(["ok", "unavailable"], delay=1.5)
+    start(broker)
+    first = subprocess.Popen([sys.executable, "-I", str(HELPER)], env={"PATH": "/usr/bin:/bin",
+                             "HOME": str(state / "home")}, stdout=subprocess.PIPE)
+    deadline = time.monotonic() + 10
+    while not broker.requests:  # the first request has reached the broker, its answer not yet back
+        assert time.monotonic() < deadline
+        time.sleep(.01)
+    first.kill()
+    first.wait()
+    first.stdout.close()
+    assert helper(state) == ("unavailable", 4)  # its own answer, never the late "ok"
+    assert len(broker.requests) == 2

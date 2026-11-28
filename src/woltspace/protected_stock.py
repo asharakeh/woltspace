@@ -4,6 +4,7 @@ from http.server import HTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import select
 import signal
 import socket
@@ -55,21 +56,26 @@ def notice_endpoint(state):
 
 
 def relay_notices(request, reply, channel, stopped):
-    """One byte asks for the one fixed notice; one fixed word answers it. A full reply pipe drops the word."""
+    """Each request line is one tag; its answer is that tag and one fixed word. A full reply pipe drops it."""
+    pending = b""
     while not stopped.is_set():
         if not select.select([request], [], [], .1)[0]:
             continue
         try:
-            if not os.read(request, 1):
-                continue
+            pending += os.read(request, 512)
         except BlockingIOError:
             continue
-        result = channel.ask(dummy_broker.TELEGRAM, 25)  # the broker's own wait for the connector is 20 s
-        word = result if result in NOTICE_WORDS else "refused"
-        try:
-            os.write(reply, word.encode() + b"\n")
-        except BlockingIOError:
-            pass
+        *lines, pending = pending.split(b"\n")
+        pending = pending[-9:]  # a line longer than a tag never becomes one
+        for tag in lines:
+            if not re.fullmatch(rb"[0-9a-f]{8}", tag):
+                continue
+            result = channel.ask(dummy_broker.TELEGRAM, 25)  # the broker's own wait for the connector is 20 s
+            word = result if result in NOTICE_WORDS else "refused"
+            try:
+                os.write(reply, tag + b" " + word.encode() + b"\n")
+            except BlockingIOError:
+                pass
 
 
 def remove_endpoint(action, fds):

@@ -160,7 +160,7 @@ def wolt_display_name(name: str, wolts_dir: Path | None = None) -> str:
 
 def create_creature_wolt(name: str, creature_type: str, role: str = "",
                          description: str = "", harness: str = "",
-                         model: str = "", display_name: str = "") -> dict:
+                         model: str = "", display_name: str = "", linkage: str = "") -> dict:
     """Create a minimal creature-wolt directory.
 
     Returns a dict with:
@@ -172,14 +172,17 @@ def create_creature_wolt(name: str, creature_type: str, role: str = "",
     checks that no wolt is one under the same lock, so a wolt can never be
     created as a creature that is being removed.
     """
+    from protected_create import MARKER, enabled
+    if enabled() and not linkage:
+        raise PermissionError("an isolated lodge creates a wolt only from an approved create request")
     with settings_lock(CONFIG_FILE):
         return _create_creature_wolt(name, creature_type, role, description,
-                                     harness, model, display_name)
+                                     harness, model, display_name, linkage and (MARKER, linkage))
 
 
 def _create_creature_wolt(name: str, creature_type: str, role: str,
                           description: str, harness: str,
-                          model: str, display_name: str) -> dict:
+                          model: str, display_name: str, linkage=None) -> dict:
     if not is_valid_type(creature_type):
         raise ValueError(f"Invalid creature type: {creature_type}. Must be one of: {', '.join(sorted(VALID_TYPES))}, or a custom creature")
     custom = get_custom(creature_type)
@@ -193,6 +196,8 @@ def _create_creature_wolt(name: str, creature_type: str, role: str,
         raise ValueError(f"Wolt '{name}' already exists at {wolt_dir}")
     if in_archive(name, wolts_dir=WOLTS_DIR):
         raise ValueError(f"an archived wolt is named {name}: unarchive or delete it first")
+
+    wolt_dir.mkdir()  # exclusive: a folder that appeared since the check is never written into
 
     # Check singleton constraint
     demoted = None
@@ -214,6 +219,8 @@ def _create_creature_wolt(name: str, creature_type: str, role: str,
     # Create directory structure
     (wolt_dir / "wolt" / "memory" / "archive").mkdir(parents=True)
     (wolt_dir / ".state").mkdir(parents=True)
+    if linkage:  # first, so a partial scaffold is recognisably this request's
+        (wolt_dir / linkage[0]).write_text(linkage[1])
 
     # Write wolt.json
     wolt_json = {

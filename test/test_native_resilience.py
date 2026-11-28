@@ -387,7 +387,7 @@ class TestEnvFileLoading:
         "WOLTSPACE_WOLT_DIR", "WOLT_DIR", "WOLTSPACE_INSTANCE_ID",
     )
 
-    def _prepare(self, tmp_path, monkeypatch, env_lines, shell=None):
+    def _prepare(self, tmp_path, monkeypatch, env_lines, shell=None, early=False):
         for key in self._KEYS:
             monkeypatch.delenv(key, raising=False)
         for key, value in (shell or {}).items():
@@ -395,7 +395,10 @@ class TestEnvFileLoading:
         layout = _layout(tmp_path)
         layout.wolts_dir.mkdir(parents=True, exist_ok=True)
         (layout.wolts_dir / ".env").write_text("\n".join(env_lines) + "\n")
+        from woltspace.supervisor import load_environment
+        provenance = load_environment(layout.wolts_dir / ".env") if early else set()
         supervisor = Supervisor(layout)
+        supervisor._env_file_keys = provenance
         supervisor.prepare()
         return supervisor
 
@@ -450,6 +453,14 @@ class TestEnvFileLoading:
         self._with_connector_secret(monkeypatch, {"TELEGRAM_BOT_TOKEN": "config-token"})
         supervisor.channel_supervisor()
         assert os.environ["TELEGRAM_BOT_TOKEN"] == "shell-token"
+
+    @pytest.mark.parametrize("exported", [False, True])
+    def test_early_node_dotenv_keeps_config_and_export_precedence(self, tmp_path, monkeypatch, exported):
+        supervisor = self._prepare(tmp_path, monkeypatch, ["TELEGRAM_BOT_TOKEN=benign-from-file"],
+            shell={"TELEGRAM_BOT_TOKEN": "benign-export"} if exported else {}, early=True)
+        self._with_connector_secret(monkeypatch, {"TELEGRAM_BOT_TOKEN": "benign-config"})
+        supervisor.channel_supervisor()
+        assert os.environ["TELEGRAM_BOT_TOKEN"] == ("benign-export" if exported else "benign-config")
 
 
 class TestTelegramTokenClash:

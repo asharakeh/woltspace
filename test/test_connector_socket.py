@@ -259,3 +259,76 @@ def test_frame_checks_refuse(frame):
 def test_an_oversized_frame_is_refused():
     with pytest.raises(wire.FrameError):
         wire.encode({"type": "say", "reply": {"text": "x" * wire.MAX_FRAME_BYTES}})
+
+
+@pytest.mark.parametrize("owners,enabled,uid_matches,accepted", [
+    (["42"], True, True, True),
+    (["42"], False, True, False),
+    (["42", "43"], True, True, False),
+    (["42"], True, False, False),
+])
+def test_fixed_telegram_route_from_connector_host(run_dir, monkeypatch, owners, enabled, uid_matches, accepted):
+    import os
+    import socket
+    from threading import Thread
+
+    import connector_host
+    from woltspace import dummy_broker
+
+    async def main():
+        root = run_dir.parent
+        effect_path = root / "effect.sock"
+        policy = root / "policy"
+        policy.mkdir(mode=0o700)
+        protected = dummy_broker.Broker(policy, os.getuid(), effect=True)
+        listener = dummy_broker.listen(effect_path)
+        Thread(target=dummy_broker.serve_effect, args=(protected, listener), daemon=True).start()
+        monkeypatch.setattr(connector_host, "EFFECT_SOCKET", str(effect_path))
+        monkeypatch.setattr(connector_host, "EFFECT_SERVICE_UID", os.getuid() + (not uid_matches))
+        monkeypatch.setenv("WOLTSPACE_BROKER_TELEGRAM", str(int(enabled)))
+        connector_host.write_lodge_file(root, [{"name": "telegram", "owners": owners}])
+        host_path = connector_host.run_dir(root)
+        token = broker_mod.new_token(host_path, "telegram")
+        got = []
+
+        async def on_send(frame):
+            got.append((frame["route"], frame["method"], frame["text"]))
+            return {"status": "delivered"}
+
+        client = client_mod.Client("telegram", socket_path=str(broker_mod.socket_path(host_path, "telegram")),
+                                   token=token, on_send=on_send)
+        action = dummy_broker.TELEGRAM
+
+        def admin(op, **fields):
+            return protected.apply({"op": op, **fields})
+
+        await connector_host.start(root)
+        try:
+            await client.connect()
+            principal = admin("enroll", wolt="alpha")["id"]
+            binding = protected.dispatch.bind(principal, "alpha")
+            assert admin("register", action=action) == {"result": "ok"}
+            assert admin("grant", wolt="alpha", action=action) == {"result": "ok"}
+            assert admin("arm", action=action)["result"] == "ok"
+            if accepted:
+                async def wait_for_peer():
+                    while protected.dispatch.peer is None:
+                        await asyncio.sleep(.01)
+                await asyncio.wait_for(wait_for_peer(), 3)
+                result = await asyncio.wrap_future(protected.dispatch.submit(binding, action))
+                assert result == "ok"
+                assert got == [({"chat_id": "42"}, "message", "Woltspace broker notice.")]
+            else:
+                if enabled and len(owners) == 1:
+                    # Connect directly so the peer-id refusal is deterministic.
+                    await connector_host._telegram_once(connector_host.connector_broker.current(), "42")
+                else:
+                    assert connector_host._effect_task is None
+                assert await asyncio.wrap_future(protected.dispatch.submit(binding, action)) == "unavailable"
+                assert not got
+        finally:
+            await client.close()
+            await connector_host.stop()
+            listener.shutdown(socket.SHUT_RDWR)
+            listener.close()
+    asyncio.run(main())

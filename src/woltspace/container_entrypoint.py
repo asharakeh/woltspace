@@ -70,6 +70,12 @@ def run_root_phase() -> int:
     host side; everything in the bundle has to belong to node because boot
     writes a derived skill into it.
     """
+    enabled = os.environ.get("WOLTSPACE_FEATURE_ISOLATION", "false")
+    if enabled not in {"true", "false"}:
+        raise ValueError("WOLTSPACE_FEATURE_ISOLATION must be true or false")
+    if enabled == "true":
+        from .broker_startup import preflight
+        preflight()  # before any uid/ownership preparation
     host_uid = os.environ.get("HOST_UID") or "1000"
     host_gid = os.environ.get("HOST_GID") or "1000"
     root_env = {**os.environ, "PATH": ROOT_PATH}
@@ -94,7 +100,11 @@ def run_root_phase() -> int:
     os.environ["HOME"] = str(HOME)
     # The node phase keeps the image's PATH; only gosu itself is looked up
     # in ROOT_PATH.
-    os.execv(_root_tool("gosu"), ["gosu", "node", "/usr/local/bin/woltspace", "container-entrypoint"])
+    node = ["gosu", "node", "/usr/local/bin/woltspace", "container-entrypoint"]
+    if enabled == "true":
+        from .broker_startup import supervise
+        return supervise([_root_tool("gosu"), *node[1:]])
+    os.execv(_root_tool("gosu"), node)
     return 1  # unreachable — execv either replaces this process or raises
 
 
@@ -415,6 +425,10 @@ def open_tmux_window(wolt_name: str, wolt_dir: Path, wolts_dir: Path) -> None:
     )
     subprocess.run(["tmux", "set", "-g", "mouse", "on"], check=True)
 
+    if wolt_name and os.environ.get("WOLTSPACE_FEATURE_ISOLATION") == "true":
+        print("automatic wolt launch refused: protected session launch required")
+        return
+
     runtime_lib_on_path(resolve_install_root(os.environ.get("WOLTSPACE_DIR")))
     from harnesses import build_command, platform_skill_invoke
 
@@ -519,6 +533,10 @@ def start_tunnel_report(wolts_dir: Path, env: dict[str, str]) -> threading.Threa
 def run_node_phase() -> int:
     woltspace_dir = resolve_install_root(os.environ.get("WOLTSPACE_DIR"))
     wolts_dir = Path(get_env("WOLTSPACE_WOLTS_DIR") or DEFAULT_WOLTS_DIR)
+    env_file_keys = None
+    if os.environ.get("WOLTSPACE_FEATURE_ISOLATION") == "true":
+        from .supervisor import load_environment
+        env_file_keys = load_environment(wolts_dir / ".env")
 
     # Lodge infrastructure — always, regardless of whether any wolts exist
     scaffold_lodge(wolts_dir, woltspace_dir)
@@ -574,6 +592,8 @@ def run_node_phase() -> int:
     # instead of a shell that would leave them orphaned.
     from .cli import serve
 
+    if env_file_keys is not None:
+        return serve(host="0.0.0.0", port=7777, isolation="external", no_doctor=True, env_file_keys=env_file_keys)
     return serve(host="0.0.0.0", port=7777, isolation="external", no_doctor=True)
 
 

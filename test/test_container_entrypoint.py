@@ -144,6 +144,20 @@ def _sent(calls):
 
 
 class TestGreetingBranches:
+    @pytest.mark.parametrize("first_run", [False, True])
+    def test_isolation_refuses_automatic_launch(self, tmp_path, fake_tmux, capsys,
+                                                monkeypatch, first_run):
+        monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
+        marker = tmp_path / "home" / ".claude" / ".first-run"
+        if first_run:
+            marker.touch()
+
+        boot.open_tmux_window("mywolt", tmp_path / "wolt", tmp_path / "wolts")
+
+        assert _sent(fake_tmux) == []
+        assert marker.exists() is first_run
+        assert "automatic wolt launch refused" in capsys.readouterr().out
+
     def test_harness_cli_owns_auth_when_a_wolt_exists(self, tmp_path, fake_tmux, capsys):
         boot.open_tmux_window("mywolt", tmp_path / "wolt", tmp_path / "wolts")
 

@@ -1316,7 +1316,8 @@ async def session_new_create(request: Request):
         )
     if not wolt_name:
         return JSONResponse({"detail": "name needs at least one letter"}, status_code=400)
-    if (WOLTS_DIR / wolt_name).exists():
+    import protected_create
+    if (WOLTS_DIR / wolt_name).exists() and not protected_create.enabled():  # protected: the broker decides
         return JSONResponse(
             {"detail": f"a wolt named {wolt_name} already exists"}, status_code=409,
         )
@@ -1356,9 +1357,49 @@ async def session_new_create(request: Request):
     except ValueError as e:
         return JSONResponse({"detail": str(e)}, status_code=400)
 
+    from wolts import create_creature_wolt
+    if protected_create.enabled():
+        # Isolated lodge: a pending request the host owner approves; this side never approves.
+        # Every effective first-launch input is in the approved terms: the resolved engine and level.
+        # A changed lodge default or a different level is a conflict, never a silent change.
+        request_id = body.get("request_id")
+        if body.get("workdir"):
+            return JSONResponse({"detail": "an isolated lodge starts a new wolt in its own home"}, status_code=400)
+        terms = {"name": wolt_name, "type": wolt_type, "harness": selected_harness, "model": requested_model,
+                 "display": typed_name, "policy": level, "role": "", "description": ""}
+        try:
+            reply = protected_create.create(
+                request_id if isinstance(request_id, str) else "", terms, WOLTS_DIR,
+                lambda linkage: create_creature_wolt(
+                    wolt_name, wolt_type, harness=selected_harness, model=requested_model,
+                    display_name=typed_name, linkage=linkage),  # the approved engine is pinned
+                lambda: start_session(  # its result carries the conversation id issued under the lock
+                    wolt=wolt_name, harness=selected_harness, execution_policy=level, track_attempt=True,
+                    prompt=platform_skill_invoke(selected_harness, "create-wolt",
+                                                 delivery=wolt_skills_delivery(WOLTS_DIR / wolt_name)),
+                    routing={"adapter": "lodge"}))
+        except Exception as e:  # the broker keeps the step reached and the principal for a retry
+            return JSONResponse({"detail": str(e)}, status_code=500)
+        if reply.get("status") == "launched" and "session" not in reply:  # a rejoin: the exact first session
+            from sessions import SessionRegistry
+            first = reply.get("first_session")  # recorded by the broker with the launched transition
+            row = SessionRegistry(WOLTS_DIR).get(first, check_alive=False) if first else None  # read only
+            if (row is None or row.get("wolt") != wolt_name  # gone, or an old record without the link,
+                    or row.get("harness_session_id") != reply.get("first_conversation")):  # or a reused name
+                return JSONResponse({**reply, "session": None,
+                                     "detail": "the first session of this create is unavailable"}, status_code=409)
+            reply["session"] = {"name": first}  # never a guess, never a relaunch
+        status = {"ok": {"launched": 200, "pending": 202}.get(reply.get("status"), 409),
+                  "unavailable": 503}.get(reply["result"], 409)
+        if status != 200:  # shown as is by the lodge page and the tui
+            reply["detail"] = (f"waiting for the host owner: woltspace secrets review {reply['code']}"
+                               if status == 202 else f"create request {reply.get('status') or reply['result']}")
+            if reply.get("status") == "launching":  # in progress, or uncertain after a failure
+                reply["detail"] += f"; if no first session started, the host owner runs woltspace secrets reconcile {reply['code']}"
+        return JSONResponse(reply, status_code=status)
+
     try:
         # Step 1: Scaffold the wolt with environment-appropriate harness config.
-        from wolts import create_creature_wolt
         # Only an explicit request becomes a durable per-wolt override. An API
         # caller that omits harness keeps following the lodge default later.
         # A chosen model is pinned with its harness: a pin only means something

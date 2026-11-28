@@ -25,6 +25,7 @@ async function main() {
   const { default: App } = await import('./ui/App.js');
   const { attach, inContainer, containerName } = await import('./attach.js');
   const { BASE, createWolt, resumeSession, spawnSession } = await import('./api.js');
+  const { createUntilStarted } = await import('./create-wolt.js');
   const { lore } = await import('./theme.js');
   const launchCwd = process.cwd();
   for (;;) {
@@ -51,10 +52,10 @@ async function main() {
         if (!slug) throw new Error('lodge returned no session name');
       } else if (action.type === 'create') {
         console.error(lore.waking(action.name));
-        const r = await createWolt(
-          action.name, action.woltType, action.workdir, action.executionPolicy,
-        );
-        slug = r?.name;
+        slug = await createUntilStarted(createWolt, action, {
+          say: (line) => console.error(`  ${line}`),
+          wait: () => new Promise((done) => setTimeout(done, 5000)),
+        });
         if (!slug) throw new Error('lodge returned no session name');
       }
     } catch (e) {

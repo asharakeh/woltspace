@@ -681,3 +681,234 @@ def test_host_tmux_paste_is_bracketed_then_submitted(tmp_path):
     body = received[len(start):-len(end + b"\r")]
     # tmux turns LF into CR inside a paste; inside brackets that is text, not submit.
     assert body.replace(b"\r", b"\n") == message.encode()
+
+
+@pytest.mark.parametrize("spawn_error", [False, True])
+def test_protected_start_cancels_and_settles_definite_launch_failure(tmp_path, monkeypatch, spawn_error):
+    import sessions
+
+    wolt = tmp_path / "alpha" / "wolt"
+    wolt.mkdir(parents=True)
+    (wolt / "wolt.json").write_text('{"name":"alpha","type":"beaver"}')
+    monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
+    monkeypatch.setattr(sessions, "WOLTS_DIR", tmp_path)
+    monkeypatch.setattr(sessions, "harness_install_problem", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sessions, "_await_agent", lambda *args: False)
+    effects = []
+
+    def control(operation, name, attempt, **kwargs):
+        effects.append((operation, name, attempt))
+        return {"result": "ok"}
+
+    def spawn(name, *_):
+        if spawn_error:
+            raise subprocess.CalledProcessError(1, "tmux")
+        return RuntimeHandle(name, name, "%1")
+
+    monkeypatch.setattr(sessions, "_launch_control", control)
+    monkeypatch.setattr(sessions, "_tmux_spawn", spawn)
+    monkeypatch.setattr(sessions, "_tmux_stop", lambda _: effects.append("stopped") or True)
+    monkeypatch.setattr(sessions, "_tmux_exists", lambda _: "stopped" not in effects)
+    error = subprocess.CalledProcessError if spawn_error else RuntimeError
+    with pytest.raises(error):
+        sessions.start_session(wolt="alpha", name="alpha-protected")
+
+    opened, *middle, cancelled = effects
+    assert opened[0] == "launch-open" and cancelled == ("launch-cancel", *opened[1:])
+    assert middle == ([] if spawn_error else ["stopped"])
+    stored = sessions.SessionRegistry(tmp_path).get("alpha-protected", wolt="alpha", check_alive=False)
+    assert stored["status"] == "stopped" and stored["stop_reason"] == "launch_failed"
+    assert "launching" not in stored
+
+
+@pytest.mark.parametrize("saved_pane", [False, True])
+@pytest.mark.parametrize("stock", [False, True])
+def test_protected_resume_timeout_cancels_without_settling_uncertain_launch(
+    tmp_path, monkeypatch, saved_pane, stock,
+):
+    import sessions
+    from woltspace import protected_launcher
+
+    wolt = tmp_path / "alpha" / "wolt"
+    wolt.mkdir(parents=True)
+    monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
+    monkeypatch.setattr(sessions, "WOLTS_DIR", tmp_path)
+    monkeypatch.setattr(protected_launcher, "stock_enabled", lambda: stock)
+    monkeypatch.setattr(protected_launcher, "launcher_epoch", lambda *_: "b" * 32)
+    root_observations = iter(("unavailable", "unrecorded"))
+    monkeypatch.setattr(protected_launcher, "reap_status", lambda *_: next(root_observations))
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda *_: saved_pane)
+    monkeypatch.setattr(sessions, "resolve_agent_handle", lambda *_, **__: None)
+    monkeypatch.setattr(sessions, "_runtime", lambda: SimpleNamespace(handle_is_alive=lambda _: True))
+    monkeypatch.setattr(sessions, "_tmux_paste", lambda *_: None)
+    monkeypatch.setattr(sessions, "_tmux_spawn", lambda name, *_: RuntimeHandle(name, name, "%2"))
+    monkeypatch.setattr(sessions, "_await_agent", lambda *_: False)
+    monkeypatch.setattr(sessions, "_schedule_pickup", lambda *_: None)
+    monkeypatch.setattr(sessions, "_tmux_stop", lambda *_: pytest.fail("uncertain launch was stopped"))
+    effects = []
+
+    def control(operation, name, attempt, **kwargs):
+        effects.append((operation, name, attempt))
+        if stock and operation == "launch-cancel":
+            assert kwargs == {"proof": True}
+            if len(effects) == 2:
+                return {"result": "cancelled-before-redeem"}
+        return {"result": "ok"}
+
+    monkeypatch.setattr(sessions, "_launch_control", control)
+    registry = sessions.SessionRegistry(tmp_path)
+    registry.create("alpha-protected", wolt="alpha", harness="claude", dir=str(wolt.parent))
+    registry.update("alpha-protected", wolt="alpha", harness_session_id=str(uuid.uuid4()),
+                    runtime=RuntimeHandle("alpha-protected", "alpha-protected", "%1").to_record())
+
+    with pytest.raises(sessions.ResumeFailed, match="could not be confirmed"):
+        sessions.resume_session("alpha-protected")
+    opened, cancelled = effects
+    assert opened[0] == "launch-open" and cancelled == ("launch-cancel", *opened[1:])
+    stored = registry.get("alpha-protected", wolt="alpha", check_alive=False)
+    assert stored["status"] == "running" and stored["attempt"] == opened[2]
+    assert stored["runtime"]["pane_id"] == ("%1" if saved_pane else "%2")
+
+    if stock:
+        assert stored["stock_attempt"] == stored["stock_cancelled_attempt"] == opened[2]
+        monkeypatch.setattr(sessions, "_tmux_alive", lambda *_: False)
+        assert sessions.stop_session("alpha-protected")["status"] == "stopped"
+        retired = registry.get("alpha-protected", wolt="alpha", check_alive=False)
+        assert "stock_attempt" not in retired and "stock_cancelled_attempt" not in retired
+        assert effects[-1] == cancelled
+    else:
+        assert "stock_attempt" not in stored
+
+
+@pytest.mark.parametrize(("receipt", "cancel_result", "settled"), [
+    ("reaped", "ok", True),
+    ("no-owned-launch", "ok", True),
+    ("unrecorded", "cancelled-before-redeem", True),
+    ("unrecorded", "ok", False),
+    ("unavailable", "cancelled-before-redeem", False),
+])
+def test_stock_stop_settles_only_a_verified_attempt(tmp_path, monkeypatch, receipt, cancel_result, settled):
+    import sessions
+    from woltspace import protected_launcher
+
+    name, attempt, epoch = "alpha-stock", "a" * 12, "b" * 32
+    (tmp_path / "alpha" / "wolt").mkdir(parents=True)
+    monkeypatch.setattr(sessions, "WOLTS_DIR", tmp_path)
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda *_: False)
+    monkeypatch.setattr(sessions, "_schedule_pickup", lambda *_: None)
+    effects = []
+    replies = iter(("pending", receipt))
+    monkeypatch.setattr(sessions, "_launch_control",
+                        lambda *args, **kwargs: effects.append((args, kwargs)) or {"result": cancel_result})
+    monkeypatch.setattr(protected_launcher, "reap_status",
+                        lambda name, attempt, _, epoch: effects.append((name, attempt, epoch)) or next(replies))
+    registry = sessions.SessionRegistry(tmp_path)
+    registry.create(name, wolt="alpha")
+    registry.update(name, wolt="alpha", status="running", attempt=attempt,
+                    stock_attempt=attempt, stock_epoch=epoch)
+
+    if settled:
+        assert sessions.stop_session(name)["status"] == "stopped"
+        assert "stock_attempt" not in registry.get(name, check_alive=False)
+        # The launcher may have restarted or evicted the now-unneeded receipt.
+        assert sessions.archive_session(name)["status"] == "archived"
+        sessions.delete_session(name)
+    else:
+        with pytest.raises(sessions.lifecycle.LifecycleUnknown):
+            sessions.stop_session(name)
+        row = registry.get(name, check_alive=False)
+        assert row["status"] == sessions.STOPPING and row["stock_attempt"] == attempt
+
+    assert effects == [(("launch-cancel", name, attempt), {"proof": True}),
+                       (name, attempt, epoch), (name, attempt, epoch)]
+
+
+@pytest.mark.parametrize("attempt", [None, "a" * 12])
+def test_stock_profile_allows_ordinary_operations_without_a_stock_launch(tmp_path, monkeypatch, attempt):
+    import sessions
+    from woltspace import protected_launcher
+
+    (tmp_path / "alpha" / "wolt").mkdir(parents=True)
+    monkeypatch.setattr(sessions, "WOLTS_DIR", tmp_path)
+    monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
+    monkeypatch.setattr(protected_launcher, "stock_enabled", lambda: True)
+    monkeypatch.setattr(protected_launcher, "reap_status", lambda *_: pytest.fail("unexpected receipt lookup"))
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda *_: False)
+    monkeypatch.setattr(sessions, "_schedule_pickup", lambda *_: None)
+    registry = sessions.SessionRegistry(tmp_path)
+    registry.create("alpha", wolt="alpha")
+    registry.update("alpha", wolt="alpha", status="resting", attempt=attempt)
+    assert sessions.stop_session("alpha")["status"] == "stopped"
+    assert sessions.archive_session("alpha")["status"] == "archived"
+    sessions.delete_session("alpha")
+
+
+@pytest.mark.parametrize("stock", [True, False])
+def test_only_published_stock_launch_records_reap_obligation(tmp_path, monkeypatch, stock):
+    import sessions
+
+    (tmp_path / "alpha" / "wolt").mkdir(parents=True)
+    from woltspace import protected_launcher
+
+    monkeypatch.setattr(sessions, "_protected_stock_enabled", lambda: stock)
+    monkeypatch.setattr(protected_launcher, "launcher_epoch", lambda *_: "b" * 32)
+    registry = sessions.SessionRegistry(tmp_path)
+    registry.create("alpha", wolt="alpha")
+    attempt = sessions.mark_launching(registry, "alpha", "alpha", "codex", None, track=True)
+    staged = registry.get("alpha", check_alive=False)
+    assert "stock_attempt" not in staged
+    monkeypatch.setattr(sessions, "_markers_on", lambda *_: False)
+    assert sessions.unresolved_launch(staged) is stock
+    runtime = RuntimeHandle("alpha", "alpha", "%1").to_record()
+    assert sessions.publish_runtime(registry, "alpha", "alpha", attempt, runtime)
+    row = registry.get("alpha", check_alive=False)
+    assert row.get("stock_attempt") == (attempt if stock else None)
+
+
+def test_stock_failed_redeem_can_be_stopped_without_claiming_reap(tmp_path, monkeypatch):
+    import sessions
+    from woltspace import protected_launcher
+
+    (tmp_path / "alpha" / "wolt").mkdir(parents=True)
+    monkeypatch.setattr(sessions, "WOLTS_DIR", tmp_path)
+    monkeypatch.setattr(sessions, "_tmux_alive", lambda *_: False)
+    monkeypatch.setattr(sessions, "_markers_on", lambda *_: False)
+    monkeypatch.setattr(sessions, "_schedule_pickup", lambda *_: None)
+    monkeypatch.setattr(sessions, "_launch_control", lambda *_, **__: {"result": "ok"})
+    monkeypatch.setattr(protected_launcher, "reap_status", lambda *_: "no-owned-launch")
+    registry = sessions.SessionRegistry(tmp_path)
+    registry.create("alpha-stock", wolt="alpha")
+    registry.update("alpha-stock", wolt="alpha",
+                    launching={"attempt": "a" * 12, "stock": True, "stock_epoch": "b" * 32})
+    assert sessions.stop_session("alpha-stock")["status"] == "stopped"
+    assert "launching" not in registry.get("alpha-stock", check_alive=False)
+
+
+def test_dummy_resume_ignores_a_legacy_conversation_id(monkeypatch):
+    import sessions
+
+    monkeypatch.setenv("WOLTSPACE_FEATURE_ISOLATION", "true")
+    monkeypatch.setattr(sessions, "_protected_stock_enabled", lambda: False)
+    calls = []
+    monkeypatch.setattr(sessions, "_launch_control",
+                        lambda *args, **kwargs: calls.append((args, kwargs)) or {"result": "ok"})
+    assert "bridge" in sessions._open_launch("alpha", "alpha", "a" * 12, conversation="legacy-id")
+    assert calls == [(("launch-open", "alpha", "a" * 12), {"wolt": "alpha"})]
+
+
+
+def test_reconcile_keeps_unresolved_stock_launch_with_inbox_off(tmp_path, monkeypatch):
+    import sessions
+
+    (tmp_path / "alpha" / "wolt").mkdir(parents=True)
+    monkeypatch.setattr(sessions, "_markers_on", lambda *_: False)
+    monkeypatch.setattr(sessions, "_tmux_sessions", lambda: set())
+    registry = sessions.SessionRegistry(tmp_path)
+    registry.create("alpha-stock", wolt="alpha")
+    registry.create("alpha-dummy", wolt="alpha")
+    registry.update("alpha-stock", wolt="alpha", status="running",
+                    launching={"attempt": "a" * 12, "stock": True})
+    registry.update("alpha-dummy", wolt="alpha", status="running",
+                    launching={"attempt": "b" * 12})
+    assert registry.reconcile() == ["alpha-dummy"]
+    assert registry.get("alpha-stock", check_alive=False)["status"] == "running"

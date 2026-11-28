@@ -3,7 +3,8 @@ set -Eeuo pipefail
 umask 077
 exec 3>&1 >/dev/null 2>&1
 root=$(mktemp -d)
-name=telegram-broker-${root##*.}
+run_id=${root##*.}
+name=telegram-broker-${run_id,,}
 base=$name:base
 image=$name:fixture
 route_off=$name:route-off
@@ -38,7 +39,7 @@ cleanup() {
     fi
     rm -rf -- "$root" || failed=1
     if (( failed )); then phase=cleanup; status=1; fi
-    if (( status )); then printf '::error::telegram-broker phase=%s line=%s\n' "$phase" "$line" >&3
+    if (( status )); then printf '::error::broker-smoke phase=%s line=%s\n' "$phase" "$line" >&3
     else printf 'PASS cleanup\n' >&3; fi
     exit "$status"
 }

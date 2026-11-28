@@ -6,6 +6,7 @@ root=$(mktemp -d)
 name=telegram-broker-${root##*.}
 base=$name:base
 image=$name:fixture
+route_off=$name:route-off
 source_volume=$name-source
 volumes=("$source_volume" "$name-post" "$name-pre")
 policy=/var/lib/woltspace-secrets
@@ -21,7 +22,7 @@ cleanup() {
         for volume in "${volumes[@]}"; do
             if docker volume inspect "$volume"; then docker volume rm "$volume" || failed=1; fi
         done
-        for target in "$image" "$base"; do
+        for target in "$route_off" "$image" "$base"; do
             if docker image inspect "$target"; then docker image rm "$target" || failed=1; fi
         done
     fi
@@ -38,7 +39,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'line=$LINENO; exit 1' INT TERM
 if docker container inspect "$name"; then exit 1; fi
-for target in "$image" "$base"; do
+for target in "$route_off" "$image" "$base"; do
     if docker image inspect "$target"; then exit 1; fi
 done
 for volume in "${volumes[@]}"; do
@@ -59,6 +60,8 @@ RUN set -e; p=/workspace/woltspace/container/connectors/telegram; \
     printf 'dummy\ntelegram\n' >/etc/woltspace/broker-dummy
 DOCKER
 docker build --network none --tag "$image" "$root/build"
+printf 'FROM %s\nRUN printf "dummy\\n" >/etc/woltspace/broker-dummy\n' "$image" >"$root/build/Dockerfile"
+docker build --network none --tag "$route_off" "$root/build"
 inside() { docker exec -u 0 "$container" "$@"; }
 py() { inside /opt/woltspace/tools/woltspace/bin/python -I "$@"; }
 probe() { py /opt/fixture/worker.py "$@"; }
@@ -78,17 +81,17 @@ handoff() {
     inside awk '$6=="03" && $8=="/run/woltspace-broker/effect.sock" {found=1} END {exit !found}' /proc/net/unix
 }
 boot() {
-    local isolation=$1 volume=${2:-}
+    local isolation=$1 volume=${2:-} startup_image=${3:-$image}
     local -a mounts=()
     if [[ $volume ]]; then mounts=(-v "$volume:$policy"); fi
     container=$(docker create --name "$name" --network none --security-opt no-new-privileges \
         -e WOLTSPACE_FEATURE_ISOLATION="$isolation" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         -e ENABLE_TELEGRAM_BOT=true -e TELEGRAM_ALLOWED_USERS=42 -e TELEGRAM_BOT_TOKEN=fixture-only \
-        "${mounts[@]}" -v "$WOLTSPACE_WOLTS_DIR:/workspace/wolts" -v "$root/ledger:/fixture" "$image")
+        "${mounts[@]}" -v "$WOLTSPACE_WOLTS_DIR:/workspace/wolts" -v "$root/ledger:/fixture" "$startup_image")
     [[ $(docker inspect -f '{{.HostConfig.NetworkMode}}' "$container") == none ]]
     docker start "$container"
     wait_until health
-    if [[ $isolation == true ]]; then wait_until handoff; fi
+    if [[ $isolation == true && $startup_image == "$image" ]]; then wait_until handoff; fi
 }
 retire() {
     local expected=$1
@@ -173,8 +176,16 @@ for snapshot in post pre; do
     stop
 done
 phase=rollback
-boot false
+boot true "$source_volume" "$route_off"
 inside test ! -e /run/woltspace-broker/effect.sock
+probe audit >"$root/rollback-before.json"
+cmp "$root/post.json" "$root/rollback-before.json"
+regrant
+probe unavailable
+ok revoke alpha telegram.notice
+probe denied
+probe audit >"$root/rollback-after.json"
+[[ $(audit_result "$arm" <"$root/rollback-after.json") == unknown ]]
 one_accept
 stop
-printf 'PASS one acceptance; crash recovery; post/pre restore; rollback\n' >&3
+printf 'PASS one acceptance; crash recovery; post/pre restore; protected rollback\n' >&3

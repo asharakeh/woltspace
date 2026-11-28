@@ -12,6 +12,7 @@ from array import array
 from collections import deque
 from concurrent.futures import Future
 import hashlib
+import http.client
 import json
 import os
 import pwd
@@ -21,6 +22,7 @@ import secrets
 import select
 import socket
 import sqlite3
+import ssl
 import stat
 import struct
 import sys
@@ -32,14 +34,16 @@ from typing import NamedTuple
 POLICY_DIR = Path("/var/lib/woltspace-secrets")
 SOCKET = Path("/run/woltspace-broker/admin.sock")  # 0600 in a 0711 directory: only the service and root
 LAUNCH = "launch.sock"
-EFFECT, TELEGRAM = "effect.sock", "telegram.notice"
+TELEGRAM, NOTICE = "telegram.notice", "Woltspace broker notice."
+PROVIDER, CAFILE, SEND_SECONDS = ("api.telegram.org", 443), "/etc/ssl/certs/ca-certificates.crt", 15  # fixed
+TOKEN, CHAT = re.compile(r"([1-9][0-9]{0,18}):[A-Za-z0-9_-]{30,64}"), re.compile(r"[1-9][0-9]{0,18}")
 CREATE = "create.sock"  # 0666 beside it: the ordinary create route, nothing else
 ACTION, ADMIN_UID, MAX_REQUEST, CAPACITY, PENDING, GROUP = "dummy.ping", 0, 512, 64, 16, 8
 WORKERS, WAITING, PER_WOLT, BINDINGS = 2, 6, 3, 128
 DUMMY_DELAY = 0.5
 ACTIONS = {ACTION: ("secret", "dummy", "ping"), TELEGRAM: ("effect", "telegram", "notice")}  # allowlisted action -> (resource type, resource, operation)
 FIELDS = {"enroll": ("wolt",), "rename": ("wolt", "to"), "retire": ("wolt",), "register": ("action",),
-          "arm": ("action",), "grant": ("wolt", "action"), "revoke": ("wolt", "action"), "run": ("wolt", "action")}
+          "arm": ("action",), "provision": ("action", "chat", "token"), "grant": ("wolt", "action"), "revoke": ("wolt", "action"), "run": ("wolt", "action")}
 NAME = re.compile(r"[a-z][a-z0-9-]{0,39}")
 SESSION = re.compile(r"[a-z][a-z0-9-]{0,127}")
 ATTEMPT = re.compile(r"[0-9a-f]{12}")
@@ -277,11 +281,11 @@ def audit(db, caller: str, op: str, principal, name: str, result: str, change=No
     return {"result": result}, change
 
 
-def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
+def mutate(db, op: str, wolt: str, name: str, to: str, resource=None, key=None) -> tuple:
     """One policy mutation and its audit row, validated against the durable registry."""
     row = db.execute("SELECT id FROM principals WHERE name = ?", (wolt,)).fetchone()
     pid, change, label = row[0] if row else None, None, name if "action" in FIELDS[op] else "other"
-    resource = ACTIONS[name][:2]
+    resource, key = resource or ACTIONS[name][:2], key or name  # telegram: the provisioned bot and chat
     rid = db.execute("SELECT id FROM resources WHERE type = ? AND name = ?", resource).fetchone()
     if op == "enroll" and pid is None:
         if db.execute("SELECT count(*) FROM principals WHERE name IS NOT NULL").fetchone()[0] >= CAPACITY:
@@ -313,11 +317,11 @@ def mutate(db, op: str, wolt: str, name: str, to: str) -> tuple:
         return audit(db, "host-admin", op, pid, label, "not-registered")
     elif op == "grant":
         db.execute("INSERT OR IGNORE INTO grants VALUES (?, ?, ?)", (pid, rid[0], ACTIONS[name][2]))
-        change = lambda authz: authz.widen({}, (pid, name))
+        change = lambda authz: authz.widen({}, (pid, key))
     else:
         db.execute("DELETE FROM grants WHERE principal = ? AND resource = ? AND operation = ?",
                    (pid, rid[0], ACTIONS[name][2]))
-        change = lambda authz: authz.drop(op, pid, wolt, name)  # by id, in order after any queued grant
+        change = lambda authz: authz.drop(op, pid, wolt, key)  # by id, in order after any queued grant
     reply, _ = audit(db, "host-admin", op, pid, label, "ok")
     return ({**reply, "id": pid} if op == "enroll" else reply), change
 
@@ -409,7 +413,7 @@ class Dispatcher:
         self.running = set()
         self.started = False
         self.effect = effect
-        self.peer = self.operation = None
+        self.credential = self.operation = None  # (token, bot, chat, grant key): volatile, owner-provisioned
         self.effect_pending = False
         self.arming = False
 
@@ -504,6 +508,8 @@ class Dispatcher:
         with self.ready:
             if not self.effect:
                 return {"result": "disabled"}
+            if self.credential is None:
+                return {"result": "not-provisioned"}
             if self.operation is not None or self.effect_pending or self.arming:
                 return {"result": "busy"}
             self.arming = True
@@ -516,37 +522,50 @@ class Dispatcher:
                 return {"result": "ok", "id": operation}
         return reply
 
-    def offer(self, peer):
+    def provision(self, chat, token):
+        """Owner-only. The token stays in this process; the registry gets only the bot and chat digest."""
+        match = TOKEN.fullmatch(token) if isinstance(token, str) else None
+        if not (match and isinstance(chat, str) and CHAT.fullmatch(chat)):
+            return {"result": "invalid"}
         with self.ready:
-            if self.peer is not None:
-                self.peer.close()
-            self.peer = peer
+            if not self.effect:
+                return {"result": "disabled"}
+            if self.operation is not None or self.effect_pending or self.arming:
+                return {"result": "busy"}
+        digest = hashlib.sha256(f"{match[1]}:{chat}".encode()).hexdigest()[:32]
+        resource = ("effect", f"telegram-{digest}")  # a new bot or chat is a new resource: grant again
+
+        def register(db):
+            db.execute("INSERT OR IGNORE INTO resources VALUES (?, ?, ?)", ("r-" + secrets.token_hex(16), *resource))
+            return audit(db, "host-admin", "provision", None, TELEGRAM, "ok")
+
+        reply = self.writer.submit(register)
+        with self.ready:
+            if reply == {"result": "ok"}:
+                self.credential = (token, int(match[1]), int(chat), resource[1])
+        return reply
+
+    def resource(self, name):
+        """The resource and grant key an owner mutation names; None until telegram is provisioned."""
+        with self.ready:
+            if name != TELEGRAM:
+                return ACTIONS[name][:2], name
+            return (("effect", self.credential[3]), f"{self.credential[3]}.notice") if self.credential else None
 
     def _telegram(self, binding, alive, requested):
-        def admitted():
-            return (self.authz.bindings.get(binding.session) == binding
-                    and (binding.principal, TELEGRAM) in self.authz.active
+        def admitted(credential):
+            return (credential is not None  # provision is refused while an arm or a send is outstanding
+                    and self.authz.bindings.get(binding.session) == binding
+                    and (binding.principal, f"{credential[3]}.notice") in self.authz.active
                     and (alive is None or alive()))
 
         with self.ready:
-            if not admitted():
+            credential = self.credential
+            if not admitted(credential):
                 return "denied"
-            if not self.effect or requested is None or requested != self.operation or self.peer is None:
+            if requested is None or requested != self.operation:
                 return "unavailable"
-            try:
-                self.peer.recv(1, socket.MSG_DONTWAIT | socket.MSG_PEEK)
-            except BlockingIOError:
-                pass  # connected peer waiting for the request
-            except OSError:
-                self.peer.close()
-                self.peer = None
-                return "unavailable"
-            else:
-                self.peer.close()
-                self.peer = None
-                return "unavailable"
-            peer, operation = self.peer, self.operation
-            self.peer = self.operation = None
+            operation, self.operation = self.operation, None
             self.effect_pending = True
 
         def update(db, result, previous):
@@ -557,43 +576,18 @@ class Dispatcher:
             return {"result": "ok" if changed.rowcount == 1 else "storage-error"}, None
 
         try:
-            with peer:
-                reply = self.writer.submit(lambda db: update(db, "pending", "armed"))
-                if reply["result"] != "ok":
-                    return reply["result"]
-                result = "unknown"
-                with self.ready:
-                    sent = False
-                    if admitted():
-                        try:
-                            sent = peer.send(b"send\n", socket.MSG_DONTWAIT) == 5
-                        except OSError:
-                            pass
-                    else:
-                        result = "denied"
-                if sent:
-                    result = self._effect_result(peer)
+            reply = self.writer.submit(lambda db: update(db, "pending", "armed"))
+            if reply["result"] != "ok":
+                return reply["result"]
+            with self.ready:
+                go = admitted(credential)
+            result = notify(credential) if go else "denied"
             if self.writer.submit(lambda db: update(db, result, "pending"))["result"] == "ok":
                 return result
             return "unknown"
         finally:
             with self.ready:
                 self.effect_pending = False
-
-    @staticmethod
-    def _effect_result(peer):
-        deadline = time.monotonic() + 20
-        response = bytearray()
-        try:
-            while len(response) < 3:
-                peer.settimeout(max(0.001, deadline - time.monotonic()))
-                chunk = peer.recv(3 - len(response))
-                if not chunk:
-                    break
-                response.extend(chunk)
-        except OSError:
-            return "unknown"
-        return "ok" if response == b"ok\n" and time.monotonic() <= deadline else "unknown"
 
     def _dummy(self) -> str:
         # One fixed adapter with a bounded delay. No caller-selected timeout,
@@ -604,6 +598,38 @@ class Dispatcher:
         except (OSError, ValueError):
             return "storage-error"
         return "ok"
+
+
+def notify(credential) -> str:
+    """The one fixed provider request. "ok" only for a verified reply naming our bot and chat."""
+    token, bot, chat, _ = credential
+    connection = http.client.HTTPSConnection(*PROVIDER, timeout=10, context=ssl.create_default_context(cafile=CAFILE))
+
+    def expire():  # one wall clock for the whole exchange, however slowly the peer answers
+        try:
+            socket.socket.shutdown(connection.sock, socket.SHUT_RDWR)
+        except (OSError, TypeError):
+            pass  # not connected yet (the connect timeout bounds that) or already closed
+
+    timer = threading.Timer(SEND_SECONDS, expire)
+    timer.start()
+    try:
+        connection.request("POST", f"/bot{token}/sendMessage", json.dumps({"chat_id": chat, "text": NOTICE}),
+                           {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        status, data = response.status, response.read(65536)
+        if 400 <= status < 500:
+            return "rejected"  # refused by the provider: not sent, and the arm stays spent
+        message = json.loads(data, object_pairs_hook=_unique)["result"] if status == 200 else None
+        sender, target = message["from"], message["chat"]
+        exact = (type(sender["id"]) is int and sender["id"] == bot and sender.get("is_bot") is True
+                 and type(target["id"]) is int and target["id"] == chat)
+    except Exception:  # any failure after the intent is ambiguous; nothing is retried
+        return "unknown"
+    finally:
+        timer.cancel()
+        connection.close()
+    return "ok" if exact else "mismatch"
 
 
 class WorkerChannels:
@@ -889,15 +915,20 @@ class Broker:
             return {"result": "invalid"}
         if name not in ACTIONS:
             return self.record("host-admin", op, "unknown-action")
-        if op == "arm":
-            return self.dispatch.arm() if name == TELEGRAM else {"result": "unknown-action"}
+        if op in {"arm", "provision"}:
+            if name != TELEGRAM:
+                return {"result": "unknown-action"}
+            return self.dispatch.arm() if op == "arm" else self.dispatch.provision(request["chat"], request["token"])
         if op == "run" and name == TELEGRAM:
             return {"result": "denied"}
         if op == "run":
             return self.record("host-admin", op, self.authz.admit(wolt, name), wolt)
+        bound = self.dispatch.resource(name) if op in {"register", "grant", "revoke"} else (None, None)
+        if bound is None:
+            return {"result": "not-provisioned"}
         if op in {"revoke", "retire", "rename"}:
-            self.authz.narrow(op, wolt, name)  # before it is durable or acknowledged
-        return self.writer.submit(lambda db: mutate(db, op, wolt, name, to))
+            self.authz.narrow(op, wolt, bound[1] or name)  # before it is durable or acknowledged
+        return self.writer.submit(lambda db: mutate(db, op, wolt, name, to, *bound))
 
     def record(self, caller: str, op: str, result: str, wolt: str | None = None) -> dict:
         with self.authz.lock:
@@ -1045,32 +1076,14 @@ def serve(broker: "Broker", server: socket.socket, route: str = "admin") -> None
                 pass
 
 
-def serve_effect(broker, server):
-    while True:
-        try:
-            peer, _ = server.accept()
-        except OSError:
-            return
-        try:
-            _, uid, _ = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-            if uid == broker.node_uid:
-                peer.settimeout(1)
-                with peer.makefile("rb") as stream:
-                    ready = stream.readline(6) == b"ready\n"
-                if ready:
-                    peer.settimeout(None)
-                    broker.dispatch.offer(peer)
-                    continue
-        except OSError:
-            pass
-        peer.close()
-
-
 def admin(argv: list[str], path: Path | None = None) -> int:
     fields = {**FIELDS, **OWNER}.get(argv[0], ()) if argv else ()
+    if argv[:1] == ["provision"]:  # chat and token from stdin only, never argv or the environment
+        argv = argv + sys.stdin.read(256).split()
     if not fields or len(argv) != 1 + len(fields):
         print("usage: woltspace secrets enroll|retire WOLT | rename WOLT NEW | register ACTION"
-              " | arm ACTION | grant|revoke|run WOLT ACTION | review|reconcile|reject CODE | approve CODE FINGERPRINT", file=sys.stderr)
+              " | arm ACTION | provision ACTION <CHAT TOKEN | grant|revoke|run WOLT ACTION"
+              " | review|reconcile|reject CODE | approve CODE FINGERPRINT", file=sys.stderr)
         return 2
     reply = call({"op": argv[0], **dict(zip(fields, argv[1:]))}, path)
     print(json.dumps(reply))
@@ -1084,12 +1097,15 @@ if __name__ == "__main__":
     try:
         action(store)
         effect = sys.argv[4:] == ["telegram"]
+        if effect:  # the provisioned token lives only in this process: no core file, no same-uid ptrace
+            import ctypes
+            import resource
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            if ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) or ctypes.CDLL(None).prctl(3, 0, 0, 0, 0):
+                raise OSError("broker must be non-dumpable")  # PR_SET_DUMPABLE 0, then PR_GET_DUMPABLE
         broker = Broker(policy_dir, pwd.getpwnam("node").pw_uid, effect)
         server, ordinary = listen(path), listen(path.with_name(CREATE), 0o666)
         launch = listen(path.with_name(LAUNCH), 0o666)
-        if effect:
-            endpoint = listen(path.with_name(EFFECT), 0o660)
-            threading.Thread(target=serve_effect, args=(broker, endpoint), daemon=True).start()
         print(json.dumps({"result": "accepted"}), flush=True)
     except (OSError, ValueError):
         sys.exit(1)  # never print the store or exception text

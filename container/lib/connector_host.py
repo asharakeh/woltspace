@@ -13,12 +13,9 @@ as it can the lodge's config. Turning a connector on is trusting its code.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
-import socket
-import struct
 import sys
 from pathlib import Path
 
@@ -27,52 +24,6 @@ import connector_broker
 logger = logging.getLogger(__name__)
 
 LODGE_FILE = "lodge.json"
-EFFECT_SOCKET = "/run/woltspace-broker/effect.sock"
-EFFECT_SERVICE_UID = 990
-_effect_task: asyncio.Task | None = None
-
-
-async def _telegram_handoff(broker, destination: str) -> None:
-    while True:
-        if broker.connected("telegram"):
-            try:
-                await _telegram_once(broker, destination)
-            except (OSError, ValueError, asyncio.TimeoutError):
-                pass
-        await asyncio.sleep(0.25)  # reconnect only; a handed-off effect is never replayed
-
-
-async def _telegram_once(broker, destination: str) -> None:
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_unix_connection(EFFECT_SOCKET, limit=5), 1)
-    try:
-        peer = writer.get_extra_info("socket")
-        _, uid, _ = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        if uid != EFFECT_SERVICE_UID or not broker.connected("telegram"):
-            return
-        writer.write(b"ready\n")
-        await asyncio.wait_for(writer.drain(), 1)
-        while broker.connected("telegram"):
-            try:
-                frame = await asyncio.wait_for(reader.readline(), 0.25)
-                break
-            except asyncio.TimeoutError:
-                continue
-        else:
-            return
-        if frame != b"send\n":
-            return
-        try:
-            await asyncio.wait_for(broker.send(
-                "telegram", {"chat_id": destination}, "message",
-                "Woltspace broker notice.", timeout=18), 19)
-        except (connector_broker.SendFailed, connector_broker.ConnectorUnavailable, asyncio.TimeoutError):
-            return  # EOF is unknown to the broker
-        writer.write(b"ok\n")
-        await asyncio.wait_for(writer.drain(), 0.25)
-    finally:
-        writer.close()
-
 
 
 def run_dir(wolts_dir) -> Path:
@@ -102,7 +53,6 @@ def read_lodge_file(wolts_dir) -> list[dict]:
 
 async def start(wolts_dir) -> connector_broker.Broker | None:
     """Serve every connector the launcher planned; None when there are none."""
-    global _effect_task
     entries = read_lodge_file(wolts_dir)
     if not entries:
         return None
@@ -128,22 +78,10 @@ async def start(wolts_dir) -> connector_broker.Broker | None:
         broker.add(spec.name, lodge.handle, menu)
     await broker.start()
     connector_broker.install(broker)
-    if os.environ.get("WOLTSPACE_BROKER_TELEGRAM") == "1":
-        destinations = {str(owner) for entry in entries if entry["name"] == "telegram"
-                        for owner in entry.get("owners") or []}
-        if len(destinations) == 1:
-            destination = next(iter(destinations))
-            if destination.isascii() and destination.isdecimal() and len(destination) <= 19 and 0 < int(destination) < 2**63:
-                _effect_task = asyncio.create_task(_telegram_handoff(broker, destination))
     return broker
 
 
 async def stop() -> None:
-    global _effect_task
-    if _effect_task is not None:
-        _effect_task.cancel()
-        await asyncio.gather(_effect_task, return_exceptions=True)
-        _effect_task = None
     broker = connector_broker.current()
     if broker is not None:
         connector_broker.install(None)

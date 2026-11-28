@@ -113,8 +113,6 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, config, mo
     events, children, handlers = [], [], {}
     if mode == "telegram":
         config.write_text("dummy\ntelegram\n")
-        monkeypatch.setattr(boot.pwd, "getpwnam", lambda name: SimpleNamespace(pw_gid=1000))
-    monkeypatch.setenv("WOLTSPACE_BROKER_TELEGRAM", "inherited")
     class Child:
         def __init__(self, role):
             self.role, self.returncode = role, None
@@ -144,7 +142,7 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, config, mo
             if mode == "early-loss":
                 child.returncode = 7
         if child.role == "node":
-            assert kw["env"].get("WOLTSPACE_BROKER_TELEGRAM") == ("1" if mode == "telegram" else None)
+            assert "env" not in kw  # the node gets no telegram handle: the broker sends itself
         return child
     def tick(delay):
         if mode == "lost":
@@ -186,7 +184,6 @@ def test_supervised_owned_children_and_cleanup(tmp_path, monkeypatch, config, mo
         assert result == (0 if mode in {"stop", "interrupt", "kill", "resume", "telegram"} else 9 if mode == "node-exit" else 1)
     assert len(children) == (1 if mode in {"missing-ready", "bad-ready", "startup-stop", "early-loss", "ready-timeout"} else 3)
     assert all(child.returncode is not None for child in children)
-    assert ((dummy_broker.SOCKET.with_name(dummy_broker.EFFECT), 990, 1000) in events) == (mode == "telegram")
     if len(children) == 3 and mode != "cleanup-failure":
         assert events.index(("node", "wait")) < events.index(("broker", "wait"))
     if mode == "cleanup-failure":

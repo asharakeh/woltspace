@@ -144,13 +144,7 @@ def supervise(node_argv: list[str]) -> int:
         if (not select.select([launcher.stdout], [], [], READY_SECONDS)[0]
                 or launcher.stdout.readline() != b"accepted\n" or stopping):
             return 1
-        node_env = os.environ.copy()
-        node_env.pop("WOLTSPACE_BROKER_TELEGRAM", None)
-        if telegram:
-            effect = dummy_broker.SOCKET.with_name(dummy_broker.EFFECT)
-            os.chown(effect, SERVICE, pwd.getpwnam("node").pw_gid)
-            node_env["WOLTSPACE_BROKER_TELEGRAM"] = "1"
-        node = subprocess.Popen(node_argv, env=node_env, close_fds=True)
+        node = subprocess.Popen(node_argv, close_fds=True)
         children.append(node)
         while not stopping and all(child.poll() is None for child in children):
             time.sleep(.05)
@@ -181,7 +175,6 @@ def supervise(node_argv: list[str]) -> int:
                     dummy_broker.SOCKET.unlink(missing_ok=True)
                     dummy_broker.SOCKET.with_name(dummy_broker.CREATE).unlink(missing_ok=True)
                     dummy_broker.SOCKET.with_name(dummy_broker.LAUNCH).unlink(missing_ok=True)
-                    dummy_broker.SOCKET.with_name(dummy_broker.EFFECT).unlink(missing_ok=True)
                     dummy_broker.SOCKET.parent.rmdir()
             except OSError:
                 cleanup_failed = True

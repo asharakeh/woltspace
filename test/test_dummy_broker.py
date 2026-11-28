@@ -4,20 +4,25 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 import json
 import os
+import re
+import shutil
 import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from woltspace import dummy_broker as broker
 
 A = broker.ACTION
+TOKEN = "123456:SyntheticFixtureTokenOnly_xyz-XYZ"  # dummy: never a real bot
 
 
 @pytest.fixture
@@ -42,7 +47,8 @@ def ask(b, request):
 
 
 def op(b, name, wolt=None, action=A, to=None):
-    request = {"op": name, **{f: {"wolt": wolt, "action": action, "to": to}[f] for f in broker.FIELDS[name]}}
+    fields = {"wolt": wolt, "action": action, "to": to, "chat": "42", "token": TOKEN}
+    request = {"op": name, **{f: fields[f] for f in broker.FIELDS[name]}}
     return ask(b, request)["result"]
 
 
@@ -534,6 +540,7 @@ def test_dispatch_crash_leaves_unknown_with_no_replay(store, owner):
     child = subprocess.run([sys.executable, "-I", "-S", "-c", """
 import os, runpy, sys
 from pathlib import Path
+from types import SimpleNamespace
 scope = runpy.run_path(sys.argv[1])
 b = scope["Broker"](Path(sys.argv[2]))
 principal = b.apply({"op": "enroll", "wolt": "alpha"})["id"]
@@ -871,13 +878,63 @@ def test_launch_cancel_proof_only_when_it_wins_before_redeem(store, owner):
     assert launch_exchange(b, cancel, "launch") == ("ok", None)
 
 
-def test_telegram_fixed_action_uses_one_owner_arm(store, owner):
+def provision(b, chat="42", token=TOKEN):
+    return ask(b, {"op": "provision", "action": broker.TELEGRAM, "chat": chat, "token": token})["result"]
+
+
+def telegram_ready(b, *wolts):
+    assert provision(b) == "ok"
+    for wolt in wolts:
+        assert op(b, "grant", wolt, broker.TELEGRAM) == "ok"
+
+
+def test_telegram_owner_provision_binds_grant_to_bot_and_chat(store, owner, monkeypatch):
+    sent = []
+    monkeypatch.setattr(broker, "notify", lambda credential: sent.append(credential[:3]) or "ok")
     action = broker.TELEGRAM
     disabled = broker.Broker(store)
-    assert op(disabled, "arm", action=action) == "disabled"
+    assert provision(disabled) == op(disabled, "arm", action=action) == "disabled"
+    b = broker.Broker(store, effect=True)
+    alpha = enrolled(b, "alpha")
+    assert {op(b, "arm", action=action), op(b, "register", action=action), op(b, "grant", "alpha", action)} == {
+        "not-provisioned"}
+    for chat, token in (("0", TOKEN), ("4 2", TOKEN), ("42", "123456:short"), ("42", "0" + TOKEN[6:]),
+                        ("42", TOKEN + "\n"), ("42", TOKEN.replace("_", "/")), (42, TOKEN)):
+        assert provision(b, chat, token) == "invalid"
+    monkeypatch.setattr(broker, "ADMIN_UID", os.getuid() + 1)
+    assert provision(b) == "denied"  # the shared node or a sibling worker on the admin route
+    monkeypatch.setattr(broker, "ADMIN_UID", os.getuid())
+    telegram_ready(b, "alpha")
+    binding = b.dispatch.bind(alpha, "a")
+    assert op(b, "arm", action=action) == "ok" and provision(b, "44") == "busy"
+    assert b.dispatch.submit(binding, action).result(3) == "ok" and sent == [(TOKEN, 123456, 42)]
+    assert op(b, "run", "alpha", action) == "denied"  # only the bound worker channel reaches the sender
+    # A new chat is a new resource: the live grant for the old pair does not carry over.
+    assert provision(b, "43") == "ok" and op(b, "arm", action=action) == "ok"
+    assert b.dispatch.submit(binding, action).result(3) == "denied" and len(sent) == 1
+    assert op(b, "grant", "alpha", action) == "ok" and b.dispatch.submit(binding, action).result(3) == "ok"
+    assert sent[1:] == [(TOKEN, 123456, 43)]
+    assert len(rows(store, "SELECT * FROM resources WHERE name LIKE 'telegram-%'")) == 2
+    assert rows(store, "SELECT caller, op, result FROM audit WHERE op = 'provision'") == [
+        ("host-admin", "provision", "invalid")] * 7 + [("worker", "provision", "denied")] + [
+        ("host-admin", "provision", "ok")] * 2
+    raw = b"".join(path.read_bytes() for path in store.iterdir())
+    secret = TOKEN.split(":")[1].encode()
+    assert all(secret[i:i + 8] not in raw for i in range(len(secret) - 7))  # only digests are durable
+
+
+def test_telegram_fixed_action_uses_one_owner_arm(store, owner, monkeypatch):
+    action, gate, calls = broker.TELEGRAM, threading.Event(), []
+
+    def held(credential):
+        calls.append(credential[2])
+        assert gate.wait(3)
+        return "ok"
+
+    monkeypatch.setattr(broker, "notify", held)
     b = broker.Broker(store, effect=True)
     alpha, beta = enrolled(b, "alpha"), enrolled(b, "beta")
-    assert op(b, "register", action=action) == op(b, "grant", "alpha", action) == "ok"
+    telegram_ready(b, "alpha")
     with ExitStack() as sockets:
         def worker(principal, session):
             endpoint, channel = socket.socketpair(type=socket.SOCK_SEQPACKET)
@@ -893,45 +950,33 @@ def test_telegram_fixed_action_uses_one_owner_arm(store, owner):
         assert packet(a, first, action=action) == "unavailable"
         arm = ask(b, {"op": "arm", "action": action})
         assert arm["result"] == "ok" and op(b, "arm", action=action) == "busy"
-        assert packet(a, first, action=action) == "unavailable"
         assert packet(denied, other, action=action) == "denied"
         assert packet(a, first, action=action, instance=second["instance"]) == "denied"
         assert packet(a, first, action="telegram.other") == "unknown-action"
         assert packet(a, first, action=action, text="ignored") == "invalid"
-        effect, fake = socket.socketpair()
-        b.dispatch.offer(effect)
-        with fake:
-            fake.settimeout(3)
-            for channel, binding in ((a, first), (duplicate, second)):
-                channel.send(json.dumps({k: binding[k] for k in ("principal", "instance")}
-                                        | {"action": action}).encode())
-            assert fake.recv(5) == b"send\n"
-            assert rows(store, f"SELECT principal, result FROM audit WHERE op = '{arm['id']}'") == [
-                (alpha, "pending")]
-            assert op(b, "arm", action=action) == "busy"
-            fake.sendall(b"o")
-            fake.sendall(b"k\n")
-            assert fake.recv(1) == b""
-        # The consumed arm must block both the duplicate and regrant even after a reconnect.
-        next_effect, next_fake = socket.socketpair()
-        b.dispatch.offer(next_effect)
-        with next_effect, next_fake:
-            assert sorted(json.loads(channel.recv(256))["result"] for channel in (a, duplicate)) == [
-                "ok", "unavailable"]
-            assert packet(duplicate, second, action=action) == "unavailable"
-            assert op(b, "revoke", "alpha", action) == op(b, "grant", "alpha", action) == "ok"
-            assert packet(a, first, action=action) == "unavailable"
-            assert b.dispatch.peer is next_effect  # the ready peer was not taken
-            with pytest.raises(BlockingIOError):
-                next_fake.recv(5, socket.MSG_DONTWAIT)
-        assert rows(store, f"SELECT principal, result FROM audit WHERE op = '{arm['id']}'") == [(alpha, "ok")]
+        assert packet(a, first, action=action, chat="43") == "invalid"
+        for channel, binding in ((a, first), (duplicate, second)):
+            channel.send(json.dumps({k: binding[k] for k in ("principal", "instance")} | {"action": action}).encode())
+        until(lambda: calls)
+        assert rows(store, f"SELECT principal, result FROM audit WHERE op = '{arm['id']}'") == [(alpha, "pending")]
+        assert op(b, "arm", action=action) == "busy" and provision(b) == "busy"
+        gate.set()
+        assert sorted(json.loads(channel.recv(256))["result"] for channel in (a, duplicate)) == ["ok", "unavailable"]
+        # The consumed arm blocks the duplicate and a regrant alike; the sender is never reached again.
+        assert packet(duplicate, second, action=action) == "unavailable"
+        assert op(b, "revoke", "alpha", action) == op(b, "grant", "alpha", action) == "ok"
+        assert packet(a, first, action=action) == "unavailable"
+        assert calls == [42]
+    assert rows(store, f"SELECT principal, result FROM audit WHERE op = '{arm['id']}'") == [(alpha, "ok")]
 
 
 def test_telegram_rechecks_binding_retired_after_enqueue(store, owner, monkeypatch):
+    sent = []
+    monkeypatch.setattr(broker, "notify", lambda credential: sent.append(1) or "ok")
     b = broker.Broker(store, effect=True)
     alpha = enrolled(b, "alpha")
-    for action in (A, broker.TELEGRAM):
-        assert op(b, "register", action=action) == op(b, "grant", "alpha", action) == "ok"
+    assert op(b, "register") == op(b, "grant", "alpha") == "ok"
+    telegram_ready(b, "alpha")
     assert op(b, "arm", action=broker.TELEGRAM) == "ok"
     binding = b.dispatch.bind(alpha, "a")
     entered, release = threading.Event(), threading.Event()
@@ -942,60 +987,27 @@ def test_telegram_rechecks_binding_retired_after_enqueue(store, owner, monkeypat
         return "ok"
 
     monkeypatch.setattr(b.dispatch, "_dummy", hold_dummy)
-    effect, fake = socket.socketpair()
-    with effect, fake:
-        b.dispatch.offer(effect)
-        blocker = b.dispatch.submit(binding, A)
-        try:
-            assert entered.wait(3)
-            queued = b.dispatch.submit(binding, broker.TELEGRAM)
-            assert not queued.done()
-            b.dispatch.end(binding)
-        finally:
-            release.set()
-        assert blocker.result(3) == "ok"
-        assert queued.result(3) == "denied"
-        assert op(b, "arm", action=broker.TELEGRAM) == "busy"
-        assert b.dispatch.peer is effect
-        with pytest.raises(BlockingIOError):
-            fake.recv(5, socket.MSG_DONTWAIT)
-
-
-def test_telegram_effect_listener_refuses_wrong_kernel_peer(store, owner, monkeypatch):
-    monkeypatch.chdir(store)
-    b = broker.Broker(store, node_uid=os.getuid() + 1, effect=True)
-    alpha = enrolled(b, "alpha")
-    action = broker.TELEGRAM
-    assert op(b, "register", action=action) == op(b, "grant", "alpha", action) == "ok"
-    assert op(b, "arm", action=action) == "ok"
-    with broker.listen(Path(broker.EFFECT)) as listener:
-        thread = threading.Thread(target=broker.serve_effect, args=(b, listener), daemon=True)
-        thread.start()
-        try:
-            with socket.socket(socket.AF_UNIX) as wrong:
-                wrong.settimeout(2)
-                wrong.connect(broker.EFFECT)
-                try:
-                    wrong.sendall(b"ready\n")
-                    assert wrong.recv(1) == b""
-                except (BrokenPipeError, ConnectionResetError):
-                    pass  # the kernel may report the refusal as a reset
-            binding = b.dispatch.bind(alpha, "a")
-            assert b.dispatch.submit(binding, action).result(3) == "unavailable"
-            assert b.dispatch.peer is None
-            assert op(b, "arm", action=action) == "busy"
-        finally:
-            listener.shutdown(socket.SHUT_RDWR)
-            thread.join(3)
-        assert not thread.is_alive()
+    blocker = b.dispatch.submit(binding, A)
+    try:
+        assert entered.wait(3)
+        queued = b.dispatch.submit(binding, broker.TELEGRAM)
+        assert not queued.done()
+        b.dispatch.end(binding)
+    finally:
+        release.set()
+    assert blocker.result(3) == "ok" and queued.result(3) == "denied"
+    assert op(b, "arm", action=broker.TELEGRAM) == "busy" and sent == []
 
 
 @pytest.mark.parametrize("interruption", ["intent-failure", "revoke-during-intent", "outcome-failure"])
 def test_telegram_intent_boundary(store, owner, monkeypatch, interruption):
+    sent = []
+    monkeypatch.setattr(broker, "notify", lambda credential: sent.append(1) or "ok")
     b = broker.Broker(store, effect=True)
     action = broker.TELEGRAM
     alpha = enrolled(b, "alpha")
-    assert op(b, "register", action=action) == op(b, "grant", "alpha", action) == "ok"
+    telegram_ready(b, "alpha")
+    key = b.dispatch.resource(action)[1]
     binding = b.dispatch.bind(alpha, "a")
     arm = ask(b, {"op": "arm", "action": action})["id"]
     entered, release = threading.Event(), threading.Event()
@@ -1014,90 +1026,210 @@ def test_telegram_intent_boundary(store, owner, monkeypatch, interruption):
         original()
 
     monkeypatch.setattr(b.writer, "commit", commit)
-    effect, fake = socket.socketpair()
-    b.dispatch.offer(effect)
-    fake.settimeout(3)
-    with fake:
-        future = b.dispatch.submit(binding, action)
-        if interruption == "revoke-during-intent":
-            assert entered.wait(3)
-            try:
-                with ThreadPoolExecutor(1) as pool:
-                    revoke = pool.submit(op, b, "revoke", "alpha", action)
-                    try:
-                        until(lambda: (alpha, action) not in b.authz.active)
-                    finally:
-                        release.set()
-                    assert revoke.result(3) == "ok"
-            finally:
-                release.set()
-        elif interruption == "outcome-failure":
-            assert fake.recv(5) == b"send\n"
-            fake.sendall(b"ok\n")
-        assert fake.recv(1) == b""
-        assert future.result(3) == {
-            "intent-failure": "storage-error", "revoke-during-intent": "denied",
-            "outcome-failure": "unknown",
-        }[interruption]
+    future = b.dispatch.submit(binding, action)
+    if interruption == "revoke-during-intent":
+        assert entered.wait(3)
+        try:
+            with ThreadPoolExecutor(1) as pool:
+                revoke = pool.submit(op, b, "revoke", "alpha", action)
+                try:
+                    until(lambda: (alpha, key) not in b.authz.active)
+                finally:
+                    release.set()
+                assert revoke.result(3) == "ok"
+        finally:
+            release.set()
+    assert future.result(3) == {
+        "intent-failure": "storage-error", "revoke-during-intent": "denied", "outcome-failure": "unknown",
+    }[interruption]
+    assert sent == ([1] if interruption == "outcome-failure" else [])
     assert op(b, "grant", "alpha", action) == "ok"
-    assert b.dispatch.submit(binding, action).result(3) == "unavailable"
-    expected = {"intent-failure": "armed", "revoke-during-intent": "denied",
-                "outcome-failure": "pending"}[interruption]
+    assert b.dispatch.submit(binding, action).result(3) == "unavailable" and len(sent) <= 1
+    expected = {"intent-failure": "armed", "revoke-during-intent": "denied", "outcome-failure": "pending"}[interruption]
     assert rows(store, f"SELECT result FROM audit WHERE op = '{arm}'") == [(expected,)]
 
 
-def test_telegram_restart_after_external_accept_stays_disarmed(store, tmp_path):
+CERTS = Path(__file__).parent / "telegram-broker-fixture" / "certs.sh"
+
+
+def certificates(path):
+    path.mkdir()
+    subprocess.run(["bash", str(CERTS), str(path)], check=True, timeout=30)
+    return path
+
+
+def answer(status, body):
+    raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+    head = b"HTTP/1.1 %d X\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (status, len(raw))
+    return lambda tls: tls.sendall(head + raw)
+
+
+def message(bot=123456, chat=42, is_bot=True):
+    return {"ok": True, "result": {"message_id": 7, "from": {"id": bot, "is_bot": is_bot}, "chat": {"id": chat}}}
+
+
+@pytest.fixture
+def provider(tmp_path, monkeypatch):
+    """A loopback TLS stand-in for the fixed endpoint, trusted through its own throwaway CA."""
+    if not shutil.which("openssl"):
+        pytest.skip("needs openssl for the throwaway CA")
+    certs = certificates(tmp_path / "certs")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certs / "provider.pem", certs / "provider.key")
+    listener = socket.create_server(("127.0.0.1", 0))
+    monkeypatch.setattr(broker, "PROVIDER", ("localhost", listener.getsockname()[1]))
+    monkeypatch.setattr(broker, "CAFILE", str(certs / "ca.pem"))
+    seen = []
+
+    def serve(reply):
+        conn = listener.accept()[0]
+        try:
+            with context.wrap_socket(conn, server_side=True) as tls:
+                tls.settimeout(5)
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += tls.recv(4096)
+                head, body = data.split(b"\r\n\r\n", 1)
+                while len(body) < int(re.search(rb"Content-Length: (\d+)", head)[1]):
+                    body += tls.recv(4096)
+                seen.append((head.split(b"\r\n")[0], json.loads(body)))
+                reply(tls)
+        except OSError:  # also ssl.SSLError: the client refused our certificate
+            seen.append(None)
+
+    def start(reply):
+        thread = threading.Thread(target=serve, args=(reply,), daemon=True)
+        thread.start()
+        return thread
+
+    yield SimpleNamespace(start=start, seen=seen, port=listener.getsockname()[1], tmp=tmp_path)
+    listener.close()
+
+
+def drip(tls):
+    tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n{")
+    try:
+        for _ in range(60):
+            time.sleep(.1)
+            tls.sendall(b" ")
+    except OSError:
+        pass  # the client's wall clock cut the exchange
+
+
+@pytest.mark.parametrize("case,reply,expected", [
+    ("exact", answer(200, message()), "ok"),
+    ("other-chat", answer(200, message(chat=43)), "mismatch"),
+    ("other-bot", answer(200, message(bot=654321)), "mismatch"),
+    ("not-a-bot", answer(200, message(is_bot=False)), "mismatch"),
+    ("chat-as-text", answer(200, message(chat="42")), "mismatch"),
+    ("bot-as-bool", answer(200, message(bot=True)), "mismatch"),
+    ("refused", answer(400, {"ok": False}), "rejected"),
+    ("server-error", answer(502, message()), "unknown"),
+    ("garbled", answer(200, b"{"), "unknown"),
+    ("duplicate-key", answer(200, b'{"ok": true, "result": %s, "result": %s}' % tuple(
+        json.dumps(message(chat=chat)["result"]).encode() for chat in (43, 42))), "unknown"),
+    ("slow", drip, "unknown"),
+    ("untrusted", None, "unknown"),
+    ("wrong-name", None, "unknown"),
+])
+def test_telegram_fixed_tls_request(provider, monkeypatch, case, reply, expected):
+    monkeypatch.setattr(broker, "SEND_SECONDS", 1)
+    if case == "untrusted":  # a valid chain from some other CA is refused before any request
+        monkeypatch.setattr(broker, "CAFILE", str(certificates(provider.tmp / "other") / "ca.pem"))
+    if case == "wrong-name":
+        monkeypatch.setattr(broker, "PROVIDER", ("127.0.0.1", provider.port))
+    thread = provider.start(reply or answer(200, message()))
+    started = time.monotonic()
+    assert broker.notify((TOKEN, 123456, 42, "telegram-x")) == expected
+    assert time.monotonic() - started < 4
+    thread.join(5)
+    if reply is None:
+        assert provider.seen == [None]
+    else:
+        assert provider.seen == [(f"POST /bot{TOKEN}/sendMessage HTTP/1.1".encode(),
+                                  {"chat_id": 42, "text": "Woltspace broker notice."})]
+
+
+def test_telegram_restart_after_provider_accept_stays_disarmed(store, owner, provider):
     import select
 
     child_code = """
-import socket
 import sys
 from pathlib import Path
-from woltspace.dummy_broker import Broker, TELEGRAM
+from types import SimpleNamespace
+from woltspace import dummy_broker
 
-b = Broker(Path(sys.argv[1]), effect=True)
-def admin(op, **kw):
-    return b.apply(dict(op=op, **kw))
+dummy_broker.PROVIDER, dummy_broker.CAFILE = ("localhost", int(sys.argv[2])), sys.argv[3]
+b = dummy_broker.Broker(Path(sys.argv[1]), effect=True)
+admin = lambda op, **kw: b.apply(dict(op=op, **kw))
 principal = admin("enroll", wolt="alpha")["id"]
-admin("register", action=TELEGRAM)
-admin("grant", wolt="alpha", action=TELEGRAM)
-operation = admin("arm", action=TELEGRAM)["id"]
-b.dispatch.offer(socket.socket(fileno=int(sys.argv[2])))
-print(operation, flush=True)
-b.dispatch.submit(b.dispatch.bind(principal, "a"), TELEGRAM).result(25)
+admin("provision", action=dummy_broker.TELEGRAM, chat="42", token=sys.stdin.readline().strip())
+admin("grant", wolt="alpha", action=dummy_broker.TELEGRAM)
+print(admin("arm", action=dummy_broker.TELEGRAM)["id"], flush=True)
+b.dispatch.submit(b.dispatch.bind(principal, "a"), dummy_broker.TELEGRAM).result(25)
 """
-    effect, fake = socket.socketpair()
-    with effect, fake, subprocess.Popen(
-        [sys.executable, "-c", child_code, str(store), str(effect.fileno())],
-        pass_fds=(effect.fileno(),), stdout=subprocess.PIPE,
-    ) as child:
+    accepted, hang = threading.Event(), threading.Event()
+    ledger = provider.tmp / "acceptances"
+
+    def accept_then_hang(tls):
+        with ledger.open("ab") as receipts:
+            receipts.write(b"accepted\n")
+            receipts.flush()
+            os.fsync(receipts.fileno())
+        accepted.set()
+        hang.wait(10)
+
+    thread = provider.start(accept_then_hang)
+    with subprocess.Popen([sys.executable, "-c", child_code, str(store), str(provider.port), broker.CAFILE],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE) as child:
         try:
-            effect.close()
-            assert select.select([child.stdout], [], [], 3)[0]
+            child.stdin.write(TOKEN.encode() + b"\n")
+            child.stdin.close()
+            assert select.select([child.stdout], [], [], 5)[0]
             operation = child.stdout.readline().decode().strip()
-            fake.settimeout(3)
-            assert fake.recv(5) == b"send\n"
-            ledger = tmp_path / "acceptances"
-            with ledger.open("wb") as receipts:
-                receipts.write(b"accepted\n")
-                receipts.flush()
-                os.fsync(receipts.fileno())
+            assert accepted.wait(10)
             assert rows(store, f"SELECT result FROM audit WHERE op = '{operation}'") == [("pending",)]
         finally:
             child.kill()
             child.wait(timeout=3)
-        assert child.returncode == -9
-        assert fake.recv(1) == b""
+            hang.set()
+    assert child.returncode == -9
+    thread.join(5)
 
     restored = broker.Broker(store, effect=True)
     action = broker.TELEGRAM
     principal, = rows(store, "SELECT id FROM principals WHERE name = 'alpha'")[0]
-    assert restored.apply({"op": "grant", "wolt": "alpha", "action": action}) == {"result": "ok"}
-    effect, fake = socket.socketpair()
-    with effect, fake:
-        restored.dispatch.offer(effect)
-        binding = restored.dispatch.bind(principal, "fresh")
-        assert restored.dispatch.submit(binding, action).result(3) == "unavailable"
-        assert not select.select([fake], [], [], 0)[0]
-        assert rows(store, f"SELECT result FROM audit WHERE op = '{operation}'") == [("unknown",)]
-        assert ledger.read_bytes() == b"accepted\n"
+    binding = restored.dispatch.bind(principal, "fresh")
+    for name in ("grant", "arm"):  # nothing of the old credential, grant or arm survives the process
+        assert op(restored, name, "alpha", action) == "not-provisioned"
+    telegram_ready(restored, "alpha")
+    assert restored.dispatch.submit(binding, action).result(3) == "unavailable"
+    assert rows(store, f"SELECT result FROM audit WHERE op = '{operation}'") == [("unknown",)]
+    assert ledger.read_bytes() == b"accepted\n" and len(provider.seen) == 1
+
+
+@pytest.mark.parametrize("telegram", [False, True])
+def test_broker_process_with_telegram_is_not_dumpable(tmp_path, telegram):
+    store, policy = tmp_path / "dummy", tmp_path / "policy"
+    store.write_text("synthetic-only")
+    policy.mkdir(mode=0o700)
+    short = Path(tempfile.mkdtemp(dir="/tmp", prefix="wsb."))  # AF_UNIX path limit; removed below
+    argv = [sys.executable, "-I", "-S", broker.__file__, str(store), str(policy), str(short / "admin.sock")]
+    child = subprocess.Popen(argv + ["telegram"] * telegram, stdout=subprocess.PIPE, env={"PATH": "/usr/bin:/bin"})
+    try:
+        assert json.loads(child.stdout.readline()) == {"result": "accepted"}
+        limits = Path(f"/proc/{child.pid}/limits").read_text()
+        assert bool(re.search(r"Max core file size\s+0\s+0\s", limits)) == telegram
+        if telegram:
+            with pytest.raises(PermissionError):
+                Path(f"/proc/{child.pid}/environ").read_bytes()  # same uid, still no ptrace or mem access
+        else:
+            Path(f"/proc/{child.pid}/environ").read_bytes()
+        assert sorted(p.name for p in short.iterdir()) == ["admin.sock", broker.CREATE, broker.LAUNCH]
+    finally:
+        child.kill()
+        child.wait(timeout=3)
+        child.stdout.close()
+        for name in ("admin.sock", broker.CREATE, broker.LAUNCH):
+            (short / name).unlink(missing_ok=True)
+        short.rmdir()

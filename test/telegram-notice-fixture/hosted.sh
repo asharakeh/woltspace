@@ -131,6 +131,7 @@ container=$(docker create --name "$name" --network none --security-opt no-new-pr
 docker start "$container"
 wait_for api /health
 wait_for handoff
+[[ $(inside stat -c '%U:%G %a' /usr/bin/telegram-notice) == 'root:root 755' ]]  # the shipped helper
 docker exec -i -u 0 "$container" sh -ec '
     engine=/home/node/.local/bin/claude
     rm -f "$engine"; cat >"$engine"; chmod 0755 "$engine"
@@ -239,12 +240,26 @@ accepts 2
 [[ $(arm_state "$second") == ok ]]
 echo 'PASS fresh launch positive' >&3
 
+phase=stop-pending  # a stalled connector cannot hold the ordinary stop past its receipt budget
+rm -f "$root/ledger/return"
+third=$(admin arm telegram.notice | field id)
+post "/sessions/$a/resume" '{"prompt":"fixture-notice"}'
+wait_for accepts 3  # the stand-in took it and now hangs
+started=$SECONDS
+post "/sessions/$a/stop" '{}' | field status | grep -Fx stopped
+(( SECONDS - started <= 12 ))
+[[ -z $(inside find "$a_state" -name action) && -z $(engine_of "$a_state") ]]
+settled() { [[ $(arm_state "$third") == unknown ]]; }
+wait_for settled  # spent and ambiguous, never replayed
+accepts 3
+echo 'PASS stop during a stalled notice' >&3
+
 phase=finish
-for session in "$a" "$b"; do post "/sessions/$session/stop" '{}' | field status | grep -Fx stopped; done
+post "/sessions/$b/stop" '{}' | field status | grep -Fx stopped
 [[ -z $(inside find /run/woltspace-engine -name action) ]]
 docker stop --time 15 "$container"
 [[ $(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$container") == 'exited 0' ]]
 docker rm "$container"
 container=
-accepts 2
+accepts 3
 printf 'PASS notice entry: unfenced refused, unarmed, one accept per arm, sibling and node fenced, stale refused\n' >&3

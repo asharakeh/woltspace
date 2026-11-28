@@ -13,9 +13,11 @@ import sys
 import time
 
 EXIT = {"ok": 0, "denied": 3, "unavailable": 4, "unknown": 5, "refused": 6}
+LOCK_SECONDS, ANSWER_SECONDS = 5, 30  # waiting for another call, then for our own answer
 
 
 def ask():
+    deadline = time.monotonic() + ANSWER_SECONDS
     action = Path(os.environ.get("HOME", "/nonexistent")).parent / "action"
     try:
         request = os.open(action / "request", os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -24,9 +26,17 @@ def ask():
         return "unavailable"  # not a protected launch, or not this launch's pipes
     tag = secrets.token_hex(4).encode()  # the supervisor answers with it: no other call's word is ours
     try:
-        fcntl.flock(request, fcntl.LOCK_EX)  # one request in flight per launch, released if we are killed
+        locked_by = time.monotonic() + LOCK_SECONDS
+        while True:  # one request in flight per launch; the lock is released if its holder is killed
+            try:
+                fcntl.flock(request, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= locked_by:
+                    return "unavailable"  # another call holds the launch: nothing was asked
+                time.sleep(.05)
         os.write(request, tag + b"\n")
-        pending, deadline = b"", time.monotonic() + 30
+        pending = b""
         while True:
             *lines, pending = pending.split(b"\n")
             for line in lines:

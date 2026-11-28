@@ -37,6 +37,14 @@ class Channel:
                 self.broken = True  # a timed-out reply may still arrive: nothing reads this channel again
                 return "unknown"  # the request may have been taken
 
+    def interrupt(self):
+        """At teardown: end any wait on the channel now and admit nothing more (no lock: a wait holds it)."""
+        self.broken = True
+        try:
+            socket.socket.shutdown(self.channel, socket.SHUT_RDWR)
+        except OSError:
+            pass
+
 
 def notice_endpoint(state):
     """This launch's private request and reply pipes; only its own worker's fence grants them."""
@@ -68,6 +76,8 @@ def relay_notices(request, reply, channel, stopped):
         *lines, pending = pending.split(b"\n")
         pending = pending[-9:]  # a line longer than a tag never becomes one
         for tag in lines:
+            if stopped.is_set():
+                return  # stopping: buffered requests are never admitted
             if not re.fullmatch(rb"[0-9a-f]{8}", tag):
                 continue
             result = channel.ask(dummy_broker.TELEGRAM, 25)  # the broker's own wait for the connector is 20 s
@@ -84,6 +94,17 @@ def remove_endpoint(action, fds):
     for name in ("request", "reply"):
         (action / name).unlink(missing_ok=True)
     action.rmdir()
+
+
+def retire(finished, bound, relay, action, pipes):
+    """Teardown within the stop budget: interrupt the channel, then retire the endpoint, before the reap."""
+    finished.set()
+    bound.interrupt()  # an in-flight notice answers unknown now instead of after the broker's 20 s
+    if relay.is_alive():
+        relay.join(2)
+    if relay.is_alive():  # never close a descriptor the relay may still read: unlink the names only
+        pipes = ()
+    remove_endpoint(action, pipes)
 
 
 def serve(fd, state, principal):
@@ -185,10 +206,7 @@ enabled = false
                 while not (stopped.is_set() or finished.is_set() or closed.poll(50)):
                     pass
             finally:
-                finished.set()
-                if relay.is_alive():
-                    relay.join(30)  # never close a pipe the relay may still read
-                remove_endpoint(action, pipes)
+                retire(finished, bound, relay, action, pipes)
                 reap(lane)
     return 0
 

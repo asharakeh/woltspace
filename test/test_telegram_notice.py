@@ -30,7 +30,10 @@ class Broker:
         while (raw := self.ours.recv(512)):
             self.requests.append(json.loads(raw))
             threading.Event().wait(self.delay)
-            self.ours.send(json.dumps({"result": self.answers.pop(0) if self.answers else "unavailable"}).encode())
+            try:
+                self.ours.send(json.dumps({"result": self.answers.pop(0) if self.answers else "unavailable"}).encode())
+            except OSError:
+                return  # the supervisor shut the channel down meanwhile
 
 
 @pytest.fixture
@@ -170,3 +173,43 @@ def test_an_interrupted_call_never_hands_its_answer_to_the_next(launch):
     first.stdout.close()
     assert helper(state) == ("unavailable", 4)  # its own answer, never the late "ok"
     assert len(broker.requests) == 2
+
+
+def test_a_held_lock_is_refused_before_anything_is_asked(launch):
+    start, state, _ = launch
+    broker = Broker(["ok"])
+    action, _ = start(broker)
+    import fcntl
+    holder = os.open(action / "request", os.O_WRONLY | os.O_NONBLOCK)  # a paused call that never finishes
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        started = time.monotonic()
+        assert helper(state) == ("unavailable", 4) and broker.requests == []  # bounded, and nothing written
+        assert time.monotonic() - started < 8
+    finally:
+        os.close(holder)
+    assert helper(state) == ("ok", 0)
+
+
+def test_stop_interrupts_a_stalled_notice_and_admits_nothing_buffered(tmp_path, monkeypatch):
+    monkeypatch.setattr(supervisor.os, "chown", lambda *_: None)
+    (tmp_path / "home").mkdir()
+    action, pipes = supervisor.notice_endpoint(tmp_path)
+    broker, finished = Broker(["ok", "ok"], delay=20), threading.Event()  # the connector never answers in time
+    bound = supervisor.Channel(broker.theirs, HELLO)
+    relay = threading.Thread(target=supervisor.relay_notices, args=(*pipes, bound, finished), daemon=True)
+    relay.start()
+    call = subprocess.Popen([sys.executable, "-I", str(HELPER)], stdout=subprocess.PIPE,
+                            env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home")})
+    deadline = time.monotonic() + 10
+    while not broker.requests:
+        assert time.monotonic() < deadline
+        time.sleep(.01)
+    queued = os.open(action / "request", os.O_WRONLY | os.O_NONBLOCK)
+    os.write(queued, b"abcdef01\n")  # buffered behind the stalled one
+    os.close(queued)
+    started = time.monotonic()
+    supervisor.retire(finished, bound, relay, action, pipes)
+    assert time.monotonic() - started < 3 and not relay.is_alive() and not action.exists()
+    assert call.communicate(timeout=10)[0] == b"unknown\n"  # submitted: ambiguous, never another call's word
+    assert len(broker.requests) == 1 and bound.broken

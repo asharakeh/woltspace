@@ -13,12 +13,14 @@ in files; only rows that change live here.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import importlib.metadata
 import json
 import os
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -278,17 +280,7 @@ def connect(wolts_dir, *, readonly: bool = False, durable: bool = False,
         )
     else:
         db.parent.mkdir(parents=True, exist_ok=True)
-        # Session prompts live here: owner-only from birth (SQLite gives
-        # -wal and -shm the main file's mode). An existing file keeps its own
-        # and is never opened here: closing any descriptor of it drops every
-        # POSIX lock this process holds on it, other connections' included, and
-        # another process may then checkpoint the WAL away under them (IOERR).
-        try:
-            os.close(os.open(db, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-        except FileExistsError:  # what that open would have refused, said as it would have
-            for refused, code in ((db.is_dir(), errno.EISDIR), (not os.access(db, os.R_OK | os.W_OK), errno.EACCES)):
-                if refused:
-                    raise OSError(code, os.strerror(code), str(db)) from None
+        _create(db)
         conn = sqlite3.connect(db, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
@@ -308,6 +300,30 @@ def connect(wolts_dir, *, readonly: bool = False, durable: bool = False,
         conn.close()
         raise
     return conn
+
+
+def _create(db: Path) -> None:
+    """Session prompts live here: a new file is owner-only from birth (SQLite gives -wal and
+    -shm the main file's mode); an existing one keeps its own. No descriptor of the published
+    file is ever opened here: closing one drops every POSIX lock this process holds on it,
+    other connections' included, and another process may then checkpoint the WAL away under
+    them (SQLITE_IOERR_SHORT_READ). A new file is closed under a private name, then linked."""
+    if not os.path.lexists(db):
+        fd, private = tempfile.mkstemp(prefix=f".{db.name}.", dir=db.parent)  # 0600
+        os.close(fd)
+        try:
+            os.link(private, db)
+            return
+        except FileExistsError:  # another opener created it first
+            pass
+        except OSError:  # no hard links here: create in place (only a first open can race)
+            with contextlib.suppress(FileExistsError):
+                os.close(os.open(db, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        finally:
+            os.unlink(private)
+    for refused, code in ((db.is_dir(), errno.EISDIR), (not os.access(db, os.R_OK | os.W_OK), errno.EACCES)):
+        if refused:  # what the old open of an existing file refused, said as it would have
+            raise OSError(code, os.strerror(code), str(db))
 
 
 def _wal(conn: sqlite3.Connection) -> None:

@@ -290,6 +290,20 @@ def test_many_first_openers_at_once_all_get_in(tmp_path):
     assert errors == []
 
 
+@pytest.mark.parametrize("exists", [False, True])
+def test_a_writable_connect_never_opens_a_descriptor_of_the_file_itself(tmp_path, monkeypatch, exists):
+    """Closing any descriptor of the file drops every POSIX lock this process holds on it: a
+    new file is created under a private name and linked, an existing one is never opened."""
+    if exists:
+        lodge_db.connect(tmp_path).close()
+    opened, real = [], os.open
+    monkeypatch.setattr(os, "open", lambda path, *a, **k: opened.append(os.fspath(path)) or real(path, *a, **k))
+    lodge_db.connect(tmp_path).close()
+    db = str(lodge_db.path(tmp_path))
+    assert db not in opened and len(opened) == (0 if exists else 1)
+    assert stat.S_IMODE(os.stat(db).st_mode) == 0o600
+    assert not [n for n in os.listdir(tmp_path / ".space") if n.startswith(".lodge.db.")]  # no private name left
+
 def test_a_new_connection_never_drops_the_locks_of_this_processs_others(tmp_path):
     """Closing any descriptor of the file drops every POSIX lock this process holds on it,
     other connections' too: another process may then checkpoint the WAL away under them

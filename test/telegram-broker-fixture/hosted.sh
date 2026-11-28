@@ -7,6 +7,9 @@ name=telegram-broker-${root##*.}
 base=$name:base
 image=$name:fixture
 route_off=$name:route-off
+committed=$name:committed
+net=$name-net
+provider=$name-provider
 source_volume=$name-source
 volumes=("$source_volume" "$name-post" "$name-pre")
 policy=/var/lib/woltspace-secrets
@@ -18,11 +21,14 @@ cleanup() {
     trap - EXIT
     trap '' INT TERM
     if [[ $owned ]]; then
-        if docker container inspect "$name"; then docker rm -f "$name" || failed=1; fi
+        for target in "$name" "$provider"; do
+            if docker container inspect "$target"; then docker rm -f "$target" || failed=1; fi
+        done
         for volume in "${volumes[@]}"; do
             if docker volume inspect "$volume"; then docker volume rm "$volume" || failed=1; fi
         done
-        for target in "$route_off" "$image" "$base"; do
+        if docker network inspect "$net"; then docker network rm "$net" || failed=1; fi
+        for target in "$committed" "$route_off" "$image" "$base"; do
             if docker image inspect "$target"; then docker image rm "$target" || failed=1; fi
         done
     fi
@@ -38,30 +44,44 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'line=$LINENO; exit 1' INT TERM
-if docker container inspect "$name"; then exit 1; fi
-for target in "$route_off" "$image" "$base"; do
+for target in "$name" "$provider"; do
+    if docker container inspect "$target"; then exit 1; fi
+done
+for target in "$committed" "$route_off" "$image" "$base"; do
     if docker image inspect "$target"; then exit 1; fi
 done
 for volume in "${volumes[@]}"; do
     if docker volume inspect "$volume"; then exit 1; fi
 done
+if docker network inspect "$net"; then exit 1; fi
 owned=1
-mkdir -p "$HOME" "$WOLTSPACE_WOLTS_DIR/.claude" "$root/build" "$root/ledger"
+mkdir -p "$HOME" "$WOLTSPACE_WOLTS_DIR/.claude" "$root/build" "$root/ledger" "$root/certs"
 printf 'WOLTSPACE_PUBLIC_TUNNEL=false\n' >"$WOLTSPACE_WOLTS_DIR/.env"
+# Synthetic only: a fresh random bot token that lives in this shell and on stdin, never in argv or a file.
+secret=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+token="123456:$secret"
+digest=$(printf '123456:42' | sha256sum | cut -c1-32)
+printf '%s 42\n' "$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)" >"$root/ledger/expect"
+chmod 755 "$root/ledger"
 phase=image
 WOLTSPACE_IMAGE="$base" ./woltspace build --local
-cp test/telegram-broker-fixture/{telegram,worker}.py "$root/build/"
+bash test/telegram-broker-fixture/certs.sh "$root/certs"
+chmod 755 "$root/certs"
+chmod 644 "$root/certs/"*
+cp test/telegram-broker-fixture/{provider,worker}.py "$root/certs/ca.pem" "$root/build/"
 printf 'FROM %s\n' "$base" >"$root/build/Dockerfile"
 cat >>"$root/build/Dockerfile" <<'DOCKER'
-COPY telegram.py worker.py /opt/fixture/
-RUN set -e; p=/workspace/woltspace/container/connectors/telegram; \
-    mv "$p/telegram_connector.py" "$p/telegram_real.py"; \
-    cp /opt/fixture/telegram.py "$p/telegram_connector.py"; \
+COPY provider.py worker.py ca.pem /opt/fixture/
+RUN set -e; cat /opt/fixture/ca.pem >>/etc/ssl/certs/ca-certificates.crt; \
     printf 'dummy\ntelegram\n' >/etc/woltspace/broker-dummy
 DOCKER
 docker build --network none --tag "$image" "$root/build"
 printf 'FROM %s\nRUN printf "dummy\\n" >/etc/woltspace/broker-dummy\n' "$image" >"$root/build/Dockerfile"
 docker build --network none --tag "$route_off" "$root/build"
+docker network create --internal "$net"
+docker run -d --name "$provider" --network "$net" --network-alias api.telegram.org -u 0 \
+    -v "$root/ledger:/fixture" -v "$root/certs:/certs:ro" --entrypoint /opt/woltspace/tools/woltspace/bin/python \
+    "$image" -I /opt/fixture/provider.py
 inside() { docker exec -u 0 "$container" "$@"; }
 py() { inside /opt/woltspace/tools/woltspace/bin/python -I "$@"; }
 probe() { py /opt/fixture/worker.py "$@"; }
@@ -71,27 +91,26 @@ audit_result() {
 admin() { py -m woltspace.dummy_broker admin "$@"; }
 json_field() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 ok() { [[ $(admin "$@" | json_field result) == ok ]]; }
-regrant() { ok grant alpha dummy.ping; ok grant alpha telegram.notice; }
+provision() {
+    printf '42\n%s\n' "$token" | docker exec -i -u 0 "$container" /opt/woltspace/tools/woltspace/bin/python -I \
+        -m woltspace.dummy_broker admin provision telegram.notice | json_field result
+}
+ready() { [[ $(provision) == ok ]]; ok grant alpha dummy.ping; ok grant alpha telegram.notice; }
 wait_until() {
     local limit=$((SECONDS + 30))
     until "$@"; do (( SECONDS < limit )) || return 1; sleep .15; done
 }
 health() { docker exec -u node "$container" curl --noproxy '*' -fsS --max-time 1 http://127.0.0.1:7777/health; }
-handoff() {
-    inside awk '$6=="03" && $8=="/run/woltspace-broker/effect.sock" {found=1} END {exit !found}' /proc/net/unix
-}
 boot() {
     local isolation=$1 volume=${2:-} startup_image=${3:-$image}
     local -a mounts=()
     if [[ $volume ]]; then mounts=(-v "$volume:$policy"); fi
-    container=$(docker create --name "$name" --network none --security-opt no-new-privileges \
+    container=$(docker create --name "$name" --network "$net" --security-opt no-new-privileges \
         -e WOLTSPACE_FEATURE_ISOLATION="$isolation" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-        -e ENABLE_TELEGRAM_BOT=true -e TELEGRAM_ALLOWED_USERS=42 -e TELEGRAM_BOT_TOKEN=fixture-only \
-        "${mounts[@]}" -v "$WOLTSPACE_WOLTS_DIR:/workspace/wolts" -v "$root/ledger:/fixture" "$startup_image")
-    [[ $(docker inspect -f '{{.HostConfig.NetworkMode}}' "$container") == none ]]
+        "${mounts[@]}" -v "$WOLTSPACE_WOLTS_DIR:/workspace/wolts" "$startup_image")
+    [[ $(docker inspect -f '{{.HostConfig.NetworkMode}}' "$container") == "$net" ]]
     docker start "$container"
     wait_until health
-    if [[ $isolation == true && $startup_image == "$image" ]]; then wait_until handoff; fi
 }
 retire() {
     local expected=$1
@@ -115,45 +134,75 @@ volume_tar() {
     shift
     docker run --rm -i --name "$name" --network none -v "$mount" --entrypoint tar "$image" "$@"
 }
-one_accept() { [[ $(cat "$root/ledger/accepts") == accepted && $(wc -l <"$root/ledger/accepts") == 1 ]]; }
+# Members holding the control, then members holding any slice of the secret: "N 0" with N > 0.
+clean_of_token() { [[ $(python3 test/telegram-broker-fixture/scan.py "$1" "$2" <<<"$secret") =~ ^[1-9][0-9]*\ 0$ ]]; }
+ledger() { [[ $(paste -sd, "$root/ledger/accepts") == "$1" ]]; }
+mode() { printf '%s\n' "$1" >"$root/ledger/mode"; }
 
 phase=flag-off
 boot false
 inside test ! -e /run/woltspace-broker/effect.sock
+[[ $(provision) != ok ]]
 stop
-phase=pre-send
+phase=send
 docker volume create "$source_volume"
 boot true "$source_volume"
+inside test ! -e /run/woltspace-broker/effect.sock
 ok enroll alpha
 ok register dummy.ping
-ok grant alpha dummy.ping
-ok register telegram.notice
-ok grant alpha telegram.notice
+[[ $(admin arm telegram.notice | json_field result) == not-provisioned ]]
+[[ $(admin grant alpha telegram.notice | json_field result) == not-provisioned ]]
+ready
 probe unavailable
-[[ ! -e "$root/ledger/accepts" ]]
+mode ok
+arm=$(admin arm telegram.notice | json_field id)
+probe ok
+probe audit >"$root/before-node.json"
+[[ $(audit_result "$arm" <"$root/before-node.json") == ok ]]
+[[ $(docker exec -u node "$container" /opt/woltspace/tools/woltspace/bin/python -I /opt/fixture/worker.py node) == node-fenced ]]
+probe audit >"$root/after-node.json"
+cmp "$root/before-node.json" "$root/after-node.json"
+mode mismatch
+mismatch=$(admin arm telegram.notice | json_field id)
+probe mismatch
+[[ $(probe audit | audit_result "$mismatch") == mismatch ]]
+ledger ok,mismatch
+phase=custody
+control="control-$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+inside sh -c 'printf "%s\n" "$1" >/root/fixture-control' sh "$control"
+docker commit "$container" "$committed"
+docker save -o "$root/committed.tar" "$committed"
+clean_of_token "$root/committed.tar" "$control"
+rm -f -- "$root/committed.tar"
+docker image rm "$committed"
 stop
 archive "$source_volume" "$root/pre.tar"
+clean_of_token "$root/pre.tar" "telegram-$digest"
 
 phase=crash-after-accept
 boot true "$source_volume"
-regrant
+[[ $(admin arm telegram.notice | json_field result) == not-provisioned ]]
+ready
+mode crash
 arm=$(admin arm telegram.notice | json_field id)
 probe crash &
 pid=$!
-wait_until one_accept
+wait_until ledger ok,mismatch,crash
 [[ $(admin arm telegram.notice | json_field result) == busy ]]
 [[ $(probe audit | audit_result "$arm") == pending ]]
 docker kill --signal KILL "$container"
 retire 137
 if wait "$pid"; then exit 1; fi
 pid=
+mode replay
 boot true "$source_volume"
-regrant
+ready
 probe unavailable
 probe audit >"$root/post.json"
 [[ $(audit_result "$arm" <"$root/post.json") == unknown ]]
 stop
 archive "$source_volume" "$root/post.tar"
+clean_of_token "$root/post.tar" "telegram-$digest"
 
 for snapshot in post pre; do
     phase="$snapshot-restore"
@@ -166,13 +215,14 @@ for snapshot in post pre; do
     else
         [[ $(grep -Fc "$arm" "$root/restored.json" || :) == 0 ]]
     fi
-    regrant
+    [[ $(admin arm telegram.notice | json_field result) == not-provisioned ]]
+    ready
     probe unavailable
     if [[ $snapshot == pre ]]; then
         ok revoke alpha telegram.notice
         probe denied
     fi
-    one_accept
+    ledger ok,mismatch,crash
     stop
 done
 phase=rollback
@@ -180,12 +230,12 @@ boot true "$source_volume" "$route_off"
 inside test ! -e /run/woltspace-broker/effect.sock
 probe audit >"$root/rollback-before.json"
 cmp "$root/post.json" "$root/rollback-before.json"
-regrant
-probe unavailable
-ok revoke alpha telegram.notice
+[[ $(provision) == disabled ]]
+ok grant alpha dummy.ping
 probe denied
 probe audit >"$root/rollback-after.json"
 [[ $(audit_result "$arm" <"$root/rollback-after.json") == unknown ]]
-one_accept
+ledger ok,mismatch,crash
+[[ ! -e "$root/ledger/errors" ]]
 stop
-printf 'PASS one acceptance; crash recovery; post/pre restore; protected rollback\n' >&3
+printf 'PASS one acceptance per arm; verified result; mismatch; custody scans; crash, restores, rollback without replay\n' >&3

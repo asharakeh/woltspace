@@ -192,9 +192,8 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
             live = _live(registry, wolt, prefer)
             if not live and not _resumable(registry.get(prefer, wolt=wolt, check_alive=False) if prefer else None):
                 live = sessions.resolve_active_session(wolt, registry) or _overdue(registry, wolt, facts["wake"])
-            reserved = facts["wake"].get("reserved") or {}
-            if live and reserved.get("missed") and live == reserved.get("session"):
-                live = None  # its due hint did not land: the wolt is brought up another way (_start)
+            if live and _unreachable(registry.get(live, wolt=wolt, check_alive=False)):
+                live = _reachable(registry, wolt)  # never that attempt again: the newest other live one
             # All mail brings the wolt up (the owner's rule): with no live session it resumes or
             # starts one; only an unresolved launch holds it (in _start). A live session is hinted.
             how, what = (None, None) if live else _start(store, registry, wolt, facts, prefer)
@@ -248,12 +247,9 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
     log.info("inbox hint for %s via %s: %s (%s)", wolt, live, status, code)
     if status == "submitted" or (status, code) == ("pending", "placed"):  # only a hint that reached the engine
         _answer(root, wolt, "hinted", session=live, hinted=hinted)
-        return
-    if (live == reserved.get("session") and _due(reserved)
-            and (status in ("unavailable", "failed") or code == "not_ready")):  # e.g. no rewake endpoint
-        _reserve(root, wolt, live, missed=True)
-        return _wake(root, wolt)  # never hinted again: this pass resumes another session or starts one
-    if (status, code) == ("pending", "busy"):  # its turn end's wake hints, if mail is still queued
+    elif status == "unavailable" and _mark_unreachable(root, registry, wolt, live, facts["wake"], fresh):
+        _wake(root, wolt)  # this pass brings the wolt up another way: resumes another session or starts one
+    elif (status, code) == ("pending", "busy"):  # its turn end's wake hints, if mail is still queued
         _answer(root, wolt, "busy", session=live)
     elif (status, code) == ("pending", "not_ready") and _mode(fresh) == "native":  # no hinted: it still picks up
         if facts["unanswered"]:  # mail already answered (a start, a resume) gets no second outcome
@@ -350,10 +346,10 @@ def _start(store, registry, wolt: str, facts: dict, prefer: str | None) -> tuple
     if any(r.get("launching") for r in records):
         return "blocked", "launch_unknown"  # an unresolved launch of this agent, whoever made it, may still start
     resting = [r for r in records if _resumable(r)]
-    # the preferred one never waits, nor a reservation whose due hint missed
-    if reserved and not reserved.get("missed") and prefer not in {r["name"] for r in resting}:
+    if reserved and prefer not in {r["name"] for r in resting}:  # the preferred one never waits
         record = registry.get(reserved["session"], wolt=wolt, check_alive=False) or {}
-        if record.get("status") in ("running", sessions.STOPPING):
+        status = record.get("status")
+        if status == sessions.STOPPING or status == "running" and not _unreachable(record):
             return None, None  # still settling: kept as it is
     keep = _kept(wake)
     if resting:  # its own conversation, in its own mode: resumed after the lock, without a prompt
@@ -396,16 +392,41 @@ def _overdue(registry, wolt: str, wake: dict) -> str | None:
     process table yet, or no longer), still running, once it is due: it is hinted on the live
     path. A stopping session and an unresolved launch are still waited for (_start)."""
     reserved = wake.get("reserved") or {}
-    if not reserved.get("session") or reserved.get("missed") or not _due(reserved):
+    if not reserved.get("session") or not _due(reserved):
         return None
     record = registry.get(reserved["session"], wolt=wolt, check_alive=False) or {}
     return reserved["session"] if record.get("status") == "running" and not record.get("launching") else None
 
 
+def _unreachable(record: dict | None) -> bool:
+    """This attempt of the session was found unable to take any hint (_mark_unreachable)."""
+    return bool(record) and "hint_unreachable" in record and record["hint_unreachable"] == record.get("attempt")
+
+
+def _reachable(registry, wolt: str) -> str | None:
+    """resolve_active_session's choice among the live sessions that can still be hinted."""
+    alive = [r for r in registry.list(alive_only=True, wolt=wolt) if not _unreachable(r)]
+    alive.sort(key=lambda r: (r.get("last_activity") or 0, r.get("created_at") or 0), reverse=True)
+    return alive[0]["name"] if alive else None
+
+
+def _mark_unreachable(root, registry, wolt: str, live: str, wake: dict, fresh: dict) -> bool:
+    """The transport said a due reserved session cannot take a hint at all (unavailable: e.g. a
+    resume that failed partway left it running with no rewake endpoint): its attempt, the one
+    the hint was fenced on, is never hinted or waited for again. A new attempt clears it."""
+    reserved = wake.get("reserved") or {}
+    if live != reserved.get("session") or not _due(reserved):
+        return False
+    with lifecycle.agent_lock(root, wolt), registry.edit(live, wolt=wolt) as current:
+        if not current or current.get("attempt") != fresh.get("attempt") or current.get("launching"):
+            return False
+        current["hint_unreachable"] = fresh.get("attempt")
+    return True
+
+
 def _reserve(root, wolt: str, name: str, **mark) -> None:
-    """Mark the reservation (failed: due at once; missed: its due hint did not land, so it is
-    neither hinted nor waited for again), only while `name` is still the one reserved. A new
-    reservation replaces it, marks and all."""
+    """Mark the reservation (failed: due at once), only while `name` is still the one
+    reserved. A new reservation replaces it, marks and all."""
     with lifecycle.agent_lock(root, wolt):
         store = inbox.Store(root, inbox.LIMITS)
         wake = (store.wake_facts(wolt) or {}).get("wake") or {}

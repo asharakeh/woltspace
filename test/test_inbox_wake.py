@@ -691,6 +691,22 @@ def test_a_running_reservation_is_waited_for_until_it_is_due_then_hinted(lodge, 
     assert not wake.starts and "hint_unreachable" not in record(lodge, "pal-r")
 
 
+def test_a_ready_file_unreadable_for_a_moment_gives_nothing_up(lodge, wake):
+    """unavailable/bad_ready (an OSError reading the ready file) is not the end of the attempt:
+    nothing is marked, nothing starts, and once it reads again the same attempt is hinted."""
+    mail(lodge)
+    lodge.registry.create("pal-r", wolt="pal")
+    lodge.registry.update("pal-r", attempt="a1")
+    lodge.store.set_wake("pal", {**wake_state(lodge), "reserved": {"session": "pal-r", "at": 0, "failed": True}})
+    results = iter([("unavailable", "bad_ready"), ("submitted", "ok")])
+    sys.modules["native_adapters"].deliver = lambda record_, hint: lodge.calls.delivered.append(1) or next(results)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert "hint_unreachable" not in record(lodge, "pal-r") and not wake.starts
+    mail(lodge, "k2")
+    inbox_wake._wake(str(lodge.root), "pal", once=True)  # e.g. the pickup of its ready announce
+    assert len(lodge.calls.delivered) == 2 and not wake.starts
+    assert [o["how"] for o in wake_state(lodge)["outcomes"]] == ["blocked", "hinted"]
+
 def test_a_failed_resume_left_running_without_an_endpoint_is_given_up_once_and_another_starts(
         lodge, resting, monkeypatch):
     """The resume relaunched, then a lodge.db write failed: the session runs, its agent is in

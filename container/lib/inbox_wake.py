@@ -247,7 +247,8 @@ def _wake(root: str, wolt: str, *, once: bool = False) -> None:
     log.info("inbox hint for %s via %s: %s (%s)", wolt, live, status, code)
     if status == "submitted" or (status, code) == ("pending", "placed"):  # only a hint that reached the engine
         _answer(root, wolt, "hinted", session=live, hinted=hinted)
-    elif status == "unavailable" and _mark_unreachable(root, registry, wolt, live, facts["wake"], fresh):
+    elif (status, code) == ("unavailable", "no_native") and _mark_unreachable(root, registry, wolt, live,
+                                                                              facts["wake"], fresh):
         _wake(root, wolt)  # this pass brings the wolt up another way: resumes another session or starts one
     elif (status, code) == ("pending", "busy"):  # its turn end's wake hints, if mail is still queued
         _answer(root, wolt, "busy", session=live)
@@ -411,14 +412,17 @@ def _reachable(registry, wolt: str) -> str | None:
 
 
 def _mark_unreachable(root, registry, wolt: str, live: str, wake: dict, fresh: dict) -> bool:
-    """The transport said a due reserved session cannot take a hint at all (unavailable: e.g. a
-    resume that failed partway left it running with no rewake endpoint): its attempt, the one
-    the hint was fenced on, is never hinted or waited for again. A new attempt clears it."""
+    """The transport found no rewake endpoint at all on a due reserved session (no_native: e.g. a
+    resume that failed partway left it running with native None): that attempt is never hinted
+    or waited for again, if the record is still the one the hint was fenced on. Any other
+    unavailability (a ready file unreadable for a moment) gives nothing up. A new attempt
+    clears it."""
     reserved = wake.get("reserved") or {}
     if live != reserved.get("session") or not _due(reserved):
         return False
     with lifecycle.agent_lock(root, wolt), registry.edit(live, wolt=wolt) as current:
-        if not current or current.get("attempt") != fresh.get("attempt") or current.get("launching"):
+        if not current or current.get("launching") or any(
+                current.get(k) != fresh.get(k) for k in ("attempt", "status", "native")):
             return False
         current["hint_unreachable"] = fresh.get("attempt")
     return True

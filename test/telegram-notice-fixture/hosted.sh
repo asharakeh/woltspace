@@ -109,6 +109,20 @@ import sqlite3, sys
 db = sqlite3.connect("file:/var/lib/woltspace-secrets/registry.db?mode=ro", uri=True)
 print(db.execute("SELECT result FROM audit WHERE op = ?", (sys.argv[1],)).fetchone()[0])' "$1"
 }
+notice() {  # pane word count [arm id]: wait for the word; on timeout name the state in fixed words only
+    if wait_for shows "$1" "fixture notice $2" "$3"; then return 0; fi
+    local count=0 arm=none last
+    if [[ -e $root/ledger/accepts ]]; then count=$(wc -l <"$root/ledger/accepts") || count=9; fi
+    (( count <= 9 )) || count=9
+    if [[ ${4:-} ]]; then arm=$(arm_state "$4") || arm=other; fi
+    [[ $arm =~ ^(armed|ok|unknown|none)$ ]] || arm=other
+    last=$(docker exec --user node "$container" env -i PATH=/usr/bin:/bin tmux -S "/tmp/tmux-$(id -u)/default" \
+        capture-pane -p -t "$1" | sed -n 's/^fixture notice \([a-z]*\)$/\1/p' | tail -n 1) || last=other
+    [[ $last =~ ^(ok|denied|unavailable|unknown|refused)$ ]] || last=${last:+other}
+    phase="wait-a$count-$arm-${last:-none}"  # at most 27 characters, all fixed words
+    line=$LINENO
+    exit 1
+}
 handoff() {
     inside awk '$6=="03" && $8=="/run/woltspace-broker/effect.sock" {found=1} END {exit !found}' /proc/net/unix
 }
@@ -214,7 +228,7 @@ echo 'PASS unfenced refused' >&3
 phase=unarmed
 a=$(post /sessions/new/lodge '{"wolt":"alpha","prompt":"fixture-notice"}' | field name)
 a_pane=$(api "/sessions/$a" | field runtime pane_id)
-wait_for shows "$a_pane" 'fixture notice unavailable' 1
+notice "$a_pane" unavailable 1
 accepts 0
 echo 'PASS unarmed' >&3
 
@@ -222,11 +236,11 @@ phase=positive
 touch "$root/ledger/return"
 first=$(admin arm telegram.notice | field id)
 post "/sessions/$a/resume" '{"prompt":"fixture-notice"}'
-wait_for shows "$a_pane" 'fixture notice ok' 1
+notice "$a_pane" ok 1 "$first"
 accepts 1
 [[ $(arm_state "$first") == ok ]]
 post "/sessions/$a/resume" '{"prompt":"fixture-notice"}'  # spent
-wait_for shows "$a_pane" 'fixture notice unavailable' 2
+notice "$a_pane" unavailable 2 "$first"
 accepts 1
 echo 'PASS positive and spent' >&3
 
@@ -234,7 +248,7 @@ phase=sibling
 second=$(admin arm telegram.notice | field id)
 b=$(post /sessions/new/lodge '{"wolt":"beta","prompt":"fixture-notice"}' | field name)
 b_pane=$(api "/sessions/$b" | field runtime pane_id)
-wait_for shows "$b_pane" 'fixture notice denied' 1
+notice "$b_pane" denied 1 "$second"
 a_state=$(state_of "$a")
 b_state=$(state_of "$b")
 a_engine=$(engine_of "$a_state")
@@ -292,7 +306,7 @@ echo 'PASS stale descriptor refused' >&3
 
 phase=fresh-positive  # the separately armed operation, on the fresh launch
 post "/sessions/$a/resume" '{"prompt":"fixture-notice"}'
-wait_for shows "$a_pane" 'fixture notice ok' 1
+notice "$a_pane" ok 1 "$second"
 accepts 2
 [[ $(arm_state "$second") == ok ]]
 echo 'PASS fresh launch positive' >&3

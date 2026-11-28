@@ -91,16 +91,11 @@ class Stub(BaseHTTPRequestHandler):
         self.wfile.write(completed(f"resp_{len(self.server.requests)}", output))
 
 
-def run_turn(tmp_path, sandbox, command=None, reads=(), writes=(), home=None):
+def engine(home, port, sandbox, reads=(), writes=()):
+    """The pinned stock app-server on stdio, fenced like the supervisor's own launch."""
     sys.path.insert(0, str(FIXTURE))
     import fence
 
-    home = home or tmp_path / "home"
-    home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    server = HTTPServer(("127.0.0.1", 0), Stub)
-    server.requests, server.tool, server.nonce = [], None, "nonce-" + secrets.token_hex(8)
-    server.command = command
-    threading.Thread(target=server.serve_forever, daemon=True).start()
     (home / "config.toml").write_text(f"""
 model = "fixture"
 model_provider = "fixture"
@@ -109,7 +104,7 @@ approval_policy = "never"
 sandbox_mode = "{sandbox}"
 [model_providers.fixture]
 name = "Local fixture"
-base_url = "http://127.0.0.1:{server.server_port}"
+base_url = "http://127.0.0.1:{port}"
 wire_api = "responses"
 request_max_retries = 0
 stream_max_retries = 0
@@ -129,24 +124,35 @@ enabled = false
             os.dup2(os.open("/dev/null", os.O_WRONLY), 2)
             os.chdir(home)
             os.closerange(3, os.sysconf("SC_OPEN_MAX"))
-            fence.fence(home, server.server_port, (STOCK, *reads), writes)
+            fence.fence(home, port, (STOCK, *reads), writes)
             os.execve(str(STOCK / "codex"), [str(STOCK / "codex"), "app-server", "--listen", "stdio://"], env)
         finally:
             os._exit(127)
     os.close(engine_in[0])
     os.close(engine_out[1])
+    return pid, engine_in[1], engine_out[0]
+
+
+def run_turn(tmp_path, sandbox, command=None, reads=(), writes=(), home=None):
+    home = home or tmp_path / "home"
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    server = HTTPServer(("127.0.0.1", 0), Stub)
+    server.requests, server.tool, server.nonce = [], None, "nonce-" + secrets.token_hex(8)
+    server.command = command
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    pid, engine_in, engine_out = engine(home, server.server_port, sandbox, reads, writes)
     events, pending, deadline = [], b"", time.monotonic() + 60
 
     def send(method, params, number=None):
-        os.write(engine_in[1], json.dumps({"method": method, "params": params,
+        os.write(engine_in, json.dumps({"method": method, "params": params,
                                            **({"id": number} if number is not None else {})}).encode() + b"\n")
 
     def receive():
         nonlocal pending
         while b"\n" not in pending:
             remaining = deadline - time.monotonic()
-            assert remaining > 0 and select.select([engine_out[0]], [], [], remaining)[0], "engine timeout"
-            chunk = os.read(engine_out[0], 65536)
+            assert remaining > 0 and select.select([engine_out], [], [], remaining)[0], "engine timeout"
+            chunk = os.read(engine_out, 65536)
             assert chunk, "engine closed stdio"
             pending += chunk
         line, pending = pending.split(b"\n", 1)
@@ -171,13 +177,13 @@ enabled = false
         while not ((event := receive()).get("method") == "turn/completed"):
             pass
     finally:
-        os.close(engine_in[1])
+        os.close(engine_in)
         try:
             os.kill(pid, 9)
         except ProcessLookupError:
             pass
         os.waitpid(pid, 0)
-        os.close(engine_out[0])
+        os.close(engine_out)
         server.shutdown()
         server.server_close()
     return server, events, home
@@ -264,6 +270,62 @@ def test_sibling_probe_reaches_no_route_to_another_launch(tmp_path, monkeypatch)
         engine.kill()
         engine.wait()
         lodge.close()
+        stopped.set()
+        relay.join(5)
+        supervisor.remove_endpoint(action, pipes)
+
+
+def test_fixture_driver_runs_repeated_notice_turns(tmp_path, monkeypatch):
+    """The exact fixture endpoint and driver: two tool turns, then one more on a resumed launch of the thread.
+
+    Codex resends its whole history, earlier tool calls and outputs included."""
+    from types import SimpleNamespace
+    from woltspace import protected_stock as supervisor
+    from test_telegram_notice import HELLO, HELPER, Broker
+
+    sys.path.insert(0, str(FIXTURE))
+    import worker
+
+    monkeypatch.setattr(supervisor.os, "chown", lambda *_: None)
+    state = tmp_path / "state"
+    for name in ("control", "home"):
+        (state / name).mkdir(parents=True, mode=0o700)
+    monkeypatch.setattr(worker, "ROOT", state / "control")
+    monkeypatch.setattr(worker, "WORKDIR", state / "home")
+    monkeypatch.setitem(worker.COMMANDS, "notice", f"/usr/bin/python3 -I {HELPER}")
+    action, pipes = supervisor.notice_endpoint(state)
+    broker, stopped = Broker(["ok", "ok", "ok"]), threading.Event()
+    relay = threading.Thread(target=supervisor.relay_notices,
+                             args=(*pipes, supervisor.Channel(broker.theirs, HELLO), stopped), daemon=True)
+    relay.start()
+    endpoint = HTTPServer(("127.0.0.1", 0), worker.Endpoint)
+    endpoint.accepted = []
+    threading.Thread(target=endpoint.serve_forever, daemon=True).start()
+    pid, engine_in, engine_out = engine(state / "home", endpoint.server_port, "danger-full-access",
+                                        (HELPER, action / "reply"), (action / "request",))
+    said = []
+    monkeypatch.setattr(worker, "sys", SimpleNamespace(stdin=iter(["notice\n", "notice\n", "exit\n"])))
+    monkeypatch.setattr(worker, "print", lambda value, **_: said.append(value), raising=False)
+    pids = [pid]
+    try:
+        child = SimpleNamespace(stdin=os.fdopen(engine_in, "wb"), stdout=os.fdopen(engine_out, "rb"))
+        thread = worker._drive(child, endpoint, "alpha", None)
+        assert said == ["ready", "notice ok", "notice ok"] and len(broker.requests) == 2
+        os.kill(pid, 9)  # stop: the next launch resumes the same thread
+        os.waitpid(pids.pop(), 0)
+        pid, engine_in, engine_out = engine(state / "home", endpoint.server_port, "danger-full-access",
+                                            (HELPER, action / "reply"), (action / "request",))
+        pids.append(pid)
+        monkeypatch.setattr(worker, "sys", SimpleNamespace(stdin=iter(["notice\n", "exit\n"])))
+        child = SimpleNamespace(stdin=os.fdopen(engine_in, "wb"), stdout=os.fdopen(engine_out, "rb"))
+        assert worker._drive(child, endpoint, "alpha", thread) == thread
+        assert said[3:] == ["ready", "notice ok"] and len(broker.requests) == 3
+    finally:
+        for pid in pids:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+        endpoint.shutdown()
+        endpoint.server_close()
         stopped.set()
         relay.join(5)
         supervisor.remove_endpoint(action, pipes)

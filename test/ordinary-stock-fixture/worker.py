@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler
 import json
 import os
 from pathlib import Path
+import secrets
 import select
 import sys
 import time
@@ -47,8 +48,9 @@ class Endpoint(BaseHTTPRequestHandler):
                 for item in request["input"] if isinstance(item, dict)
                 for piece in (item.get("content") or []) if isinstance(piece, dict)
             ]
-            outputs = [item for item in request["input"]
-                       if isinstance(item, dict) and item.get("type") == "function_call_output"]
+            outputs = [item for item in request["input"]  # only this turn's call: the history repeats earlier ones
+                       if isinstance(item, dict) and item.get("type") == "function_call_output"
+                       and item.get("call_id") == self.server.call]
         except (ValueError, TypeError, KeyError, OSError, RecursionError):
             self.send_error(400, "fixture framing")
             return
@@ -77,7 +79,8 @@ class Endpoint(BaseHTTPRequestHandler):
                 time.sleep(.025)
         answer = self.server.answer
         if self.server.command and not outputs:  # first request of a tool turn: call the engine's shell tool
-            call = {"id": "fc_fixture", "type": "function_call", "status": "completed", "call_id": "call_fixture",
+            call = {"id": f"fc_{self.server.call}", "type": "function_call", "status": "completed",
+                    "call_id": self.server.call,
                     "name": "exec_command", "arguments": json.dumps({"cmd": self.server.command})}
             self.stream([("response.output_item.added", {"output_index": 0, "item": call}),
                          ("response.output_item.done", {"output_index": 0, "item": call})], [call], "call")
@@ -168,6 +171,7 @@ def _drive(child, server, lane, expected):
         server.overlap = verb == "overlap"
         server.history = f"fixture-{lane}-reuse" if verb == "resume" else None
         server.command, server.word = COMMANDS.get(verb), None
+        server.call = f"call_{secrets.token_hex(8)}"  # fresh for every turn, also across a resumed launch
         server.accepted.clear()
         deadline = time.monotonic() + 40
         turn_id = 3

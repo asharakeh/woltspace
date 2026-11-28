@@ -39,7 +39,7 @@ export HOME="$root/home" WOLTSPACE_WOLTS_DIR="$root/wolts" WOLTSPACE_LOCAL=true
 export WOLTSPACE_NODE_SUDO=false WOLTSPACE_CONTAINER="$name"
 mkdir -p "$HOME" "$root/install/files" "$root/ledger" "$WOLTSPACE_WOLTS_DIR/.claude"
 chmod 755 "$root/ledger"
-for wolt in alpha:codex beta:codex gamma:claude; do
+for wolt in alpha:codex beta:codex gamma:claude delta:codex; do
     mkdir -p "$WOLTSPACE_WOLTS_DIR/${wolt%:*}/wolt"
     printf '{"name":"%s","type":"beaver","harness":"%s"}\n' "${wolt%:*}" "${wolt#*:}" \
         >"$WOLTSPACE_WOLTS_DIR/${wolt%:*}/wolt/wolt.json"
@@ -132,13 +132,15 @@ docker start "$container"
 wait_for api /health
 wait_for handoff
 [[ $(inside stat -c '%U:%G %a' /usr/bin/telegram-notice) == 'root:root 755' ]]  # the shipped helper
-docker exec -i -u 0 "$container" sh -ec '
-    engine=/home/node/.local/bin/claude
-    rm -f "$engine"; cat >"$engine"; chmod 0755 "$engine"
+docker exec -i -u 0 "$container" sh -ec '  # ordinary (unfenced) engines leave a marker if they ever start
+    stand_in=$(cat)
+    for engine in /home/node/.local/bin/claude /usr/local/bin/codex; do
+        rm -f "$engine"; printf "%s\n" "$stand_in" >"$engine"; chmod 0755 "$engine"
+    done
 ' <<'ENGINE'
 #!/bin/sh
-printf 'started\n' >.ordinary-engine
-while :; do sleep 60; done
+printf 'started\n' >.ordinary-engine  # in the cwd: a launch's Wolt dir, never checked for lodge probes
+exit 1
 ENGINE
 ok enroll alpha
 ok enroll beta
@@ -146,16 +148,35 @@ ok register telegram.notice
 ok grant alpha telegram.notice
 echo 'PASS boot' >&3
 
-phase=unfenced  # an unenrolled Wolt with an ordinary engine starts nothing on create or resume
-if post /sessions/new/lodge '{"wolt":"gamma"}'; then exit 1; fi
-g=$(api /sessions | python3 -c 'import json,sys
-rows = [r for r in json.load(sys.stdin) if r.get("wolt") == "gamma"]
-assert len(rows) == 1 and rows[0]["status"] == "stopped"
-print(rows[0]["name"])')
-post "/sessions/$g/resume" '{"prompt":"fixture-notice"}' || :  # refused or not: nothing may start
-[[ $(api "/sessions/$g" | field status) == stopped ]]
-[[ ! -e $WOLTSPACE_WOLTS_DIR/gamma/.ordinary-engine ]] && ! inside pgrep -f .local/bin/claude
-echo 'PASS unfenced refused' >&3
+phase=unfenced  # unenrolled Wolts with ordinary engines start nothing on create or on a real resume
+status_of() {  # HTTP status only: no response text is kept
+    docker exec --user node "$container" curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 25 \
+        -H 'content-type: application/json' -d "$2" "http://127.0.0.1:7777$1"
+}
+rows_of() {
+    api /sessions | python3 -c 'import json,sys
+print(" ".join(sorted(r["status"] for r in json.load(sys.stdin) if r.get("wolt") == sys.argv[1])))' "$1"
+}
+gates() {  # the broker's audited launch-open decisions so far
+    inside /opt/woltspace/tools/woltspace/bin/python -I -c '
+import sqlite3
+db = sqlite3.connect("file:/var/lib/woltspace-secrets/registry.db?mode=ro", uri=True)
+print(db.execute("SELECT count(*) FROM audit WHERE op = ?", ("launch-open",)).fetchone()[0])'
+}
+gamma=$(status_of /sessions/new/lodge '{"wolt":"gamma"}')
+[[ $gamma =~ ^4[0-9][0-9]$ && $(rows_of gamma) =~ ^(|stopped)$ ]]  # claude: refused before any launch
+delta=$(status_of /sessions/new/lodge '{"wolt":"delta"}')
+[[ $delta != 200 && $(rows_of delta) == stopped ]]  # codex: refused at the protected launch gate
+d=$(api /sessions | python3 -c 'import json,sys
+print(next(r["name"] for r in json.load(sys.stdin) if r.get("wolt") == "delta"))')
+before=$(gates)
+resume=$(status_of "/sessions/$d/resume" '{"prompt":"fixture-notice"}')
+(( $(gates) == before + 1 ))  # the resume really reached the gate, and was refused there
+[[ $(rows_of delta) == stopped ]]
+for wolt in gamma delta; do [[ ! -e $WOLTSPACE_WOLTS_DIR/$wolt/.ordinary-engine ]]; done
+! inside pgrep -f '/home/node/.local/bin/claude|/usr/local/bin/codex'
+printf 'PASS unfenced refused (gamma create=%s rows=%s; delta create=%s resume=%s)\n' \
+    "$gamma" "$(rows_of gamma)" "$delta" "$resume" >&3
 
 phase=unarmed
 a=$(post /sessions/new/lodge '{"wolt":"alpha","prompt":"fixture-notice"}' | field name)

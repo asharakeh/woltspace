@@ -16,6 +16,7 @@ if sys.argv[1] == "audit":
     raise SystemExit
 
 if sys.argv[1] == "node":  # run as the shared node uid: no route to the token, the grant or the result
+    print("node-discovery", flush=True)
     assert os.getuid() != 0 and not broker.SOCKET.with_name("effect.sock").exists()
     def cmdline(pid):
         try:
@@ -24,25 +25,29 @@ if sys.argv[1] == "node":  # run as the shared node uid: no route to the token, 
             return b""  # exited meanwhile
 
     pid, = [p for p in os.listdir("/proc") if p.isdigit() and b"dummy_broker.py" in cmdline(p)]
-    fenced = [f"/proc/{pid}/{entry}" for entry in ("environ", "mem", "maps")]
-    fenced += ["/etc/hosts", "/etc/ssl/certs/ca-certificates.crt", f"{broker.POLICY_DIR}/registry.db"]
-    for path in fenced:
-        try:
-            open(path, "rb" if "/proc/" in path else "ab").close()
-            raise SystemExit(f"node opened {path}")
-        except PermissionError:
-            pass
+    process_files = [f"/proc/{pid}/{entry}" for entry in ("environ", "mem", "maps")]
+    protected_files = ["/etc/hosts", "/etc/ssl/certs/ca-certificates.crt", f"{broker.POLICY_DIR}/registry.db"]
+    for stage, paths, mode in (("node-process", process_files, "rb"), ("node-files", protected_files, "ab")):
+        print(stage, flush=True)
+        for path in paths:
+            try:
+                open(path, mode).close()
+                raise SystemExit(1)
+            except PermissionError:
+                pass
+    print("node-directory", flush=True)
     try:
         broker.SOCKET.parent.joinpath("probe").touch()
-        raise SystemExit("node wrote the broker run dir")
+        raise SystemExit(1)
     except PermissionError:
         pass
+    print("node-sockets", flush=True)
     assert broker.call({"op": "provision", "action": broker.TELEGRAM, "chat": "43", "token": "1:" + "x" * 30}) == {
         "result": "unavailable"}  # the admin socket refuses the connect itself
     for route in (broker.CREATE, broker.LAUNCH):
         reply = broker.call({"op": "provision", "action": broker.TELEGRAM, "chat": "43", "token": "1:" + "x" * 30},
                             broker.SOCKET.with_name(route))
-        assert reply["result"] in {"denied", "invalid"}, (route, reply)
+        assert reply["result"] in {"denied", "invalid"}
     print("node-fenced")
     raise SystemExit
 

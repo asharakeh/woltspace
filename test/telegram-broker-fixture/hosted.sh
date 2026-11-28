@@ -70,6 +70,7 @@ bash test/telegram-broker-fixture/certs.sh "$root/certs"
 chmod 755 "$root/certs"
 chmod 644 "$root/certs/"*
 cp test/telegram-broker-fixture/{provider,worker}.py "$root/certs/ca.pem" "$root/build/"
+chmod 0644 "$root/build/worker.py"  # the shared-node probe must be able to start
 printf 'FROM %s\n' "$base" >"$root/build/Dockerfile"
 cat >>"$root/build/Dockerfile" <<'DOCKER'
 COPY provider.py worker.py ca.pem /opt/fixture/
@@ -159,7 +160,15 @@ arm=$(admin arm telegram.notice | json_field id)
 probe ok
 probe audit >"$root/before-node.json"
 [[ $(audit_result "$arm" <"$root/before-node.json") == ok ]]
-[[ $(docker exec -u node "$container" /opt/woltspace/tools/woltspace/bin/python -I /opt/fixture/worker.py node) == node-fenced ]]
+if ! node_probe=$(docker exec -u node "$container" /opt/woltspace/tools/woltspace/bin/python -I /opt/fixture/worker.py node) ||
+    [[ ${node_probe##*$'\n'} != node-fenced ]]; then
+    case ${node_probe##*$'\n'} in
+        node-discovery|node-process|node-files|node-directory|node-sockets) phase=${node_probe##*$'\n'} ;;
+        *) phase=node-start ;;
+    esac
+    line=$LINENO
+    exit 1
+fi
 probe audit >"$root/after-node.json"
 python3 - "$root/before-node.json" "$root/after-node.json" <<'PY'
 import json, sys

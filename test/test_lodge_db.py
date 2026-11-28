@@ -4,6 +4,8 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
+import time
 from contextlib import closing, contextmanager
 import sys
 import threading
@@ -286,6 +288,36 @@ def test_many_first_openers_at_once_all_get_in(tmp_path):
         for t in threads:
             t.join()
     assert errors == []
+
+
+def test_a_new_connection_never_drops_the_locks_of_this_processs_others(tmp_path):
+    """Closing any descriptor of the file drops every POSIX lock this process holds on it,
+    other connections' too: another process may then checkpoint the WAL away under them
+    (SQLITE_IOERR_SHORT_READ, "disk I/O error"). Threads here write and read while a
+    second process opens and closes connections."""
+    lodge_db.connect(tmp_path).close()
+    churn = subprocess.Popen([sys.executable, "-c", (
+        "import sys, time; sys.path.insert(0, sys.argv[1]); import lodge_db; end = time.time() + 3\n"
+        "while time.time() < end: lodge_db.connect(sys.argv[2]).close()"),
+        str(Path(lodge_db.__file__).parent), str(tmp_path)])
+    errors, end = [], time.time() + 3
+
+    def hammer(n):
+        while time.time() < end:
+            try:
+                with lodge_db.write(tmp_path, durable=True) as conn:
+                    conn.execute("INSERT OR REPLACE INTO meta VALUES (?, 'x')", (f"t{n}",))
+                lodge_db.connect(tmp_path, readonly=True).close()
+            except sqlite3.Error as exc:
+                errors.append(getattr(exc, "sqlite_errorname", str(exc)))
+
+    threads = [threading.Thread(target=hammer, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert churn.wait(timeout=30) == 0
+    assert not errors, (len(errors), sorted(set(errors)))
 
 
 # --- migration 6: session policies to record version 2 ----------------------

@@ -13,6 +13,7 @@ in files; only rows that change live here.
 
 from __future__ import annotations
 
+import errno
 import importlib.metadata
 import json
 import os
@@ -278,8 +279,16 @@ def connect(wolts_dir, *, readonly: bool = False, durable: bool = False,
     else:
         db.parent.mkdir(parents=True, exist_ok=True)
         # Session prompts live here: owner-only from birth (SQLite gives
-        # -wal and -shm the main file's mode). An existing file keeps its own.
-        os.close(os.open(db, os.O_CREAT | os.O_WRONLY, 0o600))
+        # -wal and -shm the main file's mode). An existing file keeps its own
+        # and is never opened here: closing any descriptor of it drops every
+        # POSIX lock this process holds on it, other connections' included, and
+        # another process may then checkpoint the WAL away under them (IOERR).
+        try:
+            os.close(os.open(db, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except FileExistsError:  # what that open would have refused, said as it would have
+            for refused, code in ((db.is_dir(), errno.EISDIR), (not os.access(db, os.R_OK | os.W_OK), errno.EACCES)):
+                if refused:
+                    raise OSError(code, os.strerror(code), str(db)) from None
         conn = sqlite3.connect(db, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:

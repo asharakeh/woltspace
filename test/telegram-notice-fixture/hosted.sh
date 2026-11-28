@@ -61,7 +61,8 @@ HASHES
 )
 cp test/ordinary-stock-fixture/{fence,lane,worker,probe}.py "$root/install/files/"
 cp test/telegram-broker-fixture/telegram.py "$root/install/"
-chmod 0644 "$root/install/files/"*.py "$root/install/telegram.py"
+chmod 0755 "$root/install/files"  # worker 991 traverses it to run the engine
+chmod 0644 "$root/install/files/probe.py" "$root/install/telegram.py"  # the unprivileged entries: worker, node
 printf 'stock-fixture\n' >"$root/install/stock-fixture"
 cat >"$root/install/Dockerfile" <<DOCKER
 FROM $base
@@ -70,6 +71,8 @@ COPY --chown=0:0 stock-fixture /etc/woltspace/stock-fixture
 COPY --chown=0:0 telegram.py /opt/fixture/telegram.py
 RUN set -e; test -x /usr/bin/telegram-notice; p=/workspace/woltspace/container/connectors/telegram; \\
     mv "\$p/telegram_connector.py" "\$p/telegram_real.py"; cp /opt/fixture/telegram.py "\$p/telegram_connector.py"; \\
+    for f in "\$p/telegram_connector.py" /usr/local/lib/woltspace-stock-fixture/probe.py; do \\
+        test "\$(stat -c %a "\$f")" = 644; done; \\
     printf 'dummy\\ntelegram\\n' >/etc/woltspace/broker-dummy
 DOCKER
 docker build --network none --tag "$image" "$root/install"

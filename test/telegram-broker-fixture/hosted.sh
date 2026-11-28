@@ -3,7 +3,8 @@ set -Eeuo pipefail
 umask 077
 exec 3>&1 >/dev/null 2>&1
 root=$(mktemp -d)
-name=telegram-broker-${root##*.}
+run_id=${root##*.}
+name=telegram-broker-${run_id,,}  # Docker names are lowercase
 base=$name:base
 image=$name:fixture
 route_off=$name:route-off
@@ -32,7 +33,7 @@ cleanup() {
     fi
     rm -rf -- "$root" || failed=1
     if (( failed )); then phase=cleanup; status=1; fi
-    if (( status )); then printf '::error::telegram-broker phase=%s line=%s\n' "$phase" "$line" >&3
+    if (( status )); then printf '::error::broker-smoke phase=%s line=%s\n' "$phase" "$line" >&3
     else printf 'PASS cleanup\n' >&3; fi
     exit "$status"
 }
@@ -51,12 +52,14 @@ printf 'WOLTSPACE_PUBLIC_TUNNEL=false\n' >"$WOLTSPACE_WOLTS_DIR/.env"
 phase=image
 WOLTSPACE_IMAGE="$base" ./woltspace build --local
 cp test/telegram-broker-fixture/{telegram,worker}.py "$root/build/"
+chmod 0644 "$root/build/telegram.py"  # the node-run connector loads it; root runs worker.py
 printf 'FROM %s\n' "$base" >"$root/build/Dockerfile"
 cat >>"$root/build/Dockerfile" <<'DOCKER'
 COPY telegram.py worker.py /opt/fixture/
 RUN set -e; p=/workspace/woltspace/container/connectors/telegram; \
     mv "$p/telegram_connector.py" "$p/telegram_real.py"; \
     cp /opt/fixture/telegram.py "$p/telegram_connector.py"; \
+    test "$(stat -c %a "$p/telegram_connector.py")" = 644; \
     printf 'dummy\ntelegram\n' >/etc/woltspace/broker-dummy
 DOCKER
 docker build --network none --tag "$image" "$root/build"

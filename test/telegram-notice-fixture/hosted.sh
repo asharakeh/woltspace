@@ -134,9 +134,53 @@ state_of() {  # the protected state dir of a session's current launch
     [[ $principal == /run/woltspace-engine/p-*/"$conversation" ]]
     printf '%s\n' "$principal"
 }
-engine_of() {  # the stock engine whose cwd is that launch's home; a failed census fails, none is empty
-    inside sh -c 'pids=$(pgrep -f "codex app-server"); rc=$?; [ "$rc" -le 1 ] || exit 2
-        for p in $pids; do if [ "$(readlink "/proc/$p/cwd")" = "$1/home" ]; then echo "$p"; fi; done' sh "$1"
+# The fence makes the engine non-dumpable, so even root cannot read its cwd here (no SYS_PTRACE, by design).
+# Identify it from what stays readable: the one root supervisor whose exact argv names this state dir, and its
+# sole uid-991 child whose argv is the stock app-server. Sets engine_pid and engine_start in this shell; any other
+# census fails with a fixed phase: engine-supervisor-none|many, engine-child-none|many or engine-census.
+engine_of() {
+    local found rc=0
+    found=$(inside /opt/woltspace/tools/woltspace/bin/python -I -c '
+import os, sys
+state, stock = sys.argv[1], "/usr/local/lib/woltspace-stock-fixture/codex"
+def read(pid, name):
+    try:
+        with open(f"/proc/{pid}/{name}", "rb") as entry:
+            return entry.read()
+    except OSError:
+        return b""  # exited meanwhile
+def status(pid, key):
+    lines = [line.split()[1:] for line in read(pid, "status").decode().splitlines() if line.startswith(key + ":")]
+    return lines[0][0] if lines else None
+def sole(found, label):
+    if len(found) != 1:
+        print(label + ("-none" if not found else "-many"))
+        sys.exit(3)
+    return found[0]
+pids = [pid for pid in os.listdir("/proc") if pid.isdigit()]
+argv = {pid: read(pid, "cmdline").split(b"\0")[:-1] for pid in pids}
+supervisor = sole([pid for pid in pids if argv[pid][1:4] == [b"-I", b"-m", b"woltspace.protected_stock"]
+                   and argv[pid][5:6] == [state.encode()] and status(pid, "Uid") == "0"], "supervisor")
+engine = sole([pid for pid in pids if status(pid, "PPid") == supervisor and status(pid, "Uid") == "991"
+               and argv[pid] == [stock.encode(), b"app-server", b"--listen", b"stdio://"]], "child")
+print(engine, read(engine, "stat").rsplit(b")", 1)[1].split()[19].decode())' "$1") || rc=$?
+    if (( rc )); then
+        [[ $found =~ ^(supervisor|child)-(none|many)$ ]] && phase="engine-$found" || phase=engine-census
+        line=$LINENO
+        exit 1
+    fi
+    read -r engine_pid engine_start <<<"$found"
+    [[ $engine_pid =~ ^[1-9][0-9]*$ && $engine_start =~ ^[0-9]+$ ]]
+}
+gone() {  # this exact process (pid and start time) no longer exists
+    inside /opt/woltspace/tools/woltspace/bin/python -I -c '
+import sys
+try:
+    with open(f"/proc/{sys.argv[1]}/stat", "rb") as entry:
+        alive = entry.read().rsplit(b")", 1)[1].split()[19].decode() == sys.argv[2]
+except FileNotFoundError:
+    alive = False
+sys.exit(1 if alive else 0)' "$1" "$2"
 }
 
 phase=boot
@@ -251,8 +295,8 @@ b_pane=$(api "/sessions/$b" | field runtime pane_id)
 notice "$b_pane" denied 1 "$second"
 a_state=$(state_of "$a")
 b_state=$(state_of "$b")
-a_engine=$(engine_of "$a_state")
-[[ $a_engine =~ ^[1-9][0-9]*$ ]]
+engine_of "$a_state"
+a_engine=$engine_pid
 printf '%s %s /usr/bin/telegram-notice 7777\n' "$a_state/action" "$a_engine" | \
     inside sh -c 'cat >"$1/home/probe-target"; chown 991:991 "$1/home/probe-target"' sh "$b_state"
 post "/sessions/$b/resume" '{"prompt":"fixture-probe"}'
@@ -316,12 +360,14 @@ rm -f "$root/ledger/return"
 third=$(admin arm telegram.notice | field id)
 post "/sessions/$a/resume" '{"prompt":"fixture-notice"}'
 wait_for accepts 3  # the stand-in took it and now hangs
+engine_of "$a_state"  # the exact engine of this launch, saved before the stop
+pending_pid=$engine_pid pending_start=$engine_start
 started=$SECONDS
 post "/sessions/$a/stop" '{}' | field status | grep -Fx stopped
 (( SECONDS - started <= 12 ))
 left=$(inside find "$a_state" -name action)  # a census that ran, then an empty result
-engines=$(engine_of "$a_state")
-[[ -z $left && -z $engines ]]
+[[ -z $left ]]
+gone "$pending_pid" "$pending_start"
 settled() { [[ $(arm_state "$third") == unknown ]]; }
 wait_for settled  # spent and ambiguous, never replayed
 accepts 3

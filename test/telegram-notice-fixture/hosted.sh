@@ -64,6 +64,7 @@ cp test/telegram-broker-fixture/telegram.py "$root/install/"
 chmod 0755 "$root/install/files"  # worker 991 traverses it to run the engine
 chmod 0644 "$root/install/files/probe.py" "$root/install/telegram.py"  # the unprivileged entries: worker, node
 printf 'stock-fixture\n' >"$root/install/stock-fixture"
+chmod 0644 "$root/install/stock-fixture"  # non-secret root opt-in the node reads (umask 077 above made it 0600)
 cat >"$root/install/Dockerfile" <<DOCKER
 FROM $base
 COPY --chown=0:0 files/ /usr/local/lib/woltspace-stock-fixture/
@@ -136,6 +137,8 @@ docker start "$container"
 wait_for api /health
 wait_for handoff
 [[ $(inside stat -c '%U:%G %a' /usr/bin/telegram-notice) == 'root:root 755' ]]  # the shipped helper
+[[ $(inside stat -c '%U:%G %a' /etc/woltspace/stock-fixture) == 'root:root 644' ]]  # the opt-in profile
+[[ $(docker exec --user node "$container" cat /etc/woltspace/stock-fixture) == stock-fixture ]]
 docker exec -i -u 0 "$container" sh -ec '  # ordinary (unfenced) engines leave a marker if they ever start
     stand_in=$(cat)
     for engine in /home/node/.local/bin/claude /usr/local/bin/codex; do
@@ -157,9 +160,13 @@ status_of() {  # HTTP status only: no response text is kept
     docker exec --user node "$container" curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 25 \
         -H 'content-type: application/json' -d "$2" "http://127.0.0.1:7777$1"
 }
-rows_of() {
+rows_of() {  # each row of this Wolt as fixed words only: status/stop reason/launch marker
     api /sessions | python3 -c 'import json,sys
-print(" ".join(sorted(r["status"] for r in json.load(sys.stdin) if r.get("wolt") == sys.argv[1])))' "$1"
+words = lambda value, known: value if value in known else "other"
+print(" ".join(sorted("/".join((words(r.get("status"), ("stopped", "running", "starting")),
+                                words(r.get("stop_reason") or "none", ("none", "launch_failed")),
+                                "launching" if r.get("launching") else "clear"))
+                      for r in json.load(sys.stdin) if r.get("wolt") == sys.argv[1])))' "$1"
 }
 denied_gates() {  # the broker's audited, denied launch-open decisions so far
     inside /opt/woltspace/tools/woltspace/bin/python -I -c '
@@ -167,35 +174,42 @@ import sqlite3
 db = sqlite3.connect("file:/var/lib/woltspace-secrets/registry.db?mode=ro", uri=True)
 print(db.execute("SELECT count(*) FROM audit WHERE op = ? AND result = ?", ("launch-open", "denied")).fetchone()[0])'
 }
+no_engine() {  # the census must run and find nothing, before any row is believed
+    local wolt census=0
+    for wolt in gamma delta; do [[ ! -e $WOLTSPACE_WOLTS_DIR/$wolt/.ordinary-engine ]]; done
+    inside pgrep -f '/home/node/.local/bin/claude|/usr/local/bin/codex' || census=$?
+    (( census == 1 ))  # 1 is "no match"; a match (0), a pgrep error (2, 3) or a docker error (125+) fail
+}
+settled=stopped/launch_failed/clear  # a definite non-start, settled by the lodge
 phase=unfenced-claude
-gamma=$(status_of /sessions/new/lodge '{"wolt":"gamma"}')
-[[ $gamma =~ ^4[0-9][0-9]$ ]]  # refused before any launch
-gamma_rows=$(rows_of gamma)
-[[ $gamma_rows == "" || $gamma_rows == stopped ]]
-phase=unfenced-codex
 gates=$(denied_gates)
-delta=$(status_of /sessions/new/lodge '{"wolt":"delta"}')
-[[ $delta =~ ^[45][0-9][0-9]$ ]]  # refused at the protected launch gate
+gamma=$(status_of /sessions/new/lodge '{"wolt":"gamma"}')
+no_engine
+gamma_rows=$(rows_of gamma)
 gates_after=$(denied_gates)
-(( gates_after == gates + 1 ))
+printf 'ROWS gamma create=%s rows=%s\n' "$gamma" "${gamma_rows:-none}" >&3  # fixed words and status only
+[[ $gamma =~ ^[45][0-9][0-9]$ ]]
+if [[ -z $gamma_rows ]]; then (( gates_after == gates ))  # refused before any row or gate
+else [[ $gamma_rows == "$settled" ]]; (( gates_after == gates + 1 )); fi  # denied at the gate, then settled
+phase=unfenced-codex
+delta=$(status_of /sessions/new/lodge '{"wolt":"delta"}')
+no_engine
 delta_rows=$(rows_of delta)
-[[ $delta_rows == stopped ]]
+gates_delta=$(denied_gates)
+printf 'ROWS delta create=%s rows=%s\n' "$delta" "${delta_rows:-none}" >&3
+[[ $delta =~ ^[45][0-9][0-9]$ && $delta_rows == "$settled" ]]
+(( gates_delta == gates_after + 1 ))
 d=$(api /sessions | python3 -c 'import json,sys
 print(next(r["name"] for r in json.load(sys.stdin) if r.get("wolt") == "delta"))')
 phase=unfenced-resume
 resume=$(status_of "/sessions/$d/resume" '{"prompt":"fixture-notice"}')
-[[ $resume =~ ^[45][0-9][0-9]$ ]]
-gates_resumed=$(denied_gates)
-(( gates_resumed == gates_after + 1 ))  # the resume really reached the gate, and was denied there
+no_engine
 delta_rows=$(rows_of delta)
-[[ $delta_rows == stopped ]]
-phase=unfenced-census
-for wolt in gamma delta; do [[ ! -e $WOLTSPACE_WOLTS_DIR/$wolt/.ordinary-engine ]]; done
-census=0  # pgrep: 1 is "no match"; a match (0), a pgrep error (2, 3) or a docker error (125+) all fail
-inside pgrep -f '/home/node/.local/bin/claude|/usr/local/bin/codex' || census=$?
-(( census == 1 ))
-printf 'PASS unfenced refused (gamma create=%s rows=%s; delta create=%s resume=%s)\n' \
-    "$gamma" "$gamma_rows" "$delta" "$resume" >&3
+gates_resumed=$(denied_gates)
+printf 'ROWS delta resume=%s rows=%s\n' "$resume" "${delta_rows:-none}" >&3
+[[ $resume =~ ^[45][0-9][0-9]$ && $delta_rows == "$settled" ]]
+(( gates_resumed == gates_delta + 1 ))  # the resume really reached the gate, and was denied there
+echo 'PASS unfenced refused' >&3
 
 phase=unarmed
 a=$(post /sessions/new/lodge '{"wolt":"alpha","prompt":"fixture-notice"}' | field name)

@@ -601,34 +601,50 @@ class Dispatcher:
 
 
 def notify(credential) -> str:
-    """The one fixed provider request. "ok" only for a verified reply naming our bot and chat."""
+    """The one fixed provider request. "ok" only for a complete, verified reply naming our bot and chat."""
     token, bot, chat, _ = credential
-    connection = http.client.HTTPSConnection(*PROVIDER, timeout=10, context=ssl.create_default_context(cafile=CAFILE))
+    held, deadline = [], time.monotonic() + SEND_SECONDS
+
+    class Connection(http.client.HTTPSConnection):
+        def connect(self):  # the wall clock holds the TLS socket itself, before the handshake and after
+            http.client.HTTPConnection.connect(self)  # a response with Connection: close takes it over
+            self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host, do_handshake_on_connect=False)
+            held.append(self.sock)
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            self.sock.do_handshake()
 
     def expire():  # one wall clock for the whole exchange, however slowly the peer answers
-        try:
-            socket.socket.shutdown(connection.sock, socket.SHUT_RDWR)
-        except (OSError, TypeError):
-            pass  # not connected yet (the connect timeout bounds that) or already closed
+        for sock in held:
+            try:
+                socket.socket.shutdown(sock, socket.SHUT_RDWR)
+            except OSError:
+                pass
 
-    timer = threading.Timer(SEND_SECONDS, expire)
+    connection, timer = None, threading.Timer(SEND_SECONDS, expire)
     timer.start()
-    try:
+    try:  # from here on every failure, the TLS setup included, is ambiguous and recorded: nothing is retried
+        connection = Connection(*PROVIDER, timeout=10, context=ssl.create_default_context(cafile=CAFILE))
         connection.request("POST", f"/bot{token}/sendMessage", json.dumps({"chat_id": chat, "text": NOTICE}),
                            {"Content-Type": "application/json"})
         response = connection.getresponse()
-        status, data = response.status, response.read(65536)
+        framed = response.chunked or response.length is not None  # never a close-delimited body
+        status, data = response.status, response.read(65537)
         if 400 <= status < 500:
             return "rejected"  # refused by the provider: not sent, and the arm stays spent
-        message = json.loads(data, object_pairs_hook=_unique)["result"] if status == 200 else None
+        if not (framed and len(data) <= 65536 and response.isclosed()):
+            return "unknown"  # truncated, oversized or unfinished: a JSON prefix is no acceptance
+        reply = json.loads(data, object_pairs_hook=_unique) if status == 200 else None
+        message = reply["result"] if reply["ok"] is True else None  # a top-level ok other than true is no acceptance
         sender, target = message["from"], message["chat"]
         exact = (type(sender["id"]) is int and sender["id"] == bot and sender.get("is_bot") is True
                  and type(target["id"]) is int and target["id"] == chat)
-    except Exception:  # any failure after the intent is ambiguous; nothing is retried
+    except Exception:
         return "unknown"
     finally:
         timer.cancel()
-        connection.close()
+        if connection is not None:
+            connection.close()
     return "ok" if exact else "mismatch"
 
 

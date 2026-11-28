@@ -1083,6 +1083,10 @@ def provider(tmp_path, monkeypatch):
 
     def serve(reply):
         conn = listener.accept()[0]
+        if reply == "silent":  # TCP accepted, TLS never answered
+            time.sleep(6)
+            conn.close()
+            return seen.append(None)
         try:
             with context.wrap_socket(conn, server_side=True) as tls:
                 tls.settimeout(5)
@@ -1106,29 +1110,47 @@ def provider(tmp_path, monkeypatch):
     listener.close()
 
 
-def drip(tls):
-    tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n{")
-    try:
-        for _ in range(60):
-            time.sleep(.1)
-            tls.sendall(b" ")
-    except OSError:
-        pass  # the client's wall clock cut the exchange
+def raw(*parts, pause=0.0):
+    def send(tls):
+        try:
+            for part in parts:
+                tls.sendall(part)
+                time.sleep(pause)
+        except OSError:
+            pass  # the client's wall clock cut the exchange
+    return send
+
+
+BODY = json.dumps(message()).encode()
+CHUNKED = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n" % (len(BODY), BODY)
 
 
 @pytest.mark.parametrize("case,reply,expected", [
     ("exact", answer(200, message()), "ok"),
+    ("chunked", raw(CHUNKED + b"0\r\n\r\n"), "ok"),
     ("other-chat", answer(200, message(chat=43)), "mismatch"),
     ("other-bot", answer(200, message(bot=654321)), "mismatch"),
     ("not-a-bot", answer(200, message(is_bot=False)), "mismatch"),
     ("chat-as-text", answer(200, message(chat="42")), "mismatch"),
     ("bot-as-bool", answer(200, message(bot=True)), "mismatch"),
+    ("ok-false", answer(200, {**message(), "ok": False}), "unknown"),
+    ("ok-missing", answer(200, {"result": message()["result"]}), "unknown"),
+    ("ok-as-one", answer(200, {**message(), "ok": 1}), "unknown"),
     ("refused", answer(400, {"ok": False}), "rejected"),
     ("server-error", answer(502, message()), "unknown"),
     ("garbled", answer(200, b"{"), "unknown"),
     ("duplicate-key", answer(200, b'{"ok": true, "result": %s, "result": %s}' % tuple(
         json.dumps(message(chat=chat)["result"]).encode() for chat in (43, 42))), "unknown"),
-    ("slow", drip, "unknown"),
+    # A complete JSON prefix is not a complete response.
+    ("truncated", raw(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(BODY) + 9, BODY)), "unknown"),
+    ("oversized", answer(200, BODY.ljust(65537)), "unknown"),  # one byte over the cap, otherwise complete
+    ("close-delimited", raw(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + BODY), "unknown"),
+    ("chunked-unfinished", raw(CHUNKED), "unknown"),
+    # One wall clock: a slow body after the headers, with or without Connection: close, and a silent handshake.
+    ("slow", raw(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n{", *[b" "] * 60, pause=.1), "unknown"),
+    ("slow-close", raw(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\nConnection: close\r\n\r\n{", *[b" "] * 60,
+                       pause=.1), "unknown"),
+    ("silent", "silent", "unknown"),
     ("untrusted", None, "unknown"),
     ("wrong-name", None, "unknown"),
 ])
@@ -1142,12 +1164,24 @@ def test_telegram_fixed_tls_request(provider, monkeypatch, case, reply, expected
     started = time.monotonic()
     assert broker.notify((TOKEN, 123456, 42, "telegram-x")) == expected
     assert time.monotonic() - started < 4
-    thread.join(5)
-    if reply is None:
+    thread.join(8)
+    if reply in (None, "silent"):
         assert provider.seen == [None]
     else:
         assert provider.seen == [(f"POST /bot{TOKEN}/sendMessage HTTP/1.1".encode(),
                                   {"chat_id": 42, "text": "Woltspace broker notice."})]
+
+
+def test_telegram_tls_setup_failure_settles_the_dispatch_as_unknown(store, owner, tmp_path, monkeypatch):
+    monkeypatch.setattr(broker, "CAFILE", str(tmp_path / "missing.pem"))  # the context itself raises
+    b = broker.Broker(store, effect=True)
+    alpha = enrolled(b, "alpha")
+    telegram_ready(b, "alpha")
+    arm = ask(b, {"op": "arm", "action": broker.TELEGRAM})["id"]
+    binding = b.dispatch.bind(alpha, "a")
+    assert b.dispatch.submit(binding, broker.TELEGRAM).result(5) == "unknown"
+    assert rows(store, f"SELECT result FROM audit WHERE op = '{arm}'") == [("unknown",)]
+    assert b.dispatch.submit(binding, broker.TELEGRAM).result(5) == "unavailable"  # spent, and the pool still serves
 
 
 def test_telegram_restart_after_provider_accept_stays_disarmed(store, owner, provider):

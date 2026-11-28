@@ -161,12 +161,19 @@ probe audit >"$root/before-node.json"
 [[ $(audit_result "$arm" <"$root/before-node.json") == ok ]]
 [[ $(docker exec -u node "$container" /opt/woltspace/tools/woltspace/bin/python -I /opt/fixture/worker.py node) == node-fenced ]]
 probe audit >"$root/after-node.json"
-cmp "$root/before-node.json" "$root/after-node.json"
+python3 - "$root/before-node.json" "$root/after-node.json" <<'PY'
+import json, sys
+before, after = (json.load(open(path)) for path in sys.argv[1:])
+assert after[:len(before)] == before  # every prior row, the accepted send included, is intact
+assert [row[1:] for row in after[len(before):]] == [  # only the node's two refused provision attempts
+    ["worker", "other", None, "other", "denied"], ["node", "launch-control", None, "other", "invalid"]]
+PY
 mode mismatch
 mismatch=$(admin arm telegram.notice | json_field id)
 probe mismatch
 [[ $(probe audit | audit_result "$mismatch") == mismatch ]]
 ledger ok,mismatch
+probe audit >"$root/pre.json"
 phase=custody
 control="control-$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 inside sh -c 'printf "%s\n" "$1" >/root/fixture-control' sh "$control"
@@ -204,25 +211,26 @@ stop
 archive "$source_volume" "$root/post.tar"
 clean_of_token "$root/post.tar" "telegram-$digest"
 
+sends=ok,mismatch,crash
 for snapshot in post pre; do
     phase="$snapshot-restore"
     volume="$name-$snapshot"
     restore "$volume" "$root/$snapshot.tar"
     boot true "$volume"
     probe audit >"$root/restored.json"
-    if [[ $snapshot == post ]]; then
-        cmp "$root/post.json" "$root/restored.json"
-    else
-        [[ $(grep -Fc "$arm" "$root/restored.json" || :) == 0 ]]
-    fi
+    cmp "$root/$snapshot.json" "$root/restored.json"  # the included audit comes back whole
+    [[ $(grep -Fc "$arm" "$root/restored.json" || :) == "$([[ $snapshot == post ]] && echo 1 || echo 0)" ]]
     [[ $(admin arm telegram.notice | json_field result) == not-provisioned ]]
-    ready
-    probe unavailable
-    if [[ $snapshot == pre ]]; then
-        ok revoke alpha telegram.notice
-        probe denied
-    fi
-    ledger ok,mismatch,crash
+    [[ $(provision) == ok ]]
+    ok grant alpha dummy.ping
+    mode ok
+    admin arm telegram.notice | json_field id >/dev/null
+    probe denied  # provisioned and armed, but the restored grant row stays inactive
+    ledger "$sends"
+    ok grant alpha telegram.notice
+    probe ok  # positive control: fresh provision, grant and arm send exactly once
+    sends+=,ok
+    ledger "$sends"
     stop
 done
 phase=rollback
@@ -235,7 +243,7 @@ ok grant alpha dummy.ping
 probe denied
 probe audit >"$root/rollback-after.json"
 [[ $(audit_result "$arm" <"$root/rollback-after.json") == unknown ]]
-ledger ok,mismatch,crash
-[[ ! -e "$root/ledger/errors" ]]
+ledger "$sends"
+[[ $sends == ok,mismatch,crash,ok,ok && ! -e "$root/ledger/errors" ]]
 stop
 printf 'PASS one acceptance per arm; verified result; mismatch; custody scans; crash, restores, rollback without replay\n' >&3

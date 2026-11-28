@@ -91,9 +91,8 @@ audit_result() {
 admin() { py -m woltspace.dummy_broker admin "$@"; }
 json_field() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 ok() { [[ $(admin "$@" | json_field result) == ok ]]; }
-provision() {
-    printf '42\n%s\n' "$token" | docker exec -i -u 0 "$container" /opt/woltspace/tools/woltspace/bin/python -I \
-        -m woltspace.dummy_broker admin provision telegram.notice | json_field result
+provision() {  # through the shipping host wrapper, which keeps stdin open only for provision
+    printf '42\n%s\n' "$token" | WOLTSPACE_CONTAINER="$name" ./woltspace secrets provision telegram.notice | json_field result
 }
 ready() { [[ $(provision) == ok ]]; ok grant alpha dummy.ping; ok grant alpha telegram.notice; }
 wait_until() {

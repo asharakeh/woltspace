@@ -628,7 +628,9 @@ def notify(credential) -> str:
         connection.request("POST", f"/bot{token}/sendMessage", json.dumps({"chat_id": chat, "text": NOTICE}),
                            {"Content-Type": "application/json"})
         response = connection.getresponse()
-        framed = response.chunked or response.length is not None  # never a close-delimited body
+        # Content-Length only: http.client takes EOF for a chunked trailer's last CRLF, and close-delimited
+        # bodies cannot tell a cut from an end. The provider answers with a length.
+        framed = not response.chunked and response.length is not None
         status, data = response.status, response.read(65537)
         if 400 <= status < 500:
             return "rejected"  # refused by the provider: not sent, and the arm stays spent

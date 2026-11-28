@@ -706,8 +706,12 @@ case "$cmd" in
     # Owner-only broker administration. Root inside the container is reached only
     # through the host's Docker access; the broker checks the caller's uid itself.
     # The venv's own interpreter: a symlink to it elsewhere starts the bare base Python.
-    # Ops: enroll|retire WOLT, rename WOLT NEW, register ACTION, grant|revoke|run WOLT ACTION.
+    # Ops: enroll|retire WOLT, rename WOLT NEW, register ACTION, grant|revoke|run WOLT ACTION, arm ACTION,
+    # provision ACTION (chat and token on stdin, never argv: only that op keeps stdin open with -i).
     shift
+    if [ "${1:-}" = provision ]; then
+      exec docker exec -i -u 0 "$CONTAINER_NAME" /opt/woltspace/tools/woltspace/bin/python -I -m woltspace.dummy_broker admin "$@"
+    fi
     exec docker exec -u 0 "$CONTAINER_NAME" /opt/woltspace/tools/woltspace/bin/python -I -m woltspace.dummy_broker admin "$@"
     ;;
   tui)

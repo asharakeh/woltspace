@@ -1127,7 +1127,6 @@ CHUNKED = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n" %
 
 @pytest.mark.parametrize("case,reply,expected", [
     ("exact", answer(200, message()), "ok"),
-    ("chunked", raw(CHUNKED + b"0\r\n\r\n"), "ok"),
     ("other-chat", answer(200, message(chat=43)), "mismatch"),
     ("other-bot", answer(200, message(bot=654321)), "mismatch"),
     ("not-a-bot", answer(200, message(is_bot=False)), "mismatch"),
@@ -1145,6 +1144,8 @@ CHUNKED = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n" %
     ("truncated", raw(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(BODY) + 9, BODY)), "unknown"),
     ("oversized", answer(200, BODY.ljust(65537)), "unknown"),  # one byte over the cap, otherwise complete
     ("close-delimited", raw(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + BODY), "unknown"),
+    ("chunked", raw(CHUNKED + b"0\r\n\r\n"), "unknown"),  # refused even complete: only a length frames a reply
+    ("chunked-no-terminator", raw(CHUNKED + b"0\r\n"), "unknown"),  # EOF after the zero chunk line
     ("chunked-unfinished", raw(CHUNKED), "unknown"),
     # One wall clock: a slow body after the headers, with or without Connection: close, and a silent handshake.
     ("slow", raw(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n{", *[b" "] * 60, pause=.1), "unknown"),
@@ -1170,6 +1171,23 @@ def test_telegram_fixed_tls_request(provider, monkeypatch, case, reply, expected
     else:
         assert provider.seen == [(f"POST /bot{TOKEN}/sendMessage HTTP/1.1".encode(),
                                   {"chat_id": 42, "text": "Woltspace broker notice."})]
+
+
+@pytest.mark.parametrize("argv,interactive", [(["provision", broker.TELEGRAM], True), (["arm", broker.TELEGRAM], False)])
+def test_secrets_wrapper_forwards_stdin_only_for_provision(tmp_path, argv, interactive):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "docker").write_text('#!/bin/sh\nprintf "%s\\n" "$@" >"$0.args"\ncat >"$0.stdin"\n')
+    (bin_dir / "docker").chmod(0o755)
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(tmp_path), "WOLTSPACE_WOLTS_DIR": str(tmp_path / "wolts")}
+    done = subprocess.run(["bash", str(Path(broker.__file__).parents[2] / "woltspace"), "secrets", *argv],
+                          input=f"42\n{TOKEN}\n".encode(), env=env, capture_output=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    args = (bin_dir / "docker.args").read_text().split()
+    assert args[:3] == (["exec", "-i", "-u"] if interactive else ["exec", "-u", "0"])
+    assert args[-len(argv) - 1:] == ["admin", *argv] and TOKEN not in args  # chat and token never on argv
+    if interactive:  # the wrapper hands its own stdin to docker exec untouched
+        assert (bin_dir / "docker.stdin").read_text() == f"42\n{TOKEN}\n"
 
 
 def test_telegram_tls_setup_failure_settles_the_dispatch_as_unknown(store, owner, tmp_path, monkeypatch):

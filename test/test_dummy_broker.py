@@ -973,3 +973,60 @@ def test_telegram_intent_boundary(store, owner, monkeypatch, interruption):
     expected = {"intent-failure": "armed", "revoke-during-intent": "denied",
                 "outcome-failure": "pending"}[interruption]
     assert rows(store, f"SELECT result FROM audit WHERE op = '{arm}'") == [(expected,)]
+
+
+def test_telegram_restart_after_external_accept_stays_disarmed(store, tmp_path):
+    import select
+
+    child_code = """
+import socket
+import sys
+from pathlib import Path
+from woltspace.dummy_broker import Broker, TELEGRAM
+
+b = Broker(Path(sys.argv[1]), effect=True)
+def admin(op, **kw):
+    return b.apply(dict(op=op, **kw))
+principal = admin("enroll", wolt="alpha")["id"]
+admin("register", action=TELEGRAM)
+admin("grant", wolt="alpha", action=TELEGRAM)
+operation = admin("arm", action=TELEGRAM)["id"]
+b.dispatch.offer(socket.socket(fileno=int(sys.argv[2])))
+print(operation, flush=True)
+b.dispatch.submit(b.dispatch.bind(principal, "a"), TELEGRAM).result(25)
+"""
+    effect, fake = socket.socketpair()
+    with effect, fake, subprocess.Popen(
+        [sys.executable, "-c", child_code, str(store), str(effect.fileno())],
+        pass_fds=(effect.fileno(),), stdout=subprocess.PIPE,
+    ) as child:
+        try:
+            effect.close()
+            assert select.select([child.stdout], [], [], 3)[0]
+            operation = child.stdout.readline().decode().strip()
+            fake.settimeout(3)
+            assert fake.recv(5) == b"send\n"
+            ledger = tmp_path / "acceptances"
+            with ledger.open("wb") as receipts:
+                receipts.write(b"accepted\n")
+                receipts.flush()
+                os.fsync(receipts.fileno())
+            assert rows(store, f"SELECT result FROM audit WHERE op = '{operation}'") == [("pending",)]
+        finally:
+            child.kill()
+            child.wait(timeout=3)
+        assert child.returncode == -9
+        assert fake.recv(1) == b""
+
+    restored = broker.Broker(store, effect=True)
+    action = broker.TELEGRAM
+    principal, = rows(store, "SELECT id FROM principals WHERE name = 'alpha'")[0]
+    assert restored.apply({"op": "grant", "wolt": "alpha", "action": action}) == {"result": "ok"}
+    effect, fake = socket.socketpair()
+    with effect, fake:
+        restored.dispatch.offer(effect)
+        binding = restored.dispatch.bind(principal, "fresh")
+        assert restored.dispatch.submit(binding, action).result(3) == "unavailable"
+        assert not select.select([fake], [], [], 0)[0]
+        assert rows(store, f"SELECT result FROM audit WHERE op = '{operation}'") == [("unknown",)]
+        assert ledger.read_bytes() == b"accepted\n"

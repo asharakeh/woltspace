@@ -1,0 +1,17 @@
+name: Telegram broker action
+on:
+  push:
+    branches: [feat/telegram-broker-action]
+permissions:
+  contents: read
+jobs:
+  notice-entry:
+    if: github.event.repository.fork == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: env -i PATH=/usr/local/bin:/usr/bin:/bin bash test/telegram-notice-fixture/hosted.sh
+      - run: env -i PATH=/usr/local/bin:/usr/bin:/bin bash test/telegram-broker-fixture/hosted.sh

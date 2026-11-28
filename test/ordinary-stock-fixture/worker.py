@@ -10,6 +10,8 @@ import time
 
 ROOT = Path("/state")
 WORKDIR = ROOT
+# Fixed shell-tool commands the stub asks the engine to run; their last output line is the result.
+COMMANDS = {"notice": "telegram-notice", "probe": "/usr/bin/python3 -I /usr/local/lib/woltspace-stock-fixture/probe.py"}
 
 
 class Endpoint(BaseHTTPRequestHandler):
@@ -45,6 +47,8 @@ class Endpoint(BaseHTTPRequestHandler):
                 for item in request["input"] if isinstance(item, dict)
                 for piece in (item.get("content") or []) if isinstance(piece, dict)
             ]
+            outputs = [item for item in request["input"]
+                       if isinstance(item, dict) and item.get("type") == "function_call_output"]
         except (ValueError, TypeError, KeyError, OSError, RecursionError):
             self.send_error(400, "fixture framing")
             return
@@ -55,9 +59,10 @@ class Endpoint(BaseHTTPRequestHandler):
             and request.get("stream") is True
             and ("user", self.server.prompt) in parts
             and (not self.server.history or ("assistant", self.server.history) in parts)
-            and not self.server.accepted
+            and len(self.server.accepted) == (1 if self.server.command and outputs else 0)
+            and len(outputs) == (1 if self.server.accepted else 0)
         )
-        if len(self.server.accepted) < 2:
+        if len(self.server.accepted) < 3:
             self.server.accepted.append(valid)
         if not valid:
             self.send_error(400, "fixture request mismatch")
@@ -71,29 +76,39 @@ class Endpoint(BaseHTTPRequestHandler):
                     return
                 time.sleep(.025)
         answer = self.server.answer
+        if self.server.command and not outputs:  # first request of a tool turn: call the engine's shell tool
+            call = {"id": "fc_fixture", "type": "function_call", "status": "completed", "call_id": "call_fixture",
+                    "name": "exec_command", "arguments": json.dumps({"cmd": self.server.command})}
+            self.stream([("response.output_item.added", {"output_index": 0, "item": call}),
+                         ("response.output_item.done", {"output_index": 0, "item": call})], [call], "call")
+            return
+        if outputs:
+            lines = str(outputs[0].get("output", "")).strip().splitlines()
+            self.server.word = lines[-1].strip() if lines else ""
         item = {
             "id": f"msg_{answer}", "type": "message", "role": "assistant",
             "status": "completed",
             "content": [{"type": "output_text", "text": answer, "annotations": []}],
         }
+        self.stream([
+            ("response.output_item.added", {"output_index": 0,
+              "item": dict(item, status="in_progress", content=[])}),
+            ("response.output_text.delta", {"output_index": 0, "content_index": 0,
+              "item_id": item["id"], "delta": answer}),
+            ("response.output_item.done", {"output_index": 0, "item": item}),
+        ], [item], answer)
+
+    def stream(self, middle, output, name):
         response = {
-            "id": f"resp_{answer}", "object": "response", "status": "completed",
-            "output": [item],
+            "id": f"resp_{name}", "object": "response", "status": "completed", "output": output,
             "usage": {
                 "input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
                 "input_tokens_details": {"cached_tokens": 0},
                 "output_tokens_details": {"reasoning_tokens": 0},
             },
         }
-        events = [
-            ("response.created", {"response": dict(response, status="in_progress", output=[])}),
-            ("response.output_item.added", {"output_index": 0,
-              "item": dict(item, status="in_progress", content=[])}),
-            ("response.output_text.delta", {"output_index": 0, "content_index": 0,
-              "item_id": item["id"], "delta": answer}),
-            ("response.output_item.done", {"output_index": 0, "item": item}),
-            ("response.completed", {"response": response}),
-        ]
+        events = [("response.created", {"response": dict(response, status="in_progress", output=[])}),
+                  *middle, ("response.completed", {"response": response})]
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -147,11 +162,12 @@ def _drive(child, server, lane, expected):
         verb = command.strip()
         if verb == "exit":
             return thread
-        assert verb in ("overlap", "reuse", "resume", "survive")
+        assert verb in ("overlap", "reuse", "resume", "survive", *COMMANDS)
         server.prompt = f"Fixture prompt {lane} {verb}"
         server.answer = f"fixture-{lane}-{verb}"
         server.overlap = verb == "overlap"
         server.history = f"fixture-{lane}-reuse" if verb == "resume" else None
+        server.command, server.word = COMMANDS.get(verb), None
         server.accepted.clear()
         deadline = time.monotonic() + 40
         turn_id = 3
@@ -173,8 +189,8 @@ def _drive(child, server, lane, expected):
                 assert params["turn"]["id"] == turn, "completion turn mismatch"
                 assert params["turn"]["status"] == "completed", "stock turn failed"
                 assert answers == [server.answer], "fixed reply missing"
-                assert server.accepted == [True], "expected one keyless request"
+                assert server.accepted == [True] * (2 if server.command else 1), "expected keyless requests"
                 (ROOT / "thread").write_text(thread + "\n")
-                print("complete", flush=True)
+                print(f"notice {server.word}" if verb == "notice" else "complete", flush=True)
                 break
     raise AssertionError("driver closed without exit")

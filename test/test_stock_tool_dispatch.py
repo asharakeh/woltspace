@@ -232,3 +232,38 @@ def test_stock_tool_runs_the_packaged_helper_only_through_its_own_launch(tmp_pat
         stopped.set()
         relay.join(5)
         supervisor.remove_endpoint(action, pipes)
+
+
+def test_sibling_probe_reaches_no_route_to_another_launch(tmp_path, monkeypatch):
+    """B's own tool runs the hosted probe: pipes, listing, /proc of A's engine, signals, sockets, helper."""
+    import socket
+    import subprocess
+    from woltspace import protected_stock as supervisor
+    from test_telegram_notice import HELLO, HELPER, Broker
+
+    monkeypatch.setattr(supervisor.os, "chown", lambda *_: None)
+    (tmp_path / "a" / "home").mkdir(parents=True)
+    action, pipes = supervisor.notice_endpoint(tmp_path / "a")
+    broker, stopped = Broker(["ok"]), threading.Event()
+    relay = threading.Thread(target=supervisor.relay_notices,
+                             args=(*pipes, supervisor.Channel(broker.theirs, HELLO), stopped), daemon=True)
+    relay.start()
+    engine = subprocess.Popen(["sleep", "60"])  # stands in for A's engine: outside B's fence
+    lodge = socket.create_server(("127.0.0.1", 0))  # a live port B is not granted
+    home = tmp_path / "b" / "home"
+    home.mkdir(parents=True, mode=0o700)
+    (home / "probe-target").write_text(f"{action} {engine.pid} {HELPER} {lodge.getsockname()[1]}\n")
+    probe = FIXTURE / "probe.py"
+    try:
+        server, _, _ = run_turn(tmp_path / "b", "danger-full-access", f"/usr/bin/python3 -I {probe}",
+                                (HELPER, probe), (), home)
+        output = str(server.requests[1]["input"][-1]["output"])
+        assert output.strip().splitlines()[-1] == "fenced", output
+        assert (home / "probe-result").read_text() == "fenced\n" and broker.requests == []
+    finally:
+        engine.kill()
+        engine.wait()
+        lodge.close()
+        stopped.set()
+        relay.join(5)
+        supervisor.remove_endpoint(action, pipes)

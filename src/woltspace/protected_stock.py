@@ -198,7 +198,7 @@ def drive(worker, child, endpoint, bound, principal, expected, finished):
             if line == b"ping\n":
                 print("dummy ok" if bound.ask(dummy_broker.ACTION, 2) == "ok" else "dummy refused", flush=True)
             elif line in (b"fixture-overlap\n", b"fixture-reuse\n", b"fixture-resume\n", b"fixture-survive\n",
-                          b"fixture-notice\n"):
+                          b"fixture-notice\n", b"fixture-probe\n"):
                 yield line.decode().strip().removeprefix("fixture-")
             else:
                 print("fixture refused", flush=True)

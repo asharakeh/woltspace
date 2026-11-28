@@ -14,7 +14,8 @@ class Bot:
         with Path("/fixture/accepts").open("ab", buffering=0) as ledger:
             ledger.write(b"accepted\n")
             os.fsync(ledger.fileno())
-        await asyncio.Event().wait()  # crash before the response reaches the registry
+        if not Path("/fixture/return").exists():
+            await asyncio.Event().wait()  # crash before the response reaches the registry
 
 
 telegram_real.APP = SimpleNamespace(bot=Bot())

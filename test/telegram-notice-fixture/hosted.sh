@@ -97,7 +97,11 @@ pane_count() {  # how many times the pane shows exactly this line
 shows() { [[ $(pane_count "$1" "$2") == "$3" ]]; }
 admin() { WOLTSPACE_IMAGE="$image" WOLTSPACE_FEATURE_ISOLATION=true ./woltspace secrets "$@" 3>&-; }
 ok() { [[ $(admin "$@" | field result) == ok ]]; }
-accepts() { [[ $(cat "$root/ledger/accepts" 2>/dev/null | wc -l) == "$1" ]]; }
+accepts() {  # no ledger yet is 0 accepts; an unreadable ledger is a failure, never 0
+    local count=0
+    if [[ -e $root/ledger/accepts ]]; then count=$(wc -l <"$root/ledger/accepts"); fi
+    [[ $count == "$1" ]]
+}
 arm_state() {
     inside /opt/woltspace/tools/woltspace/bin/python -I -c '
 import sqlite3, sys
@@ -115,9 +119,9 @@ state_of() {  # the protected state dir of a session's current launch
     [[ $principal == /run/woltspace-engine/p-*/"$conversation" ]]
     printf '%s\n' "$principal"
 }
-engine_of() {  # the stock engine whose cwd is that launch's home
-    inside sh -c 'for p in $(pgrep -f "codex app-server"); do
-        [ "$(readlink /proc/$p/cwd)" = "$1/home" ] && echo "$p"; done' sh "$1"
+engine_of() {  # the stock engine whose cwd is that launch's home; a failed census fails, none is empty
+    inside sh -c 'pids=$(pgrep -f "codex app-server"); rc=$?; [ "$rc" -le 1 ] || exit 2
+        for p in $pids; do if [ "$(readlink "/proc/$p/cwd")" = "$1/home" ]; then echo "$p"; fi; done' sh "$1"
 }
 
 phase=boot
@@ -157,28 +161,41 @@ rows_of() {
     api /sessions | python3 -c 'import json,sys
 print(" ".join(sorted(r["status"] for r in json.load(sys.stdin) if r.get("wolt") == sys.argv[1])))' "$1"
 }
-gates() {  # the broker's audited launch-open decisions so far
+denied_gates() {  # the broker's audited, denied launch-open decisions so far
     inside /opt/woltspace/tools/woltspace/bin/python -I -c '
 import sqlite3
 db = sqlite3.connect("file:/var/lib/woltspace-secrets/registry.db?mode=ro", uri=True)
-print(db.execute("SELECT count(*) FROM audit WHERE op = ?", ("launch-open",)).fetchone()[0])'
+print(db.execute("SELECT count(*) FROM audit WHERE op = ? AND result = ?", ("launch-open", "denied")).fetchone()[0])'
 }
+phase=unfenced-claude
 gamma=$(status_of /sessions/new/lodge '{"wolt":"gamma"}')
-[[ $gamma =~ ^4[0-9][0-9]$ && $(rows_of gamma) =~ ^(|stopped)$ ]]  # claude: refused before any launch
+[[ $gamma =~ ^4[0-9][0-9]$ ]]  # refused before any launch
+gamma_rows=$(rows_of gamma)
+[[ $gamma_rows == "" || $gamma_rows == stopped ]]
+phase=unfenced-codex
+gates=$(denied_gates)
 delta=$(status_of /sessions/new/lodge '{"wolt":"delta"}')
-[[ $delta != 200 && $(rows_of delta) == stopped ]]  # codex: refused at the protected launch gate
+[[ $delta =~ ^[45][0-9][0-9]$ ]]  # refused at the protected launch gate
+gates_after=$(denied_gates)
+(( gates_after == gates + 1 ))
+delta_rows=$(rows_of delta)
+[[ $delta_rows == stopped ]]
 d=$(api /sessions | python3 -c 'import json,sys
 print(next(r["name"] for r in json.load(sys.stdin) if r.get("wolt") == "delta"))')
-before=$(gates)
+phase=unfenced-resume
 resume=$(status_of "/sessions/$d/resume" '{"prompt":"fixture-notice"}')
-(( $(gates) == before + 1 ))  # the resume really reached the gate, and was refused there
-[[ $(rows_of delta) == stopped ]]
+[[ $resume =~ ^[45][0-9][0-9]$ ]]
+gates_resumed=$(denied_gates)
+(( gates_resumed == gates_after + 1 ))  # the resume really reached the gate, and was denied there
+delta_rows=$(rows_of delta)
+[[ $delta_rows == stopped ]]
+phase=unfenced-census
 for wolt in gamma delta; do [[ ! -e $WOLTSPACE_WOLTS_DIR/$wolt/.ordinary-engine ]]; done
 census=0  # pgrep: 1 is "no match"; a match (0), a pgrep error (2, 3) or a docker error (125+) all fail
 inside pgrep -f '/home/node/.local/bin/claude|/usr/local/bin/codex' || census=$?
 (( census == 1 ))
 printf 'PASS unfenced refused (gamma create=%s rows=%s; delta create=%s resume=%s)\n' \
-    "$gamma" "$(rows_of gamma)" "$delta" "$resume" >&3
+    "$gamma" "$gamma_rows" "$delta" "$resume" >&3
 
 phase=unarmed
 a=$(post /sessions/new/lodge '{"wolt":"alpha","prompt":"fixture-notice"}' | field name)
@@ -213,7 +230,8 @@ printf '%s %s /usr/bin/telegram-notice 7777\n' "$a_state/action" "$a_engine" | \
 post "/sessions/$b/resume" '{"prompt":"fixture-probe"}'
 wait_for shows "$b_pane" 'fixture complete' 1
 [[ $(inside cat "$b_state/home/probe-result") == fenced ]]
-[[ $(arm_state "$second") == armed ]] && accepts 1
+[[ $(arm_state "$second") == armed ]]
+accepts 1
 echo 'PASS sibling denied and fenced' >&3
 
 phase=node  # trusted for session input and the connector, but never A's private endpoint
@@ -226,7 +244,8 @@ for path, flags in ((sys.argv[1] + "/request", os.O_WRONLY), (sys.argv[1] + "/re
     except PermissionError:
         pass
 ' "$a_state/action"
-[[ $(arm_state "$second") == armed ]] && accepts 1
+[[ $(arm_state "$second") == armed ]]
+accepts 1
 echo 'PASS node cannot open the endpoint' >&3
 
 phase=stale  # a descriptor held past stop reaches nothing on the fresh launch
@@ -253,7 +272,8 @@ inside touch /run/stale-go
 wait "$pid"
 pid=
 [[ $(inside cat /run/stale-result) == refused ]]
-[[ $(arm_state "$second") == armed ]] && accepts 1
+[[ $(arm_state "$second") == armed ]]
+accepts 1
 echo 'PASS stale descriptor refused' >&3
 
 phase=fresh-positive  # the separately armed operation, on the fresh launch
@@ -271,7 +291,9 @@ wait_for accepts 3  # the stand-in took it and now hangs
 started=$SECONDS
 post "/sessions/$a/stop" '{}' | field status | grep -Fx stopped
 (( SECONDS - started <= 12 ))
-[[ -z $(inside find "$a_state" -name action) && -z $(engine_of "$a_state") ]]
+left=$(inside find "$a_state" -name action)  # a census that ran, then an empty result
+engines=$(engine_of "$a_state")
+[[ -z $left && -z $engines ]]
 settled() { [[ $(arm_state "$third") == unknown ]]; }
 wait_for settled  # spent and ambiguous, never replayed
 accepts 3
@@ -279,7 +301,8 @@ echo 'PASS stop during a stalled notice' >&3
 
 phase=finish
 post "/sessions/$b/stop" '{}' | field status | grep -Fx stopped
-[[ -z $(inside find /run/woltspace-engine -name action) ]]
+left=$(inside find /run/woltspace-engine -name action)
+[[ -z $left ]]
 docker stop --time 15 "$container"
 [[ $(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$container") == 'exited 0' ]]
 docker rm "$container"

@@ -100,7 +100,9 @@ retire() {
     local expected=$1
     [[ $(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$container") == "exited $expected" ]]
     docker rm "$container"
-    [[ -z $(docker ps -aq --no-trunc --filter "id=$container") ]]
+    local remaining
+    remaining=$(docker ps -aq --no-trunc --filter "id=$container")  # the census ran, then nothing is left
+    [[ -z $remaining ]]
     container=
 }
 stop() { docker stop --time 15 "$container"; retire 0; }
@@ -167,7 +169,8 @@ for snapshot in post pre; do
     if [[ $snapshot == post ]]; then
         cmp "$root/post.json" "$root/restored.json"
     else
-        [[ $(grep -Fc "$arm" "$root/restored.json" || :) == 0 ]]
+        hits=$(grep -Fc "$arm" "$root/restored.json") || (( $? == 1 ))  # 1 is no match; 2 is a read failure
+        [[ $hits == 0 ]]
     fi
     regrant
     probe unavailable

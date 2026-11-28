@@ -673,6 +673,45 @@ def test_an_unknown_resume_outcome_never_starts_a_second_worker(lodge, resting, 
     inbox_wake._wake(str(lodge.root), "pal")  # launch_unknown holds
 
 
+
+@pytest.mark.parametrize("age", [0, inbox_wake.SETTLE + 1])
+def test_a_running_reservation_is_waited_for_until_it_is_overdue_then_hinted(lodge, wake, age):
+    """resolve_active_session lists only sessions whose agent the process table shows (wake.live
+    None here): a running reserved session it misses is waited for, but never forever."""
+    mail(lodge)
+    lodge.registry.create("pal-r", wolt="pal")  # running
+    lodge.store.set_wake("pal", {**wake_state(lodge), "reserved": {"session": "pal-r", "at": int(time.time()) - age}})
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert [d[0] for d in lodge.calls.delivered] == (["pal-r"] if age else []) and not wake.starts
+    assert [o["how"] for o in wake_state(lodge).get("outcomes", [])] == (["hinted"] if age else [])
+
+
+@pytest.mark.parametrize("seen_live", [False, True])
+def test_a_failed_resume_is_hinted_once_and_a_miss_brings_the_wolt_up_another_way(lodge, resting, monkeypatch,
+                                                                                 seen_live):
+    """The resume relaunched, then a lodge.db write failed: the session runs with no rewake
+    endpoint (native None). Seen live or not, its one hint misses; then another session starts."""
+    started = []
+    monkeypatch.setattr(sessions, "start_session", lambda **kw: started.append(kw) or {})
+    if seen_live:
+        monkeypatch.setattr(sessions, "resolve_active_session", lambda wolt, registry=None: (
+            "pal-rest" if record(lodge, "pal-rest")["status"] == "running" else None))
+
+    def lost(name, prompt="", **kw):
+        lodge.registry.update(name, status="running", native=None)
+        raise inbox.Unavailable("store_failed")
+    monkeypatch.setattr(sessions, "resume_session", lost)
+    sys.modules["native_adapters"].deliver = (
+        lambda record_, hint: lodge.calls.delivered.append(record_["name"]) or ("unavailable", "no_endpoint"))
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert wake_state(lodge)["reserved"]["failed"] and started == [] and not lodge.calls.delivered
+    mail(lodge, "k2", human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # due at once: hinted, it misses, the same pass starts one
+    assert lodge.calls.delivered == ["pal-rest"] and len(started) == 1
+    assert [o["how"] for o in wake_state(lodge)["outcomes"]] == ["error", "started"]
+    assert wake_state(lodge)["reserved"] == {"session": started[0]["name"], "at": pytest.approx(time.time(), abs=5)}
+
 @pytest.mark.parametrize("gap", ["stopped", "archived", "other_launching"])
 def test_an_owners_stop_in_the_gap_before_the_relaunch_is_never_revived(lodge, resting, monkeypatch, gap):
     real = sessions.resume_session

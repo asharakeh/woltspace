@@ -115,3 +115,39 @@ def test_endpoint_is_rebuilt_and_removed_per_launch(launch):
         os.write(stale, b"n")
     os.close(stale)
     assert broker.requests == [] and helper(state) == ("ok", 0) and len(broker.requests) == 1
+
+
+def test_each_layer_filters_the_reply_vocabulary_on_its_own(launch, tmp_path):
+    """The relay writes only fixed words; the helper also refuses any other line it is handed."""
+    start, state, _ = launch
+    action, _ = start(Broker(["busy"]))
+    fd = os.open(action / "request", os.O_WRONLY)
+    reply = os.open(action / "reply", os.O_RDONLY)
+    try:
+        os.write(fd, b"n")
+        assert os.read(reply, 64) == b"refused\n"  # the relay itself, before any helper filter
+    finally:
+        os.close(fd)
+        os.close(reply)
+    other = tmp_path / "other"
+    (other / "home").mkdir(parents=True)
+    (other / "action").mkdir()
+    for name in ("request", "reply"):
+        os.mkfifo(other / "action" / name)
+    request = os.open(other / "action" / "request", os.O_RDWR | os.O_NONBLOCK)
+    answer = os.open(other / "action" / "reply", os.O_RDWR | os.O_NONBLOCK)
+
+    def forged():  # a reply side that does not keep to the vocabulary
+        import select
+        select.select([request], [], [], 10)
+        os.read(request, 1)
+        os.write(answer, b"sent-anyway\n")
+
+    thread = threading.Thread(target=forged, daemon=True)
+    thread.start()
+    try:
+        assert helper(other) == ("refused", 6)
+    finally:
+        thread.join(5)
+        os.close(request)
+        os.close(answer)

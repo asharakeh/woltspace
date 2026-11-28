@@ -1,9 +1,12 @@
 """lodge_db: the one SQLite file that holds the lodge's changing state."""
 
+import errno
 import json
 import os
 import sqlite3
 import stat
+import subprocess
+import time
 from contextlib import closing, contextmanager
 import sys
 import threading
@@ -286,6 +289,64 @@ def test_many_first_openers_at_once_all_get_in(tmp_path):
         for t in threads:
             t.join()
     assert errors == []
+
+
+@pytest.mark.parametrize("exists", [False, True])
+def test_a_writable_connect_never_opens_a_descriptor_of_the_file_itself(tmp_path, monkeypatch, exists):
+    """Closing any descriptor of the file drops every POSIX lock this process holds on it: a
+    new file is created under a private name and linked, an existing one is never opened."""
+    if exists:
+        lodge_db.connect(tmp_path).close()
+    opened, real = [], os.open
+    monkeypatch.setattr(os, "open", lambda path, *a, **k: opened.append(os.fspath(path)) or real(path, *a, **k))
+    lodge_db.connect(tmp_path).close()
+    db = str(lodge_db.path(tmp_path))
+    assert db not in opened and len(opened) == (0 if exists else 1)
+    assert stat.S_IMODE(os.stat(db).st_mode) == 0o600
+    assert not [n for n in os.listdir(tmp_path / ".space") if n.startswith(".lodge.db.")]  # no private name left
+
+@pytest.mark.parametrize("code", [errno.EPERM, errno.EIO])
+def test_only_a_filesystem_without_hard_links_creates_the_file_in_place(tmp_path, monkeypatch, code):
+    def link(src, dst):
+        raise OSError(code, os.strerror(code))
+    monkeypatch.setattr(os, "link", link)
+    if code == errno.EIO:  # any other link failure is the connect's failure
+        with pytest.raises(OSError, match=os.strerror(code)):
+            lodge_db.connect(tmp_path)
+        assert not lodge_db.path(tmp_path).exists()
+    else:
+        lodge_db.connect(tmp_path).close()
+        assert stat.S_IMODE(lodge_db.path(tmp_path).stat().st_mode) == 0o600
+    assert not [n for n in os.listdir(tmp_path / ".space") if n.startswith(".lodge.db.")]
+
+def test_a_new_connection_never_drops_the_locks_of_this_processs_others(tmp_path):
+    """Closing any descriptor of the file drops every POSIX lock this process holds on it,
+    other connections' too: another process may then checkpoint the WAL away under them
+    (SQLITE_IOERR_SHORT_READ, "disk I/O error"). Threads here write and read while a
+    second process opens and closes connections."""
+    lodge_db.connect(tmp_path).close()
+    churn = subprocess.Popen([sys.executable, "-c", (
+        "import sys, time; sys.path.insert(0, sys.argv[1]); import lodge_db; end = time.time() + 3\n"
+        "while time.time() < end: lodge_db.connect(sys.argv[2]).close()"),
+        str(Path(lodge_db.__file__).parent), str(tmp_path)])
+    errors, end = [], time.time() + 3
+
+    def hammer(n):
+        while time.time() < end:
+            try:
+                with lodge_db.write(tmp_path, durable=True) as conn:
+                    conn.execute("INSERT OR REPLACE INTO meta VALUES (?, 'x')", (f"t{n}",))
+                lodge_db.connect(tmp_path, readonly=True).close()
+            except sqlite3.Error as exc:
+                errors.append(getattr(exc, "sqlite_errorname", str(exc)))
+
+    threads = [threading.Thread(target=hammer, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert churn.wait(timeout=30) == 0
+    assert not errors, (len(errors), sorted(set(errors)))
 
 
 # --- migration 6: session policies to record version 2 ----------------------

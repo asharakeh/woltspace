@@ -673,6 +673,77 @@ def test_an_unknown_resume_outcome_never_starts_a_second_worker(lodge, resting, 
     inbox_wake._wake(str(lodge.root), "pal")  # launch_unknown holds
 
 
+
+@pytest.mark.parametrize("age, result", [(0, None), (inbox_wake.SETTLE + 1, ("submitted", "ok")),
+                                         (inbox_wake.SETTLE + 1, ("pending", "not_ready"))])
+def test_a_running_reservation_is_waited_for_until_it_is_due_then_hinted(lodge, wake, age, result):
+    """resolve_active_session lists only sessions whose agent the process table shows (wake.live
+    None here): a running reserved session it misses is waited for, but never forever. A hint
+    that is not placed yet is no reason to give up on it: nothing else starts."""
+    mail(lodge)
+    lodge.registry.create("pal-r", wolt="pal")  # running
+    lodge.store.set_wake("pal", {**wake_state(lodge), "reserved": {"session": "pal-r", "at": int(time.time()) - age}})
+    sys.modules["native_adapters"].deliver = lambda record_, hint: lodge.calls.delivered.append(1) or result
+    for _ in range(2):
+        inbox_wake._wake(str(lodge.root), "pal")
+    assert len(lodge.calls.delivered) == (2 if result else 0)  # every pass hints while mail waits
+    assert [o["how"] for o in wake_state(lodge).get("outcomes", [])] == (["hinted"] if result == ("submitted", "ok") else [])
+    assert not wake.starts and "hint_unreachable" not in record(lodge, "pal-r")
+
+
+def test_a_ready_file_unreadable_for_a_moment_gives_nothing_up(lodge, wake):
+    """unavailable/bad_ready (an OSError reading the ready file) is not the end of the attempt:
+    nothing is marked, nothing starts, and once it reads again the same attempt is hinted."""
+    mail(lodge)
+    lodge.registry.create("pal-r", wolt="pal")
+    lodge.registry.update("pal-r", attempt="a1")
+    lodge.store.set_wake("pal", {**wake_state(lodge), "reserved": {"session": "pal-r", "at": 0, "failed": True}})
+    results = iter([("unavailable", "bad_ready"), ("submitted", "ok")])
+    sys.modules["native_adapters"].deliver = lambda record_, hint: lodge.calls.delivered.append(1) or next(results)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert "hint_unreachable" not in record(lodge, "pal-r") and not wake.starts
+    mail(lodge, "k2")
+    inbox_wake._wake(str(lodge.root), "pal", once=True)  # e.g. the pickup of its ready announce
+    assert len(lodge.calls.delivered) == 2 and not wake.starts
+    assert [o["how"] for o in wake_state(lodge)["outcomes"]] == ["blocked", "hinted"]
+
+def test_a_failed_resume_left_running_without_an_endpoint_is_given_up_once_and_another_starts(
+        lodge, resting, monkeypatch):
+    """The resume relaunched, then a lodge.db write failed: the session runs, its agent is in
+    the process table (resolve_active_session finds it), but its attempt has no rewake endpoint
+    (native None). The real transport says unavailable: that attempt is never hinted again."""
+    starts = []
+
+    def start(**kw):
+        starts.append(kw["name"])
+        lodge.registry.create(kw["name"], wolt="pal")
+        lodge.registry.update(kw["name"], attempt="a-new")
+        return {"name": kw["name"]}
+    monkeypatch.setattr(sessions, "start_session", start)
+    monkeypatch.setattr(sessions, "resolve_active_session", lambda wolt, registry=None: (
+        "pal-rest" if record(lodge, "pal-rest")["status"] == "running" else None))
+
+    def lost(name, prompt="", **kw):
+        lodge.registry.update(name, status="running", native=None)
+        raise inbox.Unavailable("store_failed")
+    monkeypatch.setattr(sessions, "resume_session", lost)
+    monkeypatch.delitem(sys.modules, "native_adapters")  # the real transport
+    import native_adapters
+    real = native_adapters.deliver
+    seen = []
+    monkeypatch.setattr(native_adapters, "deliver", lambda record_, hint: seen.append(record_["name"]) or real(record_, hint))
+    mail(lodge, human=False)
+    inbox_wake._wake(str(lodge.root), "pal")
+    assert wake_state(lodge)["reserved"]["failed"] and starts == [] and seen == []
+    mail(lodge, "k2", human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # due at once: one hint, unavailable, and this pass starts one
+    assert seen == ["pal-rest"] and len(starts) == 1
+    assert record(lodge, "pal-rest")["hint_unreachable"] == record(lodge, "pal-rest")["attempt"]
+    assert [o["how"] for o in wake_state(lodge)["outcomes"]] == ["error", "started"]
+    mail(lodge, "k3", human=False)
+    inbox_wake._wake(str(lodge.root), "pal")  # that attempt is skipped; the new session is waited for
+    assert seen == ["pal-rest"] and len(starts) == 1
+
 @pytest.mark.parametrize("gap", ["stopped", "archived", "other_launching"])
 def test_an_owners_stop_in_the_gap_before_the_relaunch_is_never_revived(lodge, resting, monkeypatch, gap):
     real = sessions.resume_session
